@@ -1,16 +1,26 @@
+import sys
+sys.path.append('utils/')
+
+
 import os
+import torch
 from collections import OrderedDict
+
+from model import create_prediction_model
+from evaluate_utils import evaluate
+from dnn import DNN
 
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
+
 import typer
 import yaml
-from deepcell.applications import NuclearSegmentation
 from deepcell_toolbox.metrics import Metrics
 from skimage.color import label2rgb
 from skimage.exposure import rescale_intensity
 from typing_extensions import Annotated
+app = typer.Typer(pretty_exceptions_show_locals=False)
+
 
 def load_npz(data_dir, splits):
 
@@ -22,36 +32,35 @@ def load_npz(data_dir, splits):
     return data
 
 
+# def evaluate(app, X_test, y_test, postprocess_kwargs=None):
+#     y_pred = app.predict(X_test, postprocess_kwargs=postprocess_kwargs)
+#     y_true = y_test.copy()
 
-def evaluate(app, X_test, y_test, postprocess_kwargs=None):
-    y_pred = app.predict(X_test, postprocess_kwargs=postprocess_kwargs)
-    y_true = y_test.copy()
+#     # run the metrics
+#     m = Metrics("DeepWatershed - Remove no pixels", seg=False)
+#     metrics = m.calc_object_stats(y_true, y_pred)
+#     summary = m.summarize_object_metrics_df(metrics)
 
-    # run the metrics
-    m = Metrics("DeepWatershed - Remove no pixels", seg=False)
-    metrics = m.calc_object_stats(y_true, y_pred)
-    summary = m.summarize_object_metrics_df(metrics)
+#     valid_keys = {
+#         "recall",
+#         "precision",
+#         "jaccard",
+#         "n_true",
+#         "n_pred",
+#         "gained_detections",
+#         "missed_detections",
+#         "split",
+#         "merge",
+#         "catastrophe",
+#     }
+#     output_data = {}
+#     for k in valid_keys:
+#         if k in {"jaccard", "recall", "precision"}:
+#             output_data[k] = float(summary[k])
+#         else:
+#             output_data[k] = int(summary[k])
 
-    valid_keys = {
-        "recall",
-        "precision",
-        "jaccard",
-        "n_true",
-        "n_pred",
-        "gained_detections",
-        "missed_detections",
-        "split",
-        "merge",
-        "catastrophe",
-    }
-    output_data = {}
-    for k in valid_keys:
-        if k in {"jaccard", "recall", "precision"}:
-            output_data[k] = float(summary[k])
-        else:
-            output_data[k] = int(summary[k])
-
-    return output_data
+#     return output_data
 
 
 def create_overlays(x, gt, pred):
@@ -73,11 +82,11 @@ def create_overlays(x, gt, pred):
 
     return gt_overlay, pred_overlay
 
-
+@app.command()
 def main(
     model_path: Annotated[
         str, typer.Option(help="Path to the trained models")
-    ] = "data/models/saved_model_best_dict.pth",
+    ] = "data/saved_model_best_dict.pth",
     metrics_path: Annotated[
         str, typer.Option(help="Destination of evaluation metrics")
     ] = "evaluate-metrics.yaml",
@@ -120,9 +129,9 @@ def main(
         ),
     ] = 10,
 ):
-    data = load_npz(data_dir=data_path, split='test')
-    X_test = data["X"]
-    y_test = data["y"]
+    data = load_npz(data_path, ['test'])
+    X_test = data['test']["X"]
+    y_test = data['test']["y"]
 
     # Prep postprocess kwargs
     postprocess_kwargs = {
@@ -135,12 +144,23 @@ def main(
     }
 
     # Load model and application
-    model = tf.keras.models.load_model(model_path)
-    app = NuclearSegmentation(model)
+    model = create_prediction_model(
+        input_shape=(1,256,256), 
+        backbone='resnet50', 
+        pyramid_levels=("P1","P2", "P3", "P4", "P5", "P6", "P7"))
+    
+    device = torch.device('cuda:6')
+
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.to(device)
+
+    app = DNN(model=model, device=device, postprocess_kwargs=postprocess_kwargs)
 
     # evaluate the model
     # TODO: evaluate based on experiment data type
-    metrics = evaluate(app, X_test, y_test, postprocess_kwargs=postprocess_kwargs)
+    preds = app.predict(X_test)
+    metrics = evaluate(preds, y_test)
+    # metrics = evaluate(app, X_test, y_test, postprocess_kwargs=postprocess_kwargs)
 
     all_metrics = {
         "inference": OrderedDict(sorted(metrics.items())),
@@ -171,4 +191,4 @@ def main(
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    app()

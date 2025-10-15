@@ -317,7 +317,7 @@ class DNN():
             a pre-trained model will be downloaded.
     """
 
-    def __init__(self, model=None, device=None):
+    def __init__(self, model=None, device=None, postprocess_kwargs=None):
 
         if device is None:
             # select the device for computation
@@ -367,6 +367,7 @@ class DNN():
 
         self.device = device
         self.model = model.to(self.device)
+        self.postprocess_kwargs=postprocess_kwargs
 
 
         self.model_image_shape = model.input_shape[1:]
@@ -463,13 +464,15 @@ class DNN():
         #     'compartment': compartment
         # }
 
-        postprocess_kwargs = {
-            'radius': 10,
-            'maxima_threshold': 0.1,
-            'exclude_border': False,
-            'small_objects_threshold': 0,
-            'min_distance': 10
-        }
+        if self.postprocess_kwargs is None:
+            postprocess_kwargs = {
+                'radius': 10,
+                'interior_index': 1,
+                'maxima_threshold': 0.1,
+                'exclude_border': False,
+                'small_objects_threshold': 0,
+                'min_distance': 10
+            }
 
         preprocess_kwargs = {
             'normalize': True
@@ -477,9 +480,7 @@ class DNN():
 
         # Keep track of original shape for rescaling after processing
         orig_img_shape = image.shape
-
         resized_image = resize_input(image, image_mpp, self.model_mpp)
-
         image = preprocess(resized_image, **preprocess_kwargs)
 
         # Tile images, raises error if the image is not 4d
@@ -491,10 +492,11 @@ class DNN():
         output_images = untile_output(output_tiles, tiles_info, self.model_image_shape)
 
         label_image = postprocess(output_images, **postprocess_kwargs)
+
         # Restore channel dimension if not already there
         # TODO: check if unnecessary
         if len(image.shape) == self.required_rank - 1:
             image = np.expand_dims(image, axis=-1)
 
         label_image = resize_output(label_image, orig_img_shape)
-        return output_images
+        return label_image
