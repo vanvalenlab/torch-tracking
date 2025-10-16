@@ -14,8 +14,6 @@ def create_model(
     num_semantic_classes = [1, 1, 2]  # inner distance, pixelwise, inner distance, pixelwise
     model = PanopticNet(backbone=backbone,
         input_shape=input_shape,
-        norm_method=None,
-        num_semantic_heads=4,
         num_semantic_classes=num_semantic_classes,
         backbone_levels=['C1','C2','C3', 'C4', 'C5'],
         pyramid_levels=pyramid_levels,
@@ -39,7 +37,7 @@ def create_prediction_model(
         model_dir=None,
         location=True,
         device=None,
-        pyramid_levels=("P3", "P4", "P5", "P6", "P7"),
+        pyramid_levels=("P3", "P4", "P5", "P6", "P7")
 ):
     
     num_semantic_classes = [1, 1, 2]  # inner distance, pixelwise, inner distance, pixelwise
@@ -54,7 +52,6 @@ def create_prediction_model(
         pyramid_levels=pyramid_levels,
         location=location,  # should always be true
         include_top=True)
-    
     
     print("Model is using", device)
 

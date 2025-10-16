@@ -91,7 +91,6 @@ def postprocess(model_output, **postprocess_kwargs):
 
     label_images = deep_watershed(model_output, **postprocess_kwargs)
 
-
     return label_images
 
 
@@ -319,51 +318,9 @@ class DNN():
 
     def __init__(self, model=None, device=None, postprocess_kwargs=None):
 
-        if device is None:
-            # select the device for computation
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                import os
-                # if using Apple MPS, fall back to CPU for unsupported ops
-                os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-                device = torch.device("mps")
-            else:
-                device = torch.device("cpu")
-            
-
-            # # This fails as bfloat16 cannot be converted to numpy
-            # # Is also slower during inference
-            # if device.type == "cuda":
-            #     # use bfloat16 for the entire notebook
-            #     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-            #     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-            #     if torch.cuda.get_device_properties(0).major >= 8:
-            #         torch.backends.cuda.matmul.allow_tf32 = True
-            #         torch.backends.cudnn.allow_tf32 = True
-            # elif device.type == "mps":
-            #     print(
-            #         "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
-            #         "give numerically different outputs and sometimes degraded performance on MPS. "
-            #         "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
-            #     )
-
         print(f"using device: {device}")
         if model is None:
             raise Exception("Need to provide a model")
-
-            # # Uncomment with saved model later
-
-            # cache_subdir = "models"
-            # model_dir = Path.home() / ".deepcell" / "models"
-            # # archive_path = fetch_data(
-            # #     asset_key=MODEL_KEY,
-            # #     cache_subdir=cache_subdir,
-            # #     file_hash=MODEL_HASH
-            # # )
-            # # extract_archive(archive_path, model_dir)
-            # model_path = model_dir / MODEL_NAME
-            # model = tf.keras.models.load_model(model_path)
 
         self.device = device
         self.model = model.to(self.device)
@@ -376,21 +333,6 @@ class DNN():
         self.required_channels = self.model_image_shape[-1]
 
         self.model_mpp = 0.65
-
-        # # We can choose to bind these functions to the object or 
-        # # we can just have them global, should be the same
-
-        # self.preprocessing_fn = preprocessing_fn
-        # self.postprocessing_fn = postprocessing_fn
-        # self.format_model_output_fn = format_model_output_fn
-        # # Test that pre and post processing functions are callable
-        # if self.preprocessing_fn is not None and not callable(self.preprocessing_fn):
-        #     raise ValueError('Preprocessing_fn must be a callable function.')
-        # if self.postprocessing_fn is not None and not callable(self.postprocessing_fn):
-        #     raise ValueError('Postprocessing_fn must be a callable function.')
-        # if self.format_model_output_fn is not None and not callable(self.format_model_output_fn):
-        #     raise ValueError('Format_model_output_fn must be a callable function.')
-
         
         # Not used properly right now
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -430,42 +372,9 @@ class DNN():
         Returns:
             numpy.array: Instance segmentation mask.
         """
-        # default_kwargs_cell = {
-        #     'maxima_threshold': 0.075,
-        #     'maxima_smooth': 0,
-        #     'interior_threshold': 0.2,
-        #     'interior_smooth': 2,
-        #     'small_objects_threshold': 15,
-        #     'fill_holes_threshold': 15,
-        #     'radius': 2
-        # }
-
-        # default_kwargs_nuc = {
-        #     'maxima_threshold': 0.1,
-        #     'maxima_smooth': 0,
-        #     'interior_threshold': 0.2,
-        #     'interior_smooth': 2,
-        #     'small_objects_threshold': 15,
-        #     'fill_holes_threshold': 15,
-        #     'radius': 2
-        # }
-
-        # # overwrite defaults with any user-provided values
-        # postprocess_kwargs_whole_cell = {**default_kwargs_cell,
-        #                                  **postprocess_kwargs_whole_cell}
-
-        # postprocess_kwargs_nuclear = {**default_kwargs_nuc,
-        #                               **postprocess_kwargs_nuclear}
-
-        # # create dict to hold all of the post-processing kwargs
-        # postprocess_kwargs = {
-        #     'whole_cell_kwargs': postprocess_kwargs_whole_cell,
-        #     'nuclear_kwargs': postprocess_kwargs_nuclear,
-        #     'compartment': compartment
-        # }
 
         if self.postprocess_kwargs is None:
-            postprocess_kwargs = {
+            self.postprocess_kwargs = {
                 'radius': 10,
                 'interior_index': 1,
                 'maxima_threshold': 0.1,
@@ -474,14 +383,15 @@ class DNN():
                 'min_distance': 10
             }
 
-        preprocess_kwargs = {
+
+        self.preprocess_kwargs = {
             'normalize': True
         }
 
         # Keep track of original shape for rescaling after processing
         orig_img_shape = image.shape
         resized_image = resize_input(image, image_mpp, self.model_mpp)
-        image = preprocess(resized_image, **preprocess_kwargs)
+        image = preprocess(resized_image, **self.preprocess_kwargs)
 
         # Tile images, raises error if the image is not 4d
         tiles, tiles_info = tile_input(image, pad_mode=pad_mode, model_image_shape=self.model_image_shape)
@@ -491,7 +401,7 @@ class DNN():
         # Untile images
         output_images = untile_output(output_tiles, tiles_info, self.model_image_shape)
 
-        label_image = postprocess(output_images, **postprocess_kwargs)
+        label_image = postprocess(output_images, **self.postprocess_kwargs)
 
         # Restore channel dimension if not already there
         # TODO: check if unnecessary

@@ -5,7 +5,7 @@ from operator import __add__
 
 import torch
 import torch.nn as nn
-from torch.nn import Conv2d, Conv3d, LazyConv2d, Upsample, BatchNorm2d
+from torch.nn import Conv3d, LazyConv2d, Upsample, BatchNorm2d
 
 class Conv2dSamePadding(nn.LazyConv2d):
     def __init__(self,*args,**kwargs):
@@ -85,10 +85,7 @@ def create_pyramid_level(backbone_input,
         raise ValueError(f'Upsample method "{upsample_type}" not supported. '
                          f'Choose from {list(acceptable_upsample)}.')
 
-    reduced_name = f'C{level}_reduced'
     upsample_name = f'P{level}_upsampled'
-    addition_name = f'P{level}_merged'
-    final_name = f'P{level}'
 
     backbone_input = [backbone_input]
     
@@ -98,9 +95,7 @@ def create_pyramid_level(backbone_input,
                          padding='same'))
         pyramid = backbone_input
         pyramid = nn.Sequential(*pyramid)
-    else:
-        pyramid = Conv3d(feature_size, (1, 1, 1), strides=(1, 1, 1),
-                         padding='same', name=reduced_name)(backbone_input)
+
     
     # Add and then 3x3 conv
     if addition_input is not None:
@@ -118,7 +113,7 @@ def create_pyramid_level(backbone_input,
         assert(False)
         pyramid_upsample = None
     else:
-        # upsampling = UpSampling2D if ndim == 2 else UpSampling3D
+
         upsampling = Upsample
         size = (2, 2) if ndim == 2 else (1, 2, 2)
         upsampling_kwargs = {
@@ -133,20 +128,10 @@ def create_pyramid_level(backbone_input,
         pyramid_upsample = nn.Sequential(*temp_li)
     
     if ndim == 2:
-        if lite:
-            assert(False)
-            pyramid_final = DepthwiseConv2D((3, 3), strides=(1, 1),
-                                            padding='same',
-                                            name=final_name)(pyramid)
-        else:
-            temp_li = [pyramid]
-            temp_li.append(LazyConv2d(feature_size, (3, 3), stride=(1, 1),
-                                    padding='same'))
-            pyramid_final = nn.Sequential(*temp_li)
-    else:
-        z = 3 if z_axis_convolutions else 1
-        pyramid_final = Conv3D(feature_size, (z, 3, 3), strides=(1, 1, 1),
-                               padding='same', name=final_name)(pyramid)
+        temp_li = [pyramid]
+        temp_li.append(LazyConv2d(feature_size, (3, 3), stride=(1, 1),
+                                padding='same'))
+        pyramid_final = nn.Sequential(*temp_li)
     
     return pyramid_final, pyramid_upsample
 
@@ -269,10 +254,7 @@ def __create_pyramid_features(backbone_dict,
             temp_F.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
                                stride=(2, 2)))
             P_minus_2 = nn.Sequential(*temp_F)
-        else:
-            P_minus_2 = Conv3D(feature_size, kernel_size=(1, 3, 3),
-                               strides=(1, 2, 2), padding='same',
-                               name=P_minus_2_name)(F)
+
 
         pyramid_names.insert(0, P_minus_2_name)
         pyramid_finals.insert(0, P_minus_2)
@@ -285,15 +267,11 @@ def __create_pyramid_features(backbone_dict,
         P_minus_1 = [P_minus_2]
         P_minus_1.append(torch.nn.ReLU())
         
-
         if ndim == 2:
             P_minus_1.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
                                stride=(2, 2)))
             P_minus_1 = nn.Sequential(*P_minus_1)
-        else:
-            P_minus_1 = Conv3D(feature_size, kernel_size=(1, 3, 3),
-                               strides=(1, 2, 2), padding='same',
-                               name=P_minus_1_name)(P_minus_1)
+
 
         pyramid_names.insert(0, P_minus_1_name)
         pyramid_finals.insert(0, P_minus_1)
@@ -387,16 +365,9 @@ def semantic_upsample(x,
 
                 if ndim > 2:
                     del upsampling_kwargs['interpolation']
-                # x = upsampling(**upsampling_kwargs)(x)
                 temp.append(upsampling(**upsampling_kwargs))
         x = nn.Sequential(*temp)
-    else:
-        assert(False)
-        x = conv(1389, n_filters, conv_kernel, stride=1, padding='same')(x)
 
-        if upsample_type == 'upsamplelike' and target is not None:
-            upsample_name = f'upsampling_{0}_semanticupsample_{semantic_id}'
-            x = UpsampleLike(name=upsample_name)([x, target])
 
     return x
 

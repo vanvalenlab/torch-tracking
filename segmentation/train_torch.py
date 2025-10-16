@@ -1,9 +1,5 @@
-
-# New imports 
 import sys
-
 sys.path.append('utils/')
-import os
 
 from tqdm import tqdm
 
@@ -12,7 +8,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from model import create_model
-from panoptic import PanopticNet
 from toolbox import histogram_normalization
 from loaders import SemanticDataset, CroppingDatasetTorch
 
@@ -31,25 +26,6 @@ def load_npz(data_dir, splits):
 
     return data
 
-
-def create_prediction_model(
-    input_shape, backbone, weights_path, location, pyramid_levels
-):
-    """Remove the fgbg head from the model and load weights"""
-    prediction_model = PanopticNet(
-        backbone=backbone,
-        input_shape=input_shape,
-        norm_method=None,
-        num_semantic_heads=2,
-        num_semantic_classes=[1, 1],  # inner distance, outer distance
-        location=location,  # should always be true
-        include_top=True,
-        backbone_levels=["C1", "C2", "C3", "C4", "C5"],
-        pyramid_levels=pyramid_levels,
-    )
-    prediction_model.load_weights(weights_path, by_name=True)
-    return prediction_model
-
 def train_one_epoch(model, dataloader, optimizer, losses, device):
     running_loss_avg = 0.
     count = 0
@@ -57,7 +33,6 @@ def train_one_epoch(model, dataloader, optimizer, losses, device):
     for (li_inputs, li_labels) in tqdm(dataloader):
 
         count += 1
-                
         inputs = li_inputs.to(device)
         labels = [l.to(device) for l in li_labels]
 
@@ -65,10 +40,9 @@ def train_one_epoch(model, dataloader, optimizer, losses, device):
 
         outputs = model(inputs)
 
-
-        loss = sum([losses[j](outputs[j], labels[j]) for j in range(len(losses))])
-            
+        loss = sum([losses[j](outputs[j], labels[j]) for j in range(len(losses))])            
         loss.backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.001, error_if_nonfinite=True)
     
         optimizer.step()
@@ -114,17 +88,31 @@ def create_data_loaders(
     x_val = histogram_normalization(val["X"])
     print('FINISH PREPROCESS')
 
-    cdt = CroppingDatasetTorch(x_train, train["y"], rotation_range, shear_range, zoom_range, horizontal_flip, vertical_flip, crop_size, batch_size=batch_size, transforms=transforms, transforms_kwargs=transforms_kwargs, seed=seed, min_objects=min_objects)
-
+    cdt = CroppingDatasetTorch(
+        x_train, 
+        train["y"], 
+        rotation_range, 
+        shear_range, 
+        zoom_range, 
+        horizontal_flip, 
+        vertical_flip, 
+        crop_size, 
+        batch_size=batch_size, 
+        transforms=transforms, 
+        transforms_kwargs=transforms_kwargs, 
+        seed=seed, 
+        min_objects=min_objects)
+    
+    sd = SemanticDataset(
+        x_val, 
+        val["y"], 
+        transforms=transforms, 
+        min_objects=min_objects, 
+        transforms_kwargs=transforms_kwargs)  
+      
     dataloader = DataLoader(cdt, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
-
-    sd = SemanticDataset(x_val, val["y"], transforms=transforms, min_objects=min_objects, transforms_kwargs=transforms_kwargs)
     valloader = DataLoader(sd, batch_size=batch_size, shuffle=False, num_workers=4)
-    # dataiter = iter(dataloader)
-    # X_sd, y_sd = next(dataiter)
-    # print(X_sd.shape)
-    # print(len(y_sd))
-    # print(y_sd[3].shape)
+
     return dataloader, valloader
 
 
@@ -135,6 +123,7 @@ def train_torch(dataloader,
     lr=1e-4,
     epochs=8,
     pyramid_levels=("P1", "P2", "P3", "P4", "P5", "P6", "P7"),
+    save_path_prefix = "data/saved_model"
 ):
 
     torch.cuda.empty_cache()
@@ -145,14 +134,9 @@ def train_torch(dataloader,
         input_shape=(crop_size, crop_size, 1),
         backbone=backbone,
         lr=lr,
-        num_semantic_classes=3,
         device=device,
         pyramid_levels=pyramid_levels
     )
-
-    # dummy = torch.rand(3, 2, crop_size, crop_size).to(device)
-    # model(dummy)
-
 
     loss_tracking = []
     vloss_tracking = []
@@ -168,32 +152,29 @@ def train_torch(dataloader,
     model = model.to(device)
 
     save_path_prefix = "data/saved_model"
-    # if smaller is None:
-    #     save_path_prefix = save_path_prefix + "_torch_tmp_" + str(batch_size)
-    # else:
-    #     save_path_prefix = save_path_prefix + "_" + str(smaller)
 
     for epoch in range(start_epoch, epochs):
+
         print('EPOCH {}:'.format(epoch_number + 1))
         print("TRAIN")
+
         model.train()
+
         avg_loss = train_one_epoch(model, dataloader, optimizer, losses, device)
+
         count = 0
-        
         running_vloss_avg = 0.
         
         print("VAL")
-        model.eval()
 
+        model.eval()
         with torch.no_grad():
             for (li_inputs, li_labels) in tqdm(valloader):
                 count += 1
                 
                 vinputs = li_inputs.to(device)
                 vlabels = [l.to(device) for l in li_labels]
-                
                 voutputs = model(vinputs)
-                
                 vloss = sum([losses[j](voutputs[j], vlabels[j]) for j in range(len(losses))])
                     
                 running_vloss_avg += vloss
@@ -237,9 +218,6 @@ def main_torch(
     model_path: Annotated[
         str, typer.Option(help="Path to save segmentation model")
     ] = "data/models/",
-    train_log: Annotated[
-        str, typer.Option(help="Path for csv training logs")
-    ] = "train_log.csv",
     data_path: Annotated[
         str, typer.Option(help="Directory where training data is located")
     ] = None,
@@ -272,7 +250,6 @@ def main_torch(
     inner_erosion_width: Annotated[
         int, typer.Option(help="erosion width for inner distance transform")
     ] = 0,
-    location: Annotated[bool, typer.Option(help="Whether to include location layer")] = True,
     pyramid_levels: Annotated[
         str, typer.Option(help="String of pyramid levels")
     ] = "P1-P2-P3-P4-P5-P6-P7",
@@ -305,9 +282,8 @@ def main_torch(
         epochs=epochs,
         pyramid_levels=pyramid_levels.split("-"),
     )
-
-    # save the model
-    model.save(model_path, include_optimizer=False, overwrite=True)
+    
+    torch.save(model.state_dict(), model_path)
 
 
 if __name__ == "__main__":
