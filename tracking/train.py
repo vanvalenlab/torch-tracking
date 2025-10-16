@@ -4,6 +4,7 @@ import deepcell
 import tensorflow as tf
 import typer
 import yaml
+import math
 from deepcell.data.tracking import random_rotate, random_translate, temporal_slice
 from deepcell.model_zoo.tracking import GNNTrackingModel
 from deepcell.utils.tfrecord_utils import get_tracking_dataset
@@ -12,6 +13,50 @@ from tensorflow.keras.callbacks import CSVLogger
 from tensorflow_addons.optimizers import RectifiedAdam
 from typing_extensions import Annotated
 
+def random_rotate(X, y, rotation_range=0):
+    """Randomly rotate centroids and appearances.
+
+    Args:
+        X (dict): Dictionary of feature data.
+        rotation_range (int): Maximum rotation range in degrees.
+
+    Returns:
+        dict: Rotated ``X`` data.
+    """
+    appearances = X['appearances']
+    centroids = X['centroids']
+
+    # Calculate the random rotation in radians
+    rg = rotation_range * math.pi / 180
+    theta = tf.random.uniform(shape=[1], minval=-rg, maxval=rg)
+
+    # Transform appearances
+    old_shape = tf.shape(appearances)
+    new_shape = [-1, old_shape[2], old_shape[3], old_shape[4]]
+    img = tf.reshape(appearances, new_shape)
+    img = tfa.image.rotate(img, theta)
+    img = tf.reshape(img, old_shape)
+    X['appearances'] = img
+
+    # Rotate coordinates
+    cos_theta = tf.math.cos(theta)
+    sin_theta = tf.math.sin(theta)
+    rotation_matrix = tf.concat([
+        [cos_theta, -sin_theta],
+        [sin_theta, cos_theta],
+    ], axis=1)
+    transformed_centroids = tf.matmul(centroids, rotation_matrix)
+    X['centroids'] = transformed_centroids
+
+    return X, y
+
+def random_translate(X, y, range=512):
+    """Randomly translate the centroids."""
+    centroids = X['centroids']
+    r0 = tf.random.uniform([1, 1, 2], -range, range)
+    transformed_centroids = centroids + r0
+    X['centroids'] = transformed_centroids
+    return X, y
 
 def filter_and_flatten(y_true, y_pred):
     n_classes = tf.shape(y_true)[-1]
@@ -26,6 +71,59 @@ def filter_and_flatten(y_true, y_pred):
     y_true = tf.gather(y_true, good_loc, axis=0)
     y_pred = tf.gather(y_pred, good_loc, axis=0)
     return y_true, y_pred
+
+def temporal_slice(X, y, track_length=8):
+    """Randomly slice movies and labels with a length of ``track_length``.
+
+    Args:
+        X (dict): Dictionary of feature data.
+        y (dict): Dictionary of labels.
+        track_length (int): Length of temporal slices.
+
+    Returns:
+        tuple(dict, dict): Tuple of sliced ``X`` and ``y`` data.
+    """
+    temporal_adj_matrices = y['temporal_adj_matrices']
+
+    temporal_adj_matrices = tf.cast(temporal_adj_matrices, tf.int32)
+
+    # Identify max time, accounting for padding
+    # Padding frames have zero value accross all channels - look for these
+    tam_reduce_sum = tf.sparse.reduce_sum(temporal_adj_matrices, axis=[1, 2, 3])
+    non_pad_indices = tf.where(tam_reduce_sum != 0)
+    max_time = tf.reduce_max(non_pad_indices)
+
+    max_time = tf.cond(max_time > track_length,
+                       lambda: tf.cast(max_time - track_length, tf.int32),
+                       lambda: tf.cast(1, tf.int32))
+
+    t_start = tf.random.uniform(shape=[], minval=0,
+                                maxval=max_time,
+                                dtype=tf.int32)
+
+    t_end = t_start + track_length
+
+    def slice_sparse(sp, t_start, t_length):
+        shape = sp.shape.as_list()
+        n_dim = len(shape)
+        start = [t_start] + [0] * (n_dim - 1)
+        size = [t_length] + shape[1:]
+        sp_slice = tf.sparse.slice(sp, start=start, size=size)
+        return tf.sparse.to_dense(sp_slice)
+
+    for key, data in X.items():
+        if isinstance(data, tf.sparse.SparseTensor):
+            X[key] = slice_sparse(data, t_start, track_length)
+        else:
+            X[key] = data[t_start:t_end]
+
+    for key, data in y.items():
+        if isinstance(data, tf.sparse.SparseTensor):
+            y[key] = slice_sparse(data, t_start, track_length - 1)
+        else:
+            y[key] = data[t_start:t_end]
+
+    return (X, y)
 
 
 class Recall(tf.keras.metrics.Recall):
