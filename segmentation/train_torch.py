@@ -3,9 +3,15 @@ sys.path.append('utils/')
 
 from tqdm import tqdm
 
+from time import sleep
+
 import numpy as np
 import torch
+
+torch.set_num_threads(4)
+
 from torch.utils.data import DataLoader
+from torchvision.transforms import v2 as transforms
 
 from model import create_model
 from toolbox import histogram_normalization
@@ -30,8 +36,9 @@ def train_one_epoch(model, dataloader, optimizer, losses, device):
     running_loss_avg = 0.
     count = 0
 
-    for (li_inputs, li_labels) in tqdm(dataloader):
-
+    for batch in tqdm(dataloader):
+        print(batch[0].shape, batch[0].device)
+        li_inputs, li_labels = batch
         count += 1
         inputs = li_inputs.to(device)
         labels = [l.to(device) for l in li_labels]
@@ -66,13 +73,9 @@ def create_data_loaders(
 ):
     
     rotation_range = 180
-    shear_range = 0
     zoom_range = (zoom_min, 1/zoom_min)
-    horizontal_flip = True
-    vertical_flip = True
 
-
-    transforms = ["inner-distance", "outer-distance", "fgbg"]
+    in_transforms = ["inner-distance", "outer-distance", "fgbg"]
 
     transforms_kwargs = {
         "outer-distance": {"erosion_width": outer_erosion_width},
@@ -83,34 +86,42 @@ def create_data_loaders(
         },
     }
 
+    train_transforms = transforms.Compose([
+        transforms.ToImage(),
+        transforms.RandomCrop(crop_size),
+        transforms.RandomRotation(degrees=rotation_range),
+        transforms.RandomResizedCrop(size=256, scale=zoom_range),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5)
+        ])
+    
+    val_transforms = transforms.Compose([
+            transforms.ToImage(),
+        ])
+
     print('STARTING PREPROCESS')
-    x_train = histogram_normalization(train["X"])
-    x_val = histogram_normalization(val["X"])
+    x_train = histogram_normalization(train["X"][0:100])
+    x_val = histogram_normalization(val["X"][0:100])
     print('FINISH PREPROCESS')
+
+    y_train = train["y"][0:100]
+    y_val = val["y"][0:100]
 
     cdt = CroppingDatasetTorch(
         x_train, 
-        train["y"], 
-        rotation_range, 
-        shear_range, 
-        zoom_range, 
-        horizontal_flip, 
-        vertical_flip, 
-        crop_size, 
-        batch_size=batch_size, 
-        transforms=transforms, 
-        transforms_kwargs=transforms_kwargs, 
-        seed=seed, 
-        min_objects=min_objects)
+        y_train,
+        in_transforms=in_transforms, 
+        out_transforms=train_transforms,
+        transforms_kwargs=transforms_kwargs)
     
     sd = SemanticDataset(
         x_val, 
-        val["y"], 
-        transforms=transforms, 
-        min_objects=min_objects, 
+        y_val, 
+        in_transforms=in_transforms, 
+        out_transforms=val_transforms,
         transforms_kwargs=transforms_kwargs)  
       
-    dataloader = DataLoader(cdt, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
+    dataloader = DataLoader(cdt, batch_size=batch_size, shuffle=True, num_workers=4)
     valloader = DataLoader(sd, batch_size=batch_size, shuffle=False, num_workers=4)
 
     return dataloader, valloader
@@ -151,8 +162,6 @@ def train_torch(dataloader,
 
     model = model.to(device)
 
-    save_path_prefix = "data/saved_model"
-
     for epoch in range(start_epoch, epochs):
 
         print('EPOCH {}:'.format(epoch_number + 1))
@@ -160,26 +169,54 @@ def train_torch(dataloader,
 
         model.train()
 
-        avg_loss = train_one_epoch(model, dataloader, optimizer, losses, device)
-
+        running_loss_avg = 0.
         count = 0
-        running_vloss_avg = 0.
+
+        for batch in tqdm(dataloader):
+
+            li_inputs, li_labels = batch
+            count += 1
+            inputs = li_inputs.to(device)
+            # print('inputs loaded to device')
+            labels = [l.to(device) for l in li_labels]
+            # print('labels loaded to device')
+            optimizer.zero_grad()
+
+            outputs = model(inputs)
+
+            loss = sum([losses[j](outputs[j], labels[j]) for j in range(len(losses))])            
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.001, error_if_nonfinite=True)
+        
+            optimizer.step()
+
+            running_loss_avg += loss.item()
+
+
+        avg_loss = running_loss_avg/count
         
         print("VAL")
 
+        vcount = 0
+        running_vloss_avg = 0.
+
         model.eval()
+        
         with torch.no_grad():
-            for (li_inputs, li_labels) in tqdm(valloader):
-                count += 1
-                
+            for batch in tqdm(valloader):
+                vcount += 1
+
+                li_inputs, li_labels = batch
                 vinputs = li_inputs.to(device)
                 vlabels = [l.to(device) for l in li_labels]
+
                 voutputs = model(vinputs)
                 vloss = sum([losses[j](voutputs[j], vlabels[j]) for j in range(len(losses))])
                     
                 running_vloss_avg += vloss
                     
-        avg_vloss = running_vloss_avg/count
+        avg_vloss = running_vloss_avg/vcount
 
         decay_scheduler.step()
         plateau_scheduler.step(avg_vloss)
@@ -229,7 +266,7 @@ def main_torch(
     zoom_min: Annotated[
         float, typer.Option(help="Smallest zoom value. Zoom max is inverse of zoom min")
     ] = 0.75,
-    batch_size: Annotated[int, typer.Option(help="Number of samples per batch")] = 16,
+    batch_size: Annotated[int, typer.Option(help="Number of samples per batch")] = 8,
     backbone: Annotated[
         str, typer.Option(help="Backbone of the model")
     ] = "efficientnetv2bl",
@@ -281,9 +318,10 @@ def main_torch(
         lr=lr,
         epochs=epochs,
         pyramid_levels=pyramid_levels.split("-"),
+        save_path_prefix=model_path+'saved_model'
     )
     
-    torch.save(model.state_dict(), model_path)
+    torch.save(model.state_dict(), model_path+'last_model_dict.pth')
 
 
 if __name__ == "__main__":

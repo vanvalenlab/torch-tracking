@@ -56,7 +56,10 @@ def main(
     ] = "evaluate-metrics.yaml",
     data_path: Annotated[
         str, typer.Option(help="Path to the training data")
-    ] = None
+    ] = None,
+    backbone: Annotated[
+        str, typer.Option(help="Path to the training data")
+    ] = 'resnet50'
 ):
     data = load_npz(data_path, ['test'])
     X_test = data['test']["X"]
@@ -65,15 +68,23 @@ def main(
     # Load model and application
     model = create_prediction_model(
         input_shape=(1,256,256), 
-        backbone='resnet50', 
+        backbone=backbone, 
         pyramid_levels=("P1","P2", "P3", "P4", "P5", "P6", "P7"))
     
     device = torch.device('cuda:6')
 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
-
-    app = DNN(model=model, device=device)
+    postprocess_kwargs = {
+                'radius': 10,
+                'interior_index': 1,
+                'maxima_threshold': 0.1,
+                'exclude_border': False,
+                'small_objects_threshold': 0,
+                'min_distance': 10,
+                'maxima_algorithm': 'h_maxima'
+            }
+    app = DNN(model=model, device=device, postprocess_kwargs=postprocess_kwargs)
 
     # evaluate the model
     # TODO: evaluate based on experiment data type

@@ -6,13 +6,13 @@ from torchvision.transforms import v2 as transforms
 import logging
 
 class SemanticDataset(Dataset):
-    def __init__(self, X, y, transforms=['outer-distance'], min_objects=3, transforms_kwargs={}):
+    def __init__(self, X, y, in_transforms=['outer-distance'], out_transforms=None, transforms_kwargs={}):
         self.X = X
         self.y = y
-        self.transforms = transforms
+        self.in_transforms = in_transforms
+        self.out_transforms=out_transforms
         self.transforms_kwargs = transforms_kwargs
         self.channel_axis = -1
-        self.min_objects = min_objects
 
     def _transform_labels(self, y):
         y_semantic_list = []
@@ -25,7 +25,7 @@ class SemanticDataset(Dataset):
                 y_current = y[..., label_num:label_num + 1]
     
             data_format='channels_last'
-            for transform in self.transforms:
+            for transform in self.in_transforms:
                 transform_kwargs = self.transforms_kwargs.get(transform, dict())
                 y_transform = _transform_masks(y_current, transform,
                                                data_format=data_format,
@@ -43,30 +43,20 @@ class SemanticDataset(Dataset):
         x = self.X[idx]
         y_semantic_list = self._transform_labels(self.y[idx:idx+1])      
         
-        transform = transforms.Compose([
-            transforms.ToImage(),
-        ])
-        
-        x, y_semantic_list = transform(x, y_semantic_list)
+        if self.out_transforms:
+            x, y_semantic_list = self.out_transforms(x, y_semantic_list)
+            
         return (x, y_semantic_list)
 
 
 class CroppingDatasetTorch(Dataset):
-    def __init__(self, X, y, rotation_range, shear_range, zoom_range, horizontal_flip, vertical_flip, crop_size, batch_size=8, transforms=['outer-distance'], transforms_kwargs={}, seed=0, min_objects=3):
+    def __init__(self, X, y, in_transforms=['outer-distance'], transforms_kwargs={}, out_transforms=None):
         self.X = X
         self.y = y
-        self.transforms = transforms
+        self.in_transforms = in_transforms
+        self.out_transforms = out_transforms
         self.transforms_kwargs = transforms_kwargs
         self.channel_axis=-1
-        self.seed = seed
-        self.rotation_range = rotation_range
-        self.shear_range = shear_range
-        self.zoom_range = zoom_range
-        self.horizontal_flip = horizontal_flip
-        self.vertical_flip = vertical_flip
-        self.crop_size = (crop_size, crop_size)
-        self.batch_size = batch_size
-        self.min_objects = min_objects
 
         
     def _transform_labels(self, y):
@@ -80,7 +70,7 @@ class CroppingDatasetTorch(Dataset):
                 y_current = y[..., label_num:label_num + 1]
 
             data_format='channels_last'
-            for transform in self.transforms:
+            for transform in self.in_transforms:
                 transform_kwargs = self.transforms_kwargs.get(transform, dict())
                 y_transform = _transform_masks(y_current, transform,
                                                data_format=data_format,
@@ -94,24 +84,12 @@ class CroppingDatasetTorch(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        if self.seed is not None and idx%self.batch_size==0:
-            np.random.seed(self.seed + idx//self.batch_size)
-            torch.manual_seed(self.seed+idx//self.batch_size)
-
-        # Create a Compose object with a list of transformations
-        # This also converts from NHWC to NCHW
-        transform = transforms.Compose([
-            transforms.ToImage(),
-            transforms.RandomCrop(self.crop_size),
-            transforms.RandomRotation(degrees=self.rotation_range),
-            transforms.RandomResizedCrop(size=256, scale=self.zoom_range),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5)
-        ])
 
         x = self.X[idx]
         y_semantic_list = self._transform_labels(self.y[idx:idx+1]) 
 
-        x, y_semantic_list = transform(x, y_semantic_list)
+        if self.out_transforms:
+            x, y_semantic_list = self.out_transforms(x, y_semantic_list)
+
 
         return (x, y_semantic_list)

@@ -316,6 +316,7 @@ class DNN():
     def predict(self,
                 image,
                 batch_size=16,
+                return_transforms=False,
                 image_mpp=None,
                 preprocess_kwargs={},
                 pad_mode='constant'):
@@ -394,4 +395,7 @@ class DNN():
             image = np.expand_dims(image, axis=-1)
 
         label_image = resize_output(label_image, orig_img_shape)
-        return label_image
+        if not return_transforms:
+            return label_image
+        else:
+            return label_image, output_images

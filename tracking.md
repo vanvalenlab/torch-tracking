@@ -23,4 +23,55 @@
         - embedding dim: 64
         - encoder_dim: 64
         -norm_layer: 'batch'
-
+    2. The model is composed by the GNNTrackingModel module, which does the following:
+        1. During the `__init__` stage, it uses the inputs to make the expected shapes
+        2. Model architecture for training branch is as follows:
+            1. Inputs:
+                - appearances
+                - morphologies
+                - centroids
+                - adjacency matrices
+            2. Reshape inputs using `tf.reshape` and store this in a `Lambda` layer beneath the inputs.
+            3. These inputs are passed into the `get_neighborhood_encoder` function.
+                1. The `appearance_encoder` is composed of:
+                    1. Inputs ->
+                    2. TimeDistributed layer (keras) -> ImageNormalization2D layer (deepcell) ->
+                    3. Nested 3D convolution layers spanning log base 2 indices of appearance shape. ->
+                        4. Normalization layer ->
+                        5. Activation layer (ReLU) ->
+                        6. MaxPool3D layer ->
+                    4. A lambda layer (squeeze across axes 2 and 3) ->
+                    5. A dense layer of shape `encoder_dim` ->
+                    6. A normalization layer ->
+                    7. Activation layer (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
+                2. The `morphology_encoder` is composed of:
+                    1. Inputs ->
+                    2. Dense layer of shape `encoder_dim` ->
+                    3. Normalization layer ->
+                    4. Activation (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
+                3. The `centroid_encoder` is composed of:
+                    1. Inputs ->
+                    2. Dense layer of shape `encoder_dim` ->
+                    3. Normalization layer ->
+                    4. Activation (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
+                4. Adjacency matrix is kept as-is.
+                5. Merging features into `Concatenate` object ->
+                6. Dense object the size of `n_filters` ->
+                7. Normalization layer ->
+                8. Activation layer (ReLU)
+                9. Construction of GNN convolution using the Spektral GCNConv GCSConv GATConv, depending on the input information. Graph layer depth is 3.
+                10. For each layer depth, pipes in `node_features` and adjacency amtrix into the graph layer ->
+                11. Normalization layer ->
+                12. Activation layer (ReLU) ->
+                13. Concatenating appearance features, morphology features, and node features ->
+                14. Dense layer ->
+                15. Normalization layer ->
+                16. Activation layer -> Returns Model of inputs (app, mo, ce, and adj encoders) and outputs (node_features).
+            4. Embeddings are "unmerged".
+                1. Inputs ->
+                2. Unmerge (deepcell layers) -> returns model
+            5. Centroids are "unmerged".
+                1. Inputs ->
+                2. Unmerge (deepcell layers) -> returns model
+            6. Lambda extracting current and future embedding
+            7. 
