@@ -1,28 +1,3 @@
-# Copyright 2016-2024 The Van Valen Lab at the California Institute of
-# Technology (Caltech), with support from the Paul Allen Family Foundation,
-# Google, & National Institutes of Health (NIH) under Grant U24CA224309-01.
-# All rights reserved.
-#
-# Licensed under a modified Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.github.com/vanvalenlab/deepcell-tf/LICENSE
-#
-# The Work provided may be used for non-commercial academic purposes only.
-# For any other use of the Work, including commercial use, please contact:
-# vanvalenlab@gmail.com
-#
-# Neither the name of Caltech nor the names of its contributors may be used
-# to endorse or promote products derived from this software without specific
-# prior written permission.
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """Nuclear segmentation application"""
 
 import numpy as np
@@ -34,8 +9,9 @@ from toolbox import resize, tile_image, untile_image
 import logging
 
 import numpy as np
-
+import time
 import torch
+torch.set_num_threads(4)
 from tqdm import tqdm
 
 import logging
@@ -343,7 +319,8 @@ class DNN():
     
     def predict(self,
                 image,
-                batch_size=4,
+                batch_size=16,
+                return_transforms=False,
                 image_mpp=None,
                 preprocess_kwargs={},
                 pad_mode='constant'):
@@ -384,28 +361,37 @@ class DNN():
                 'maxima_threshold': 0.1,
                 'exclude_border': False,
                 'small_objects_threshold': 0,
-                'min_distance': 10
+                'min_distance': 10,
+                'maxima_algorithm': 'concomp'
             }
 
 
         self.preprocess_kwargs = {
             'normalize': True
         }
-
+        t_step = time.time()
         # Keep track of original shape for rescaling after processing
         orig_img_shape = image.shape
         resized_image = resize_input(image, image_mpp, self.model_mpp)
         image = preprocess(resized_image, **self.preprocess_kwargs)
-
+        print(f"Preprocess done in {round(time.time() - t_step)}s")
+        
+        t_step = time.time()
         # Tile images, raises error if the image is not 4d
         tiles, tiles_info = tile_input(image, pad_mode=pad_mode, model_image_shape=self.model_image_shape)
+        print(f"Tiling done in {round(time.time() - t_step)}s")
 
+        t_step = time.time()
         output_tiles = batch_predict(tiles=tiles, batch_size=batch_size, model=self.model, device=self.device)
+        print(f"Prediction done in {round(time.time() - t_step)}s")
 
-        # Untile images
+        t_step = time.time()
         output_images = untile_output(output_tiles, tiles_info, self.model_image_shape)
+        print(f"Untiling done in {round(time.time() - t_step)}s")
 
+        t_step = time.time()
         label_image = postprocess(output_images, **self.postprocess_kwargs)
+        print(f"Postprocess done in {round(time.time() - t_step)}s")
 
         # Restore channel dimension if not already there
         # TODO: check if unnecessary
@@ -413,4 +399,7 @@ class DNN():
             image = np.expand_dims(image, axis=-1)
 
         label_image = resize_output(label_image, orig_img_shape)
-        return label_image
+        if not return_transforms:
+            return label_image
+        else:
+            return label_image, output_images

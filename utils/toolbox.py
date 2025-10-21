@@ -32,9 +32,6 @@ from skimage.morphology import remove_small_objects, h_maxima, disk, ball, squar
 from skimage.segmentation import relabel_sequential
 
 
-
-
-
 def resize(data, shape, data_format='channels_last', labeled_image=False):
     """Resize the data to the given shape.
     Uses openCV to resize the data if the data is a single channel, as it
@@ -716,8 +713,6 @@ def weighted_categorical_crossentropy(y_true, y_pred,
     class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
     return - torch.sum((y_true * torch.log(y_pred) * class_weights), dim=axis)
 
-
-
 def semantic_loss(n_classes):
     def _semantic_loss(y_pred, y_true):
         if n_classes > 1:
@@ -822,42 +817,42 @@ def percentile_threshold(image, percentile=99.9):
 
     return processed_image
 
-def watershed(image, min_distance=10, min_size=50, threshold_abs=0.05):
-    """Use the watershed method to identify unique cells based
-    on their distance transform.
+# def watershed(image, min_distance=10, min_size=50, threshold_abs=0.05):
+#     """Use the watershed method to identify unique cells based
+#     on their distance transform.
 
-    # TODO: labels should be the fgbg output, NOT the union of distances
+#     # TODO: labels should be the fgbg output, NOT the union of distances
 
-    Args:
-        image (numpy.array): distance transform of image (model output)
-        min_distance (int): minimum number of pixels separating peaks
-        min_size (int): removes small objects if smaller than min_size.
-        threshold_abs (float): minimum intensity of peaks
+#     Args:
+#         image (numpy.array): distance transform of image (model output)
+#         min_distance (int): minimum number of pixels separating peaks
+#         min_size (int): removes small objects if smaller than min_size.
+#         threshold_abs (float): minimum intensity of peaks
 
-    Returns:
-        numpy.array: image mask where each cell is annotated uniquely
-    """
-    distance = np.argmax(image, axis=-1)
-    labels = (distance > 0).astype('int')
+#     Returns:
+#         numpy.array: image mask where each cell is annotated uniquely
+#     """
+#     distance = np.argmax(image, axis=-1)
+#     labels = (distance > 0).astype('int')
 
-    local_maxi_coords = peak_local_max(
-        image[..., -1],
-        min_distance=min_distance,
-        threshold_abs=threshold_abs,
-        labels=labels,
-        exclude_border=False)
+#     local_maxi_coords = peak_local_max(
+#         image[..., -1],
+#         min_distance=min_distance,
+#         threshold_abs=threshold_abs,
+#         labels=labels,
+#         exclude_border=False)
 
-    # Construct mask from local_maxi coords
-    local_maxi = np.zeros_like(image[..., -1], dtype=bool)
-    local_maxi[tuple(local_maxi_coords.T)] = True
+#     # Construct mask from local_maxi coords
+#     local_maxi = np.zeros_like(image[..., -1], dtype=bool)
+#     local_maxi[tuple(local_maxi_coords.T)] = True
 
-    # markers = label(local_maxi)
-    markers = ndimage.label(local_maxi)[0]
-    segments = segmentation.watershed(-distance, markers, mask=labels)
-    results = np.expand_dims(segments, axis=-1)
-    results = morphology.remove_small_objects(
-        results, min_size=min_size, connectivity=1)
-    return results
+#     # markers = label(local_maxi)
+#     markers = ndimage.label(local_maxi)[0]
+#     segments = segmentation.watershed(-distance, markers, mask=labels)
+#     results = np.expand_dims(segments, axis=-1)
+#     results = morphology.remove_small_objects(
+#         results, min_size=min_size, connectivity=1)
+#     return results
 
 def pixelwise(prediction, threshold=.8, min_size=50, interior_axis=-2):
     """Post-processing for pixelwise transform predictions.
@@ -927,6 +922,34 @@ def update_data_split(source, data_dir):
 
     return data
 
+def peak_concomp(image, maxima_threshold=0.7):
+
+    '''
+    Uses connected components via  ``regionprops`` to find centroids 
+    weighted by intensity image.
+
+    Args:
+        inputs: (list): list of [maximas, interiors] model outputs.
+        maxima_threshold (float): the rough thresholding used to find 
+            region masks. Should be /very/ strict.
+
+    Returns:
+        markers (numpy.array): Mask of points corresponding to predicted
+            centroid 'seeds' that is then passed into the watershedding algorithm.
+
+    '''
+    markers = np.zeros_like(image.squeeze())
+    maxima_thresh = image > maxima_threshold
+    maxima_thresh = label(maxima_thresh.astype('uint8').squeeze())
+    maxima_props = regionprops(maxima_thresh, intensity_image=image.squeeze())
+
+
+    for prop in maxima_props:
+        x, y = (np.around(prop['centroid_weighted'][0]).astype(int), np.around(prop['centroid_weighted'][1]).astype(int))
+        markers[x,y] = prop['label']
+
+    return markers
+
 def deep_watershed(outputs,
                    radius=10,
                    maxima_threshold=0.1,
@@ -982,7 +1005,7 @@ def deep_watershed(outputs,
         raise ValueError('`outputs` should be a list of at least two '
                          'NumPy arryas of equal shape.')
 
-    valid_algos = {'h_maxima', 'peak_local_max'}
+    valid_algos = {'h_maxima', 'peak_local_max', 'concomp'}
     if maxima_algorithm not in valid_algos:
         raise ValueError('Invalid value for maxima_algorithm: {}. '
                          'Must be one of {}'.format(
@@ -1058,12 +1081,15 @@ def deep_watershed(outputs,
             markers = np.zeros_like(maxima)
             slc = tuple(coords[:, i] for i in range(coords.shape[1]))
             markers[slc] = 1
-        else:
+
+        elif maxima_algorithm == 'h_maxima':
             # Find peaks and merge equal regions
             fn = ball if input_is_3d else disk
-            markers = h_maxima(image=maxima,
-                               h=maxima_threshold,
-                               footprint=fn(radius))
+            markers = h_maxima(maxima, h=maxima_threshold, footprint=disk(radius))
+
+        else:           
+            # Find peaks and merge equal regions
+            markers = peak_concomp(maxima)
 
         markers = label(markers)
         label_image = segmentation.watershed(-1 * interior, markers,

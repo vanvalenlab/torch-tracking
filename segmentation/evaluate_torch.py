@@ -75,8 +75,16 @@ def main(
 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
-
-    app = DNN(model=model, device=device)
+    postprocess_kwargs = {
+                'radius': 10,
+                'interior_index': 1,
+                'maxima_threshold': 0.1,
+                'exclude_border': False,
+                'small_objects_threshold': 0,
+                'min_distance': 10,
+                'maxima_algorithm': 'h_maxima'
+            }
+    app = DNN(model=model, device=device, postprocess_kwargs=postprocess_kwargs)
 
     # evaluate the model
     # TODO: evaluate based on experiment data type
