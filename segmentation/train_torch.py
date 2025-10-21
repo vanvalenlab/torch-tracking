@@ -37,7 +37,7 @@ def train_one_epoch(model, dataloader, optimizer, losses, device):
     count = 0
 
     for batch in tqdm(dataloader):
-        print(batch[0].shape, batch[0].device)
+
         li_inputs, li_labels = batch
         count += 1
         inputs = li_inputs.to(device)
@@ -204,6 +204,7 @@ def train_torch(dataloader,
         model.eval()
         
         with torch.no_grad():
+            
             for batch in tqdm(valloader):
                 vcount += 1
 
