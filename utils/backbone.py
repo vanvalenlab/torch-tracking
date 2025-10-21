@@ -106,7 +106,7 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
             model_cls = efficientnet_v2_l()
 
         model = nn.Sequential(img_input, model_cls)
-        all_layers = get_all_children(model_cls.features, ['0','1','2','3','4'])
+        all_layers = get_all_children(model_cls.features, ['0','2','3','4','6'])
 
         
         specific_layers = [nn.Sequential(img_input, i) for i in all_layers]

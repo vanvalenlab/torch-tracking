@@ -18,19 +18,19 @@ class combine_models(nn.Module):
         self.model_li = nn.ModuleList(model_li)
         self.input_shape = (None, 256, 256, 2)
     
-    def forward(self, input):
-        model_out_li = [self.model_li[i](input) for i in range(len(self.model_li))]        
+    def forward(self, x):
+        model_out_li = [self.model_li[i](x) for i in range(len(self.model_li))]        
         return model_out_li
 
 class concat_components(nn.Module):
     def __init__(self, path1, path2):
         super(concat_components, self).__init__()
-        # might be unnecessary
-        self.path_li = nn.ModuleList([path1, path2])
+        self.path1=path1
+        self.path2=path2
     
     def forward(self, input):
         
-        return torch.cat([self.path_li[0](input), self.path_li[1](input)], dim=1)
+        return torch.cat([self.path1(input), self.path2(input)], dim=1)
 
 def PanopticNet(backbone,
                 input_shape,
@@ -171,7 +171,6 @@ def PanopticNet(backbone,
         'input_shape': fixed_input_shape,
         'pooling': pooling
     }
-
     _, backbone_dict = get_backbone(backbone, fixed_inputs,
                                     use_imagenet=use_imagenet,
                                     frames_per_batch=frames_per_batch,

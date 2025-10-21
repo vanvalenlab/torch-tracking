@@ -48,7 +48,6 @@ def train_one_epoch(model, dataloader, optimizer, losses, device):
         optimizer.step()
 
         running_loss_avg += loss.item()
-        
     return running_loss_avg/count
 
 def create_data_loaders(
@@ -126,7 +125,7 @@ def train_torch(dataloader,
     save_path_prefix = "data/saved_model"
 ):
 
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
     device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
     print(device)
 
