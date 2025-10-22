@@ -196,7 +196,7 @@ def batch_predict(tiles, batch_size, model, device):
     model.eval()
     batch_outputs_list = []
 
-    for idx, i in tqdm(enumerate(range(0, tiles.shape[0], batch_size))):
+    for idx, i in enumerate(tqdm(range(0, tiles.shape[0], batch_size))):
         
         batch_inputs = tiles[i:i + batch_size, ...]
         temp_input = torch.tensor(batch_inputs).to(device)

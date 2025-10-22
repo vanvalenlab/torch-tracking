@@ -16,7 +16,8 @@ class combine_models(nn.Module):
     def __init__(self, model_li):
         super().__init__()
         self.model_li = nn.ModuleList(model_li)
-    
+        self.input_shape = (None, 256, 256, 2)
+
     def forward(self, x):
         model_out_li = [self.model_li[i](x) for i in range(len(self.model_li))]        
         return model_out_li

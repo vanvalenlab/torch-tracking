@@ -82,7 +82,7 @@ def main(
                 'exclude_border': False,
                 'small_objects_threshold': 0,
                 'min_distance': 10,
-                'maxima_algorithm': 'h_maxima'
+                'maxima_algorithm': 'concomp'
             }
     app = DNN(model=model, device=device, postprocess_kwargs=postprocess_kwargs)
 
