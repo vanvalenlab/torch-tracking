@@ -2,16 +2,18 @@
 
 import numpy as np
 
-from toolbox import histogram_normalization
-from toolbox import deep_watershed
-from toolbox import resize, tile_image, untile_image
+from utils.toolbox import histogram_normalization
+from utils.toolbox import deep_watershed
+from utils.toolbox import resize, tile_image, untile_image
 
 import logging
 
 import numpy as np
 import time
 import torch
+
 torch.set_num_threads(4)
+
 from tqdm import tqdm
 
 import logging

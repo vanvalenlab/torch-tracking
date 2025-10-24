@@ -1,9 +1,9 @@
 import numpy as np
 import warnings
 
-from transforms import pixelwise_transform
-from transforms import outer_distance_transform_movie, outer_distance_transform_3d, outer_distance_transform_2d
-from transforms import inner_distance_transform_movie, inner_distance_transform_3d, inner_distance_transform_2d
+from utils.transforms import pixelwise_transform
+from utils.transforms import outer_distance_transform_movie, outer_distance_transform_3d, outer_distance_transform_2d
+from utils.transforms import inner_distance_transform_movie, inner_distance_transform_3d, inner_distance_transform_2d
 
 # Copied from keras
 def to_categorical(x, num_classes=None, dtype="int64"):
