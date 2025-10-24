@@ -1,9 +1,4 @@
-import sys
-sys.path.append('utils/')
-
 from tqdm import tqdm
-
-from time import sleep
 
 import numpy as np
 import torch
@@ -13,9 +8,9 @@ torch.set_num_threads(4)
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as transforms
 
-from model import create_model
-from toolbox import histogram_normalization
-from loaders import SemanticDataset, CroppingDatasetTorch
+from utils.model import create_model
+from utils.toolbox import histogram_normalization
+from utils.loaders import SemanticDataset, CroppingDatasetTorch
 
 import typer
 

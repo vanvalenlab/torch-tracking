@@ -1,29 +1,7 @@
-# Copyright 2016-2024 The Van Valen Lab at the California Institute of
-# Technology (Caltech), with support from the Paul Allen Family Foundation,
-# Google, & National Institutes of Health (NIH) under Grant U24CA224309-01.
-# All rights reserved.
-#
-# Licensed under a modified Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.github.com/vanvalenlab/deepcell-tf/LICENSE
-#
-# The Work provided may be used for non-commercial academic purposes only.
-# For any other use of the Work, including commercial use, please contact:
-# vanvalenlab@gmail.com
-#
-# Neither the name of Caltech nor the names of its contributors may be used
-# to endorse or promote products derived from this software without specific
-# prior written permission.
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+
 """Assortment of CNN (and GNN) architectures for tracking single cells"""
+
+
 
 
 import ast
@@ -41,168 +19,278 @@ from tensorflow.keras.layers import Subtract, Dense, Reshape
 from tensorflow.keras.layers import MaxPool3D
 from tensorflow.keras.layers import Activation, Softmax
 from tensorflow.keras.layers import LayerNormalization, BatchNormalization, Lambda
-from tensorflow.keras.regularizers import l2
+from tensorflow.python.framework import tensor_shape
+
+from tensorflow.keras.layers import Layer, InputSpec
+
+from tensorflow.keras import activations
+from tensorflow.keras import constraints
+from tensorflow.keras import initializers
+from tensorflow.keras import regularizers
+from keras.utils import conv_utils
 
 from spektral.layers import GCSConv, GCNConv, GATConv
 
-from deepcell.layers import ImageNormalization2D
-from deepcell.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
-
-
-def siamese_model(input_shape=None,
-                  features=None,
-                  neighborhood_scale_size=10,
-                  reg=1e-5,
-                  init='he_normal',
-                  filter_size=61):
-    """Creates a tracking model based on Siamese Neural Networks(SNNs).
+class ImageNormalization2D(Layer):
+    """Image Normalization layer for 2D data.
 
     Args:
-        input_shape (tuple): If no input tensor, create one with this shape.
-        features (list): Number of output features
-        neighborhood_scale_size (int): number of input channels
-        reg (int): regularization value
-        init (str): Method for initalizing weights
-        filter_size (int): the receptive field of the neural network
-
-    Returns:
-        tensorflow.keras.Model: 2D FeatureNet
+        norm_method (str): Normalization method to use, one of:
+            "std", "max", "whole_image", None.
+        filter_size (int): The length of the convolution window.
+        data_format (str): A string, one of ``channels_last`` (default)
+            or ``channels_first``. The ordering of the dimensions in the
+            inputs. ``channels_last`` corresponds to inputs with shape
+            ``(batch, height, width, channels)`` while ``channels_first``
+            corresponds to inputs with shape
+            ``(batch, channels, height, width)``.
+        activation (function): Activation function to use.
+            If you don't specify anything, no activation is applied
+            (ie. "linear" activation: ``a(x) = x``).
+        use_bias (bool): Whether the layer uses a bias.
+        kernel_initializer (function): Initializer for the ``kernel`` weights
+            matrix, used for the linear transformation of the inputs.
+        bias_initializer (function): Initializer for the bias vector. If None,
+            the default initializer will be used.
+        kernel_regularizer (function): Regularizer function applied to the
+            ``kernel`` weights matrix.
+        bias_regularizer (function): Regularizer function applied to the
+            bias vector.
+        activity_regularizer (function): Regularizer function applied to.
+        kernel_constraint (function): Constraint function applied to
+            the ``kernel`` weights matrix.
+        bias_constraint (function): Constraint function applied to the
+            bias vector.
     """
-    def compute_input_shape(feature):
-        if feature == 'appearance':
-            return input_shape
-        elif feature == 'distance':
-            return (None, 2)
-        elif feature == 'neighborhood':
-            return (None, 2 * neighborhood_scale_size + 1,
-                    2 * neighborhood_scale_size + 1,
-                    input_shape[-1])
-        elif feature == 'regionprop':
-            return (None, 3)
+    def __init__(self,
+                 norm_method='std',
+                 filter_size=61,
+                 data_format=None,
+                 activation=None,
+                 use_bias=False,
+                 kernel_initializer='glorot_uniform',
+                 bias_initializer='zeros',
+                 kernel_regularizer=None,
+                 bias_regularizer=None,
+                 activity_regularizer=None,
+                 kernel_constraint=None,
+                 bias_constraint=None,
+                 **kwargs):
+        self.valid_modes = {'std', 'max', None, 'whole_image'}
+        if norm_method not in self.valid_modes:
+            raise ValueError(f'Invalid `norm_method`: "{norm_method}". '
+                             f'Use one of {self.valid_modes}.')
+        if 'trainable' not in kwargs:
+            kwargs['trainable'] = False
+        super().__init__(
+            activity_regularizer=regularizers.get(activity_regularizer),
+            **kwargs)
+        self.activation = activations.get(activation)
+        self.use_bias = use_bias
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.bias_initializer = initializers.get(bias_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
+        self.kernel_constraint = constraints.get(kernel_constraint)
+        self.bias_constraint = constraints.get(bias_constraint)
+        self.input_spec = InputSpec(ndim=4)  # hardcoded for 2D data
+
+        self.filter_size = filter_size
+        self.norm_method = norm_method
+        self.data_format = conv_utils.normalize_data_format(data_format)
+
+        if self.data_format == 'channels_first':
+            self.channel_axis = 1
         else:
-            raise ValueError('siamese_model.compute_input_shape: '
-                             f'Unknown feature `{feature}`')
+            self.channel_axis = 3  # hardcoded for 2D data
 
-    def compute_reshape(feature):
-        if feature == 'appearance':
-            return (64,)
-        elif feature == 'distance':
-            return (2,)
-        elif feature == 'neighborhood':
-            return (64,)
-        elif feature == 'regionprop':
-            return (3,)
+        if isinstance(self.norm_method, str):
+            self.norm_method = self.norm_method.lower()
+
+    def build(self, input_shape):
+        input_shape = tensor_shape.TensorShape(input_shape)
+        if len(input_shape) != 4:
+            raise ValueError('Inputs should have rank 4, '
+                             'received input shape: %s' % input_shape)
+        if self.data_format == 'channels_first':
+            channel_axis = 1
         else:
-            raise ValueError('siamese_model.compute_output_shape: '
-                             f'Unknown feature `{feature}`')
+            channel_axis = -1
+        if input_shape.dims[channel_axis].value is None:
+            raise ValueError('The channel dimension of the inputs '
+                             'should be defined. Found `None`.')
+        input_dim = int(input_shape[channel_axis])
+        self.input_spec = InputSpec(ndim=4, axes={channel_axis: input_dim})
 
-    def compute_feature_extractor(feature, shape):
-        if feature == 'appearance':
-            # This should not stay: channels_first/last should be used to
-            # dictate size (1 works for either right now)
-            N_layers = np.int_(np.floor(np.log2(input_shape[1])))
-            feature_extractor = Sequential()
-            feature_extractor.add(InputLayer(input_shape=shape))
-            # feature_extractor.add(ImageNormalization2D('std', filter_size=32))
-            for layer in range(N_layers):
-                feature_extractor.add(Conv3D(64, (1, 3, 3),
-                                             kernel_initializer=init,
-                                             padding='same',
-                                             kernel_regularizer=l2(reg)))
-                feature_extractor.add(BatchNormalization(axis=channel_axis))
-                feature_extractor.add(Activation('relu'))
-                feature_extractor.add(MaxPool3D(pool_size=(1, 2, 2)))
+        kernel_shape = (self.filter_size, self.filter_size, input_dim, 1)
+        # self.kernel = self.add_weight(
+        #     name='kernel',
+        #     shape=kernel_shape,
+        #     initializer=self.kernel_initializer,
+        #     regularizer=self.kernel_regularizer,
+        #     constraint=self.kernel_constraint,
+        #     trainable=False,
+        #     dtype=self.compute_dtype)
 
-            feature_extractor.add(Reshape((-1, 64)))
-            return feature_extractor
+        W = K.ones(kernel_shape, dtype=self.compute_dtype)
+        W = W / K.cast(K.prod(K.int_shape(W)), dtype=self.compute_dtype)
+        self.kernel = W
+        # self.set_weights([W])
 
-        elif feature == 'distance':
-            return None
-        elif feature == 'neighborhood':
-            N_layers_og = np.int_(np.floor(np.log2(2 * neighborhood_scale_size + 1)))
-            feature_extractor_neighborhood = Sequential()
-            feature_extractor_neighborhood.add(
-                InputLayer(input_shape=shape)
-            )
-            for layer in range(N_layers_og):
-                feature_extractor_neighborhood.add(Conv3D(64, (1, 3, 3),
-                                                          kernel_initializer=init,
-                                                          padding='same',
-                                                          kernel_regularizer=l2(reg)))
-                feature_extractor_neighborhood.add(BatchNormalization(axis=channel_axis))
-                feature_extractor_neighborhood.add(Activation('relu'))
-                feature_extractor_neighborhood.add(MaxPool3D(pool_size=(1, 2, 2)))
-
-            feature_extractor_neighborhood.add(Reshape((-1, 64)))
-
-            return feature_extractor_neighborhood
-        elif feature == 'regionprop':
-            return None
+        if self.use_bias:
+            self.bias = self.add_weight(
+                name='bias',
+                shape=(self.filter_size, self.filter_size),
+                initializer=self.bias_initializer,
+                regularizer=self.bias_regularizer,
+                constraint=self.bias_constraint,
+                trainable=False,
+                dtype=self.compute_dtype)
         else:
-            raise ValueError('siamese_model.compute_feature_extractor: '
-                             f'Unknown feature `{feature}`')
+            self.bias = None
 
-    if features is None:
-        raise ValueError('siamese_model: No features specified.')
+        self.built = True
 
-    if K.image_data_format() == 'channels_first':
-        channel_axis = 1
-        raise ValueError('siamese_model: Only channels_last is supported.')
-    else:
-        channel_axis = -1
+    def compute_output_shape(self, input_shape):
+        input_shape = tensor_shape.TensorShape(input_shape).as_list()
+        return tensor_shape.TensorShape(input_shape)
 
-    input_shape = tuple([None] + list(input_shape))
+    def _average_filter(self, inputs):
+        # Depthwise convolution on CPU is only supported for NHWC format
+        if self.data_format == 'channels_first':
+            inputs = K.permute_dimensions(inputs, pattern=[0, 2, 3, 1])
+        outputs = tf.nn.depthwise_conv2d(inputs, self.kernel, [1, 1, 1, 1],
+                                         padding='SAME', data_format='NHWC')
+        if self.data_format == 'channels_first':
+            outputs = K.permute_dimensions(outputs, pattern=[0, 3, 1, 2])
+        return outputs
 
-    features = sorted(features)
+    def _window_std_filter(self, inputs, epsilon=K.epsilon()):
+        c1 = self._average_filter(inputs)
+        c2 = self._average_filter(K.square(inputs))
+        output = K.sqrt(c2 - c1 * c1) + epsilon
+        return output
 
-    inputs = []
-    outputs = []
-    for feature in features:
-        in_shape = compute_input_shape(feature)
-        re_shape = compute_reshape(feature)
-        feature_extractor = compute_feature_extractor(feature, in_shape)
+    def call(self, inputs):
+        if not self.norm_method:
+            outputs = inputs
 
-        layer_1 = Input(shape=in_shape, name=f'{feature}_input1')
-        layer_2 = Input(shape=in_shape, name=f'{feature}_input2')
+        elif self.norm_method == 'whole_image':
+            axes = [2, 3] if self.channel_axis == 1 else [1, 2]
+            outputs = inputs - K.mean(inputs, axis=axes, keepdims=True)
+            outputs = outputs / (K.std(inputs, axis=axes, keepdims=True) + K.epsilon())
 
-        inputs.extend([layer_1, layer_2])
+        elif self.norm_method == 'std':
+            outputs = inputs - self._average_filter(inputs)
+            outputs = outputs / self._window_std_filter(outputs)
 
-        # apply feature_extractor if it exists
-        if feature_extractor is not None:
-            layer_1 = feature_extractor(layer_1)
-            layer_2 = feature_extractor(layer_2)
+        elif self.norm_method == 'max':
+            outputs = inputs / K.max(inputs)
+            outputs = outputs - self._average_filter(outputs)
 
-        # LSTM on 'left' side of network since that side takes in stacks of features
-        layer_1 = LSTM(64)(layer_1)
-        layer_2 = Reshape(re_shape)(layer_2)
+        else:
+            raise NotImplementedError(f'"{self.norm_method}" is not a valid norm_method')
 
-        outputs.append([layer_1, layer_2])
+        return outputs
 
-    dense_merged = []
-    for layer_1, layer_2 in outputs:
-        merge = Concatenate(axis=channel_axis)([layer_1, layer_2])
-        dense_merge = Dense(128)(merge)
-        bn_merge = BatchNormalization(axis=channel_axis)(dense_merge)
-        dense_relu = Activation('relu')(bn_merge)
-        dense_merged.append(dense_relu)
+    def get_config(self):
+        config = {
+            'norm_method': self.norm_method,
+            'filter_size': self.filter_size,
+            'data_format': self.data_format,
+            'activation': activations.serialize(self.activation),
+            'use_bias': self.use_bias,
+            'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'bias_initializer': initializers.serialize(self.bias_initializer),
+            'kernel_regularizer': regularizers.serialize(self.kernel_regularizer),
+            'bias_regularizer': regularizers.serialize(self.bias_regularizer),
+            'activity_regularizer': regularizers.serialize(self.activity_regularizer),
+            'kernel_constraint': constraints.serialize(self.kernel_constraint),
+            'bias_constraint': constraints.serialize(self.bias_constraint)
+        }
+        base_config = super().get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
-    # Concatenate outputs from both instances
-    merged_outputs = Concatenate(axis=channel_axis)(dense_merged)
+class Comparison(Layer):
+    """Layer for comparing two sequences of inputs."""
+    def call(self, inputs):
+        x = inputs[0]
+        y = inputs[1]
 
-    # Add dense layers
-    dense1 = Dense(128)(merged_outputs)
-    bn1 = BatchNormalization(axis=channel_axis)(dense1)
-    relu1 = Activation('relu')(bn1)
-    dense2 = Dense(128)(relu1)
-    bn2 = BatchNormalization(axis=channel_axis)(dense2)
-    relu2 = Activation('relu')(bn2)
-    dense3 = Dense(3, activation='softmax', name='classification', dtype=K.floatx())(relu2)
+        x = tf.expand_dims(x, 3)
+        multiples = [1, 1, 1, tf.shape(y)[2], 1]
+        x = tf.tile(x, multiples)
 
-    # Instantiate model
-    final_layer = dense3
-    model = Model(inputs=inputs, outputs=final_layer)
+        y = tf.expand_dims(y, 2)
+        multiples = [1, 1, tf.shape(x)[2], 1, 1]
+        y = tf.tile(y, multiples)
 
-    return model
+        return tf.concat([x, y], axis=-1)
+    
+
+class DeltaReshape(Layer):
+    """Reshape changes between current and future frames"""
+    def call(self, inputs):
+        current = inputs[0]
+        future = inputs[1]
+        current = tf.expand_dims(current, axis=3)
+        multiples = [1, 1, 1, tf.shape(future)[2], 1]
+        output = tf.tile(current, multiples)
+        return output
+    
+
+class Unmerge(Layer):
+    """Unmerge temporal inputs"""
+    def __init__(self, track_length, max_cells, embedding_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.track_length = track_length
+        self.max_cells = max_cells
+        self.embedding_dim = embedding_dim
+
+    def call(self, inputs):
+        new_shape = [-1, self.track_length, self.max_cells, self.embedding_dim]
+        output = tf.reshape(inputs, new_shape)
+        return output
+
+    def get_config(self):
+        config = {
+            'track_length': self.track_length,
+            'max_cells': self.max_cells,
+            'embedding_dim': self.embedding_dim
+        }
+        base_config = super().get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+    
+class TemporalMerge(Layer):
+    """Layer for merging the time dimension of a Tensor.
+
+    Args:
+        encoder_dim (int): desired encoder dimension.
+    """
+    def __init__(self, encoder_dim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.encoder_dim = encoder_dim
+        self.lstm = tf.keras.layers.LSTM(
+            self.encoder_dim,
+            return_sequences=True,
+            name=f'{self.name}_lstm')
+
+    def call(self, inputs):
+        input_shape = tf.shape(inputs)
+        # reshape away the temporal axis
+        x = tf.reshape(inputs, [-1, input_shape[1], self.encoder_dim])
+        x = self.lstm(x)
+        output_shape = [-1, input_shape[1], input_shape[2], self.encoder_dim]
+        x = tf.reshape(x, output_shape)
+        return x
+
+    def get_config(self):
+        config = {
+            'encoder_dim': self.encoder_dim,
+        }
+        base_config = super().get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
 
 
 class GNNTrackingModel:
@@ -624,3 +712,160 @@ class GNNTrackingModel:
         inference_model = Model(inputs=inference_inputs, outputs=inference_output)
 
         return training_model, inference_model
+    
+
+# def siamese_model(input_shape=None,
+#                   features=None,
+#                   neighborhood_scale_size=10,
+#                   reg=1e-5,
+#                   init='he_normal',
+#                   filter_size=61):
+#     """Creates a tracking model based on Siamese Neural Networks(SNNs).
+
+#     Args:
+#         input_shape (tuple): If no input tensor, create one with this shape.
+#         features (list): Number of output features
+#         neighborhood_scale_size (int): number of input channels
+#         reg (int): regularization value
+#         init (str): Method for initalizing weights
+#         filter_size (int): the receptive field of the neural network
+
+#     Returns:
+#         tensorflow.keras.Model: 2D FeatureNet
+#     """
+#     def compute_input_shape(feature):
+#         if feature == 'appearance':
+#             return input_shape
+#         elif feature == 'distance':
+#             return (None, 2)
+#         elif feature == 'neighborhood':
+#             return (None, 2 * neighborhood_scale_size + 1,
+#                     2 * neighborhood_scale_size + 1,
+#                     input_shape[-1])
+#         elif feature == 'regionprop':
+#             return (None, 3)
+#         else:
+#             raise ValueError('siamese_model.compute_input_shape: '
+#                              f'Unknown feature `{feature}`')
+
+#     def compute_reshape(feature):
+#         if feature == 'appearance':
+#             return (64,)
+#         elif feature == 'distance':
+#             return (2,)
+#         elif feature == 'neighborhood':
+#             return (64,)
+#         elif feature == 'regionprop':
+#             return (3,)
+#         else:
+#             raise ValueError('siamese_model.compute_output_shape: '
+#                              f'Unknown feature `{feature}`')
+
+#     def compute_feature_extractor(feature, shape):
+#         if feature == 'appearance':
+#             # This should not stay: channels_first/last should be used to
+#             # dictate size (1 works for either right now)
+#             N_layers = np.int_(np.floor(np.log2(input_shape[1])))
+#             feature_extractor = Sequential()
+#             feature_extractor.add(InputLayer(input_shape=shape))
+#             # feature_extractor.add(ImageNormalization2D('std', filter_size=32))
+#             for layer in range(N_layers):
+#                 feature_extractor.add(Conv3D(64, (1, 3, 3),
+#                                              kernel_initializer=init,
+#                                              padding='same',
+#                                              kernel_regularizer=l2(reg)))
+#                 feature_extractor.add(BatchNormalization(axis=channel_axis))
+#                 feature_extractor.add(Activation('relu'))
+#                 feature_extractor.add(MaxPool3D(pool_size=(1, 2, 2)))
+
+#             feature_extractor.add(Reshape((-1, 64)))
+#             return feature_extractor
+
+#         elif feature == 'distance':
+#             return None
+#         elif feature == 'neighborhood':
+#             N_layers_og = np.int_(np.floor(np.log2(2 * neighborhood_scale_size + 1)))
+#             feature_extractor_neighborhood = Sequential()
+#             feature_extractor_neighborhood.add(
+#                 InputLayer(input_shape=shape)
+#             )
+#             for layer in range(N_layers_og):
+#                 feature_extractor_neighborhood.add(Conv3D(64, (1, 3, 3),
+#                                                           kernel_initializer=init,
+#                                                           padding='same',
+#                                                           kernel_regularizer=l2(reg)))
+#                 feature_extractor_neighborhood.add(BatchNormalization(axis=channel_axis))
+#                 feature_extractor_neighborhood.add(Activation('relu'))
+#                 feature_extractor_neighborhood.add(MaxPool3D(pool_size=(1, 2, 2)))
+
+#             feature_extractor_neighborhood.add(Reshape((-1, 64)))
+
+#             return feature_extractor_neighborhood
+#         elif feature == 'regionprop':
+#             return None
+#         else:
+#             raise ValueError('siamese_model.compute_feature_extractor: '
+#                              f'Unknown feature `{feature}`')
+
+#     if features is None:
+#         raise ValueError('siamese_model: No features specified.')
+
+#     if K.image_data_format() == 'channels_first':
+#         channel_axis = 1
+#         raise ValueError('siamese_model: Only channels_last is supported.')
+#     else:
+#         channel_axis = -1
+
+#     input_shape = tuple([None] + list(input_shape))
+
+#     features = sorted(features)
+
+#     inputs = []
+#     outputs = []
+#     for feature in features:
+#         in_shape = compute_input_shape(feature)
+#         re_shape = compute_reshape(feature)
+#         feature_extractor = compute_feature_extractor(feature, in_shape)
+
+#         layer_1 = Input(shape=in_shape, name=f'{feature}_input1')
+#         layer_2 = Input(shape=in_shape, name=f'{feature}_input2')
+
+#         inputs.extend([layer_1, layer_2])
+
+#         # apply feature_extractor if it exists
+#         if feature_extractor is not None:
+#             layer_1 = feature_extractor(layer_1)
+#             layer_2 = feature_extractor(layer_2)
+
+#         # LSTM on 'left' side of network since that side takes in stacks of features
+#         layer_1 = LSTM(64)(layer_1)
+#         layer_2 = Reshape(re_shape)(layer_2)
+
+#         outputs.append([layer_1, layer_2])
+
+#     dense_merged = []
+#     for layer_1, layer_2 in outputs:
+#         merge = Concatenate(axis=channel_axis)([layer_1, layer_2])
+#         dense_merge = Dense(128)(merge)
+#         bn_merge = BatchNormalization(axis=channel_axis)(dense_merge)
+#         dense_relu = Activation('relu')(bn_merge)
+#         dense_merged.append(dense_relu)
+
+#     # Concatenate outputs from both instances
+#     merged_outputs = Concatenate(axis=channel_axis)(dense_merged)
+
+#     # Add dense layers
+#     dense1 = Dense(128)(merged_outputs)
+#     bn1 = BatchNormalization(axis=channel_axis)(dense1)
+#     relu1 = Activation('relu')(bn1)
+#     dense2 = Dense(128)(relu1)
+#     bn2 = BatchNormalization(axis=channel_axis)(dense2)
+#     relu2 = Activation('relu')(bn2)
+#     dense3 = Dense(3, activation='softmax', name='classification', dtype=K.floatx())(relu2)
+
+#     # Instantiate model
+#     final_layer = dense3
+#     model = Model(inputs=inputs, outputs=final_layer)
+
+#     return model
+

@@ -12,6 +12,20 @@ from tensorflow.keras.callbacks import CSVLogger
 from tensorflow_addons.optimizers import RectifiedAdam
 from typing_extensions import Annotated
 
+def filter_and_flatten(y_true, y_pred):
+    
+    n_classes = tf.shape(y_true)[-1]
+    new_shape = [-1, n_classes]
+    y_true = tf.reshape(y_true, new_shape)
+    y_pred = tf.reshape(y_pred, new_shape)
+
+    # Mask out the padded cells
+    y_true_reduced = tf.reduce_sum(y_true, axis=-1)
+    good_loc = tf.where(y_true_reduced == 1)[:, 0]
+
+    y_true = tf.gather(y_true, good_loc, axis=0)
+    y_pred = tf.gather(y_pred, good_loc, axis=0)
+    return y_true, y_pred
 
 class Recall(tf.keras.metrics.Recall):
     def update_state(self, y_true, y_pred, sample_weight=None):

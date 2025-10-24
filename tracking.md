@@ -74,4 +74,20 @@
                 1. Inputs ->
                 2. Unmerge (deepcell layers) -> returns model
             6. Lambda extracting current and future embedding
-            7. 
+            7. Merge the current embeddings with TemporalMerge layer from deepcell
+                1. Inputs ->
+                2. TemporalMerge ->
+            8. Compare the current and future embeddings using the Comparison layer from deepcell ->
+            9. Convert raw position information to deltas between positions in the current frame using Lambda ->
+            10. Pad the deltas with a constant matrix ->
+            11. Find deltas across frames between current and future using Lambda ->
+            12. Subtract the centroid deltas using Subtract() ->
+            13. Activation function for both current and future deltas ->
+            14. Encode deltas:
+                1. Inputs for current frame ->
+                2. Inputs across frames ->
+                3. Dense layer + normalization + activation ->
+                4. X0 (same frame) and X1 (across frames) are fed into these separately
+                5. Delta encoder and delta across frames encoder are created from X0 and X1, respectively.
+            15.
+
