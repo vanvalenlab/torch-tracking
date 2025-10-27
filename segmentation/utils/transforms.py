@@ -7,7 +7,7 @@ from skimage.morphology import ball, disk
 from skimage.morphology import binary_dilation
 from skimage.segmentation import find_boundaries
 
-from toolbox import erode_edges
+from utils.toolbox import erode_edges
 
 eps = 1e-7
 

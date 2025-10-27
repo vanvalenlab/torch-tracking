@@ -1,7 +1,7 @@
-from panoptic import PanopticNet
+from utils.panoptic import PanopticNet
 import torch
 import numpy as np
-from training_utils import semantic_loss
+from utils.training_utils import semantic_loss
 
 def create_model(
         input_shape,

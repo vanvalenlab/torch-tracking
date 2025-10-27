@@ -1,31 +1,20 @@
-from tqdm import tqdm
-
 import numpy as np
 import torch
-
 torch.set_num_threads(4)
+
+from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as transforms
 
 from utils.model import create_model
-from utils.toolbox import histogram_normalization
-from utils.loaders import SemanticDataset, CroppingDatasetTorch
-
-import typer
+from utils.loaders import SegmentationDataset
 
 from typing_extensions import Annotated
+import zarr
 
+import typer
 app = typer.Typer(pretty_exceptions_show_locals=False)
-
-def load_npz(data_dir, splits):
-
-    data = {}
-
-    for split in splits:
-        data[split] = np.load(f"{data_dir}/{split}.npz")
-
-    return data
 
 def train_one_epoch(model, dataloader, optimizer, losses, device):
     running_loss_avg = 0.
@@ -56,8 +45,6 @@ def create_data_loaders(
     train,
     val,
     crop_size=256,
-    min_objects=1,
-    seed=0,
     zoom_min=0.75,
     batch_size=16,
     outer_erosion_width=1,
@@ -93,30 +80,22 @@ def create_data_loaders(
             transforms.ToImage(),
         ])
 
-    print('STARTING PREPROCESS')
-    x_train = histogram_normalization(train["X"][0:100])
-    x_val = histogram_normalization(val["X"][0:100])
-    print('FINISH PREPROCESS')
-
-    y_train = train["y"][0:100]
-    y_val = val["y"][0:100]
-
-    cdt = CroppingDatasetTorch(
-        x_train, 
-        y_train,
+    train_dataset = SegmentationDataset(
+        train['X'], 
+        train['y'],
         in_transforms=in_transforms, 
         out_transforms=train_transforms,
         transforms_kwargs=transforms_kwargs)
     
-    sd = SemanticDataset(
-        x_val, 
-        y_val, 
+    val_dataset = SegmentationDataset(
+        val['X'], 
+        val['y'], 
         in_transforms=in_transforms, 
         out_transforms=val_transforms,
         transforms_kwargs=transforms_kwargs)  
       
-    dataloader = DataLoader(cdt, batch_size=batch_size, shuffle=True, num_workers=4)
-    valloader = DataLoader(sd, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     return dataloader, valloader
 
@@ -287,16 +266,15 @@ def main_torch(
     ] = "P1-P2-P3-P4-P5-P6-P7",
 ):
 
-    data = load_npz(data_path, ['train','val'])
+    z_train = zarr.open(f"{data_path}/train.zarr")
+    z_val = zarr.open(f"{data_path}/val.zarr")
 
     # Set up data generators with updated data
     train_data, val_data = create_data_loaders(
-        data["train"],
-        data["val"],
+        z_train,
+        z_val,
         crop_size=crop_size,
-        min_objects=min_objects,
         zoom_min=zoom_min,
-        seed=seed,
         batch_size=batch_size,
         outer_erosion_width=outer_erosion_width,
         inner_distance_alpha=inner_distance_alpha,

@@ -93,8 +93,6 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
                 
 
         all_layers = get_all_children(model_cls, ["relu", "layer1", "layer2", "layer3", "layer4"])
-        full_layers = [nn.Sequential(img_input, i) for i in all_layers]
-        specific_layers = full_layers
 
     elif _backbone in efficientnet_v2_backbones:
 
@@ -108,9 +106,10 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
         model = nn.Sequential(img_input, model_cls)
         all_layers = get_all_children(model_cls.features, ['0','2','3','4','6'])
 
-        
-        specific_layers = [nn.Sequential(img_input, i) for i in all_layers]
-
-    output_dict = {f'C{i + 1}': j for i, j in enumerate(specific_layers)}
+    else:
+        raise ValueError(f"Unknown backbone: {_backbone}")
+    
+    output_dict = {f'C{i + 1}': j for i, j in enumerate(all_layers)}
+    
     return (model, output_dict) if return_dict else model
 
