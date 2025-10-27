@@ -8,19 +8,29 @@ from torch.nn import LazyConv2d, LazyConv3d
 
 from utils.fpn import __create_pyramid_features
 from utils.fpn import __create_semantic_head
-from utils.layers import Location2D, TimeDistributed
+from utils.layers import Location2D
 from utils.backbone import get_backbone
 
 
-class combine_models(nn.Module):
-    def __init__(self, model_li):
+class PanopticModel(nn.Module):
+    """Wrapper that applies preprocessing once, then extracts features."""
+    
+    def __init__(self, preprocessing, semantic_heads):
         super().__init__()
-        self.model_li = nn.ModuleList(model_li)
-        self.input_shape = (None, 256, 256, 2)
-
+        self.preprocessing = preprocessing
+        self.semantic_heads = nn.ModuleList(semantic_heads)
+    
     def forward(self, x):
-        model_out_li = [self.model_li[i](x) for i in range(len(self.model_li))]        
-        return model_out_li
+        # Apply preprocessing ONCE
+        x_preprocessed = self.preprocessing(x)
+        
+        # Each semantic head processes the preprocessed input
+        # They share the same backbone/pyramid computation internally
+        outputs = []
+        for head in self.semantic_heads:
+            outputs.append(head(x_preprocessed))
+        
+        return outputs
 
 class concat_components(nn.Module):
     def __init__(self, path1, path2):
@@ -114,7 +124,6 @@ def PanopticNet(backbone,
     input_shape = (1, 256, 256)
     channel_axis = 1
 
-    # conv = Conv3D if frames_per_batch > 1 else Conv2D
     conv = LazyConv3d if frames_per_batch > 1 else LazyConv2d
     conv_kernel = (1, 1, 1) if frames_per_batch > 1 else (1, 1)
 
@@ -139,24 +148,12 @@ def PanopticNet(backbone,
         inputs = torch.randn(size=temp_input_shape)
             
     norm = nn.Identity()
-
-    # Add location layer
-    if location:
-        if frames_per_batch > 1:
-            # TODO: TimeDistributed is incompatible with channels_first
-            loc = TimeDistributed(Location2D(name='location'),
-                                  name='td_location')(norm)
-        else:
-            t_norm = [norm]
-            t_norm.append(Location2D())
-            loc = nn.Sequential(*t_norm)
-            
-        concat = concat_components(norm, loc)
-    else:
-        concat = norm
+    loc = nn.Sequential(norm, Location2D())
+        
+    concat = concat_components(norm, loc)
 
     # Force the channel size for backbone input to be `required_channels`
-    fixed_inputs = nn.Sequential(concat, conv(required_channels, conv_kernel, stride=1, padding='same'))
+    preprocessing = nn.Sequential(concat, conv(required_channels, conv_kernel, stride=1, padding='same'))
 
     # Set axis as 0 for pytorch's channels_first approach
     axis = 0
@@ -171,7 +168,7 @@ def PanopticNet(backbone,
         'input_shape': fixed_input_shape,
         'pooling': pooling
     }
-    _, backbone_dict = get_backbone(backbone, fixed_inputs,
+    _, backbone_dict = get_backbone(backbone, preprocessing,
                                     use_imagenet=use_imagenet,
                                     frames_per_batch=frames_per_batch,
                                     return_dict=True,
@@ -205,9 +202,7 @@ def PanopticNet(backbone,
             input_target=inputs, target_level=target_level,
             semantic_id=k, ndim=ndim, upsample_type=upsample_type,
             interpolation=interpolation, **kwargs))
+        
+    model = PanopticModel(preprocessing, semantic_head_list)
 
-    outputs = semantic_head_list
-    final_model = outputs
-    
-    model = combine_models(final_model)
     return model

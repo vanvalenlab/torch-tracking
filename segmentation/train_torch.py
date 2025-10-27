@@ -267,12 +267,12 @@ def main_torch(
 ):
 
     z_train = zarr.open(f"{data_path}/train.zarr")
-    z_train = zarr.open(f"{data_path}/train.zarr")
+    z_val = zarr.open(f"{data_path}/val.zarr")
 
     # Set up data generators with updated data
     train_data, val_data = create_data_loaders(
         z_train,
-        z_train,
+        z_val,
         crop_size=crop_size,
         zoom_min=zoom_min,
         batch_size=batch_size,
