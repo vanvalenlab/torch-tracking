@@ -371,29 +371,20 @@ class DNN():
         self.preprocess_kwargs = {
             'normalize': True
         }
-        t_step = time.time()
+        
         # Keep track of original shape for rescaling after processing
         orig_img_shape = image.shape
         resized_image = resize_input(image, image_mpp, self.model_mpp)
         image = preprocess(resized_image, **self.preprocess_kwargs)
-        print(f"Preprocess done in {round(time.time() - t_step)}s")
         
-        t_step = time.time()
         # Tile images, raises error if the image is not 4d
         tiles, tiles_info = tile_input(image, pad_mode=pad_mode, model_image_shape=self.model_image_shape)
-        print(f"Tiling done in {round(time.time() - t_step)}s")
 
-        t_step = time.time()
         output_tiles = batch_predict(tiles=tiles, batch_size=batch_size, model=self.model, device=self.device)
-        print(f"Prediction done in {round(time.time() - t_step)}s")
 
-        t_step = time.time()
         output_images = untile_output(output_tiles, tiles_info, self.model_image_shape)
-        print(f"Untiling done in {round(time.time() - t_step)}s")
 
-        t_step = time.time()
         label_image = postprocess(output_images, **self.postprocess_kwargs)
-        print(f"Postprocess done in {round(time.time() - t_step)}s")
 
         # Restore channel dimension if not already there
         # TODO: check if unnecessary

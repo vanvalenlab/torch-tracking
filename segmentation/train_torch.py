@@ -1,11 +1,13 @@
 import numpy as np
 import torch
 torch.set_num_threads(4)
+import sys
 
 from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as transforms
+from torch.utils.tensorboard import SummaryWriter
 
 from utils.model import create_model
 from utils.loaders import SegmentationDataset
@@ -107,10 +109,12 @@ def train_torch(dataloader,
     lr=1e-4,
     epochs=8,
     pyramid_levels=("P1", "P2", "P3", "P4", "P5", "P6", "P7"),
-    save_path_prefix = "data/saved_model"
+    save_path_prefix = "data/saved_model",
+    writer=None
 ):
 
     # torch.cuda.empty_cache()
+
     device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
     print(device)
 
@@ -122,8 +126,6 @@ def train_torch(dataloader,
         pyramid_levels=pyramid_levels
     )
 
-    loss_tracking = []
-    vloss_tracking = []
     decay_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.33, patience=5,)
 
@@ -145,7 +147,7 @@ def train_torch(dataloader,
         running_loss_avg = 0.
         count = 0
 
-        for batch in tqdm(dataloader):
+        for _, batch in enumerate(tqdm(dataloader)):
 
             li_inputs, li_labels = batch
             count += 1
@@ -164,11 +166,13 @@ def train_torch(dataloader,
         
             optimizer.step()
 
+
             running_loss_avg += loss.item()
 
 
         avg_loss = running_loss_avg/count
-        
+        writer.add_scalar('avg_loss/train', avg_loss, epoch)
+
         print("VAL")
 
         vcount = 0
@@ -178,7 +182,7 @@ def train_torch(dataloader,
         
         with torch.no_grad():
             
-            for batch in tqdm(valloader):
+            for _, batch in enumerate(tqdm(valloader)):
                 vcount += 1
 
                 li_inputs, li_labels = batch
@@ -189,15 +193,14 @@ def train_torch(dataloader,
                 vloss = sum([losses[j](voutputs[j], vlabels[j]) for j in range(len(losses))])
                     
                 running_vloss_avg += vloss
-                    
+
         avg_vloss = running_vloss_avg/vcount
+        writer.add_scalar('avg_loss/val', avg_vloss, epoch)
 
         decay_scheduler.step()
         plateau_scheduler.step(avg_vloss)
         print(decay_scheduler.get_last_lr())
         
-        loss_tracking.append(avg_loss)
-        vloss_tracking.append(avg_vloss)
         
         # Save model periodically
         if (epoch+1)%10==0:
@@ -231,6 +234,9 @@ def main_torch(
     ] = "data/models/",
     data_path: Annotated[
         str, typer.Option(help="Directory where training data is located")
+    ] = None,
+    run_info: Annotated[
+        str, typer.Option(help="Directory where run info/losses is stored")
     ] = None,
     epochs: Annotated[int, typer.Option(help="Number of training epochs")] = 16,
     seed: Annotated[int, typer.Option(help="Random seed")] = 0,
@@ -266,6 +272,10 @@ def main_torch(
     ] = "P1-P2-P3-P4-P5-P6-P7",
 ):
 
+
+    writer = SummaryWriter(run_info)
+    writer.add_text('command', ' '.join(sys.argv))
+
     z_train = zarr.open(f"{data_path}/train.zarr")
     z_val = zarr.open(f"{data_path}/val.zarr")
 
@@ -291,9 +301,11 @@ def main_torch(
         lr=lr,
         epochs=epochs,
         pyramid_levels=pyramid_levels.split("-"),
-        save_path_prefix=model_path+'saved_model'
+        save_path_prefix=model_path+'saved_model',
+        writer=writer
     )
-    
+
+    writer.close()
     torch.save(model.state_dict(), model_path+'last_model_dict.pth')
 
 

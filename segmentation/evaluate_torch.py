@@ -1,12 +1,11 @@
 import sys
-sys.path.append('utils/')
 
 import torch
 from collections import OrderedDict
 
-from model import create_prediction_model
-from evaluate_utils import evaluate
-from dnn import DNN
+from utils.model import create_prediction_model
+from utils.evaluate_utils import evaluate
+from utils.dnn import DNN
 
 import matplotlib.pyplot as plt
 import numpy as np
