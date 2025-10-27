@@ -17,6 +17,7 @@ class PanopticModel(nn.Module):
     
     def __init__(self, preprocessing, semantic_heads):
         super().__init__()
+        self.input_shape = (None, 256, 256, 2)
         self.preprocessing = preprocessing
         self.semantic_heads = nn.ModuleList(semantic_heads)
     

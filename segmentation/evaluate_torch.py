@@ -10,6 +10,8 @@ from utils.dnn import DNN
 import matplotlib.pyplot as plt
 import numpy as np
 
+import zarr
+
 import typer
 import yaml
 from skimage.color import label2rgb
@@ -17,14 +19,6 @@ from skimage.exposure import rescale_intensity
 from typing_extensions import Annotated
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
-def load_npz(data_dir, splits):
-
-    data = {}
-
-    for split in splits:
-        data[split] = np.load(f"{data_dir}/{split}.npz")
-
-    return data
 
 def create_overlays(x, gt, pred):
     x = np.squeeze(x)
@@ -60,9 +54,11 @@ def main(
         str, typer.Option(help="Path to the training data")
     ] = 'resnet50'
 ):
-    data = load_npz(data_path, ['test'])
-    X_test = data['test']["X"]
-    y_test = data['test']["y"]
+    
+    z_test = zarr.open(f"{data_path}/test.zarr")
+
+    X_test = z_test['X']
+    y_test = z_test['y']
 
     # Load model and application
     model = create_prediction_model(

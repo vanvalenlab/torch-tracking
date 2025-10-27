@@ -392,6 +392,7 @@ class DNN():
             image = np.expand_dims(image, axis=-1)
 
         label_image = resize_output(label_image, orig_img_shape)
+        
         if not return_transforms:
             return label_image
         else:
