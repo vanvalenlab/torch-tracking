@@ -5,3 +5,4 @@ torch-mesmer/
 *.ipynb
 */__pycache__/
 deepcell-tracking/
+segmentation/utils/__pycache__
