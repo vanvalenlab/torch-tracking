@@ -2,6 +2,7 @@ import sys
 
 import torch
 from collections import OrderedDict
+import itertools
 
 from utils.model import create_prediction_model
 from utils.evaluate_utils import evaluate
@@ -11,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import zarr
+from torch.utils.tensorboard import SummaryWriter
 
 import typer
 import yaml
@@ -52,9 +54,14 @@ def main(
     ] = None,
     backbone: Annotated[
         str, typer.Option(help="Path to the training data")
-    ] = 'resnet50'
+    ] = 'resnet50',
+    eval_info: Annotated[
+        str, typer.Option(help="Path to the training data")
+    ] = None
 ):
     
+    writer = SummaryWriter(eval_info)
+
     z_test = zarr.open(f"{data_path}/test.zarr")
 
     X_test = z_test['X']
@@ -70,34 +77,47 @@ def main(
 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
+
+    # maxima_thresholds = (0.1, 0.5, 0.7)
+    # small_objects_thresholds = (0, 2, 4)
+    # maxima_algorithms = ('concomp', 'h_maxima')
+
+    # hyperparam_combs = list(itertools.product(maxima_thresholds, small_objects_thresholds, maxima_algorithms))
+    
+    # for hyperparams in hyperparam_combs:
+
     postprocess_kwargs = {
                 'radius': 10,
                 'interior_index': 1,
                 'maxima_threshold': 0.1,
+                'interior_threshold': 0.05,
                 'exclude_border': False,
                 'small_objects_threshold': 0,
                 'min_distance': 10,
                 'maxima_algorithm': 'concomp'
             }
+    
     app = DNN(model=model, device=device, postprocess_kwargs=postprocess_kwargs)
 
     # evaluate the model
     # TODO: evaluate based on experiment data type
-    preds = app.predict(X_test)
+    preds = app.predict(X_test, batch_size=32)
     metrics = evaluate(preds, y_test)
 
-    all_metrics = {
-        "inference": OrderedDict(sorted(metrics.items())),
-    }
+    # all_metrics = {
+    #     "inference": OrderedDict(sorted(metrics.items())),
+    # }
 
-    # save a metadata.yaml file in the saved model directory
-    with open(metrics_path+'evaluate-metrics.yaml', "w") as f:
-        yaml.dump(all_metrics, f)
+    writer.add_hparams(postprocess_kwargs, metrics)
+
+    # # save a metadata.yaml file in the saved model directory
+    # with open(metrics_path+'evaluate-metrics.yaml', "w") as f:
+    #     yaml.dump(all_metrics, f)
 
     # Plot sample predictions
     n = 10
     # Configure plot
-    _, ax = plt.subplots(n, 2, figsize=(20, 10 * n))
+    fig, ax = plt.subplots(n, 2, figsize=(20, 10 * n))
     ax[0, 0].set_title("Ground Truth")
     ax[0, 1].set_title("Prediction")
     plt.tight_layout()
@@ -111,7 +131,10 @@ def main(
         ax[j, 1].imshow(pred)
         ax[j, 1].axis("off")
 
-    plt.savefig(metrics_path + 'sample_predictions.png')
+    # plt.savefig(metrics_path + 'sample_predictions.png')
+    writer.add_figure('sample_predictions', fig)
+
+    writer.close()
 
 if __name__ == "__main__":
     app()

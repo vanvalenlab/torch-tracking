@@ -358,14 +358,15 @@ class DNN():
 
         if self.postprocess_kwargs is None:
             self.postprocess_kwargs = {
-                'radius': 10,
-                'interior_index': 1,
-                'maxima_threshold': 0.1,
-                'exclude_border': False,
-                'small_objects_threshold': 0,
-                'min_distance': 10,
-                'maxima_algorithm': 'concomp'
-            }
+                        'radius': 10,
+                        'interior_index': 1,
+                        'maxima_threshold': 0.1,
+                        'interior_threshold': 0.05,
+                        'exclude_border': False,
+                        'small_objects_threshold': 0,
+                        'min_distance': 10,
+                        'maxima_algorithm': 'concomp'
+                    }
 
 
         self.preprocess_kwargs = {

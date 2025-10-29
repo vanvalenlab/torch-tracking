@@ -1089,7 +1089,7 @@ def deep_watershed(outputs,
 
         else:           
             # Find peaks and merge equal regions
-            markers = peak_concomp(maxima)
+            markers = peak_concomp(maxima, maxima_threshold=maxima_threshold)
 
         markers = label(markers)
         label_image = segmentation.watershed(-1 * interior, markers,

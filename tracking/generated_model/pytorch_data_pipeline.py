@@ -324,7 +324,6 @@ class TrkDataset(Dataset):
         
         # Initialize labels (default: 0 = no link)
         linkages = np.zeros((T-1, len(lineages), len(lineages)), dtype=np.int64)
-        labels = np.zeros((T-1, len(lineages)), dtype=np.int64)
 
         for _, track in lineages.items():
             labels[track['frames'], int(track['label'])-1] = int(track['label'])
