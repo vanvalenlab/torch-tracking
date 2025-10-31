@@ -11,83 +11,61 @@
         3 **to do** configure the loading function to bypass the TFRecord and load directly from either JSON or numpy.
         4. The TFRecordDataset object has built in functions like `.shuffle` for shuffling the data, `.map` for mapping the augmentations, and `.batch` for preparing batches. These have similarities to the `DataLoader` functions in PyTorch.
         5. Loading the validation dataset in the similar manner.
-3. Create the model:
-    1. `create_model` takes in several arguments:
-        - max_cells (int): maximum number of cells per movie in dataset
-        - strategy: tensorflow training strategy for synchronous training
-        - n_layers: number of graph convolution layers
-        - graph_layer: either GCS, GCN or GAT. We are using GCS for training.
-        - track_length: length of tracks, set to 8
-        - lr: learning rate, set to 1e-4
-        - n_filters: 64 (unsure what this means)
-        - embedding dim: 64
-        - encoder_dim: 64
-        -norm_layer: 'batch'
-    2. The model is composed by the GNNTrackingModel module, which does the following:
-        1. During the `__init__` stage, it uses the inputs to make the expected shapes
-        2. Model architecture for training branch is as follows:
-            1. Inputs:
-                - appearances
-                - morphologies
-                - centroids
-                - adjacency matrices
-            2. Reshape inputs using `tf.reshape` and store this in a `Lambda` layer beneath the inputs.
-            3. These inputs are passed into the `get_neighborhood_encoder` function.
-                1. The `appearance_encoder` is composed of:
-                    1. Inputs ->
-                    2. TimeDistributed layer (keras) -> ImageNormalization2D layer (deepcell) ->
-                    3. Nested 3D convolution layers spanning log base 2 indices of appearance shape. ->
-                        4. Normalization layer ->
-                        5. Activation layer (ReLU) ->
-                        6. MaxPool3D layer ->
-                    4. A lambda layer (squeeze across axes 2 and 3) ->
-                    5. A dense layer of shape `encoder_dim` ->
-                    6. A normalization layer ->
-                    7. Activation layer (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
-                2. The `morphology_encoder` is composed of:
-                    1. Inputs ->
-                    2. Dense layer of shape `encoder_dim` ->
-                    3. Normalization layer ->
-                    4. Activation (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
-                3. The `centroid_encoder` is composed of:
-                    1. Inputs ->
-                    2. Dense layer of shape `encoder_dim` ->
-                    3. Normalization layer ->
-                    4. Activation (ReLU) -> returned as an output `Model(inputs=inputs, outputs=x)` object.
-                4. Adjacency matrix is kept as-is.
-                5. Merging features into `Concatenate` object ->
-                6. Dense object the size of `n_filters` ->
-                7. Normalization layer ->
-                8. Activation layer (ReLU)
-                9. Construction of GNN convolution using the Spektral GCNConv GCSConv GATConv, depending on the input information. Graph layer depth is 3.
-                10. For each layer depth, pipes in `node_features` and adjacency amtrix into the graph layer ->
-                11. Normalization layer ->
-                12. Activation layer (ReLU) ->
-                13. Concatenating appearance features, morphology features, and node features ->
-                14. Dense layer ->
-                15. Normalization layer ->
-                16. Activation layer -> Returns Model of inputs (app, mo, ce, and adj encoders) and outputs (node_features).
-            4. Embeddings are "unmerged".
-                1. Inputs ->
-                2. Unmerge (deepcell layers) -> returns model
-            5. Centroids are "unmerged".
-                1. Inputs ->
-                2. Unmerge (deepcell layers) -> returns model
-            6. Lambda extracting current and future embedding
-            7. Merge the current embeddings with TemporalMerge layer from deepcell
-                1. Inputs ->
-                2. TemporalMerge ->
-            8. Compare the current and future embeddings using the Comparison layer from deepcell ->
-            9. Convert raw position information to deltas between positions in the current frame using Lambda ->
-            10. Pad the deltas with a constant matrix ->
-            11. Find deltas across frames between current and future using Lambda ->
-            12. Subtract the centroid deltas using Subtract() ->
-            13. Activation function for both current and future deltas ->
-            14. Encode deltas:
-                1. Inputs for current frame ->
-                2. Inputs across frames ->
-                3. Dense layer + normalization + activation ->
-                4. X0 (same frame) and X1 (across frames) are fed into these separately
-                5. Delta encoder and delta across frames encoder are created from X0 and X1, respectively.
-            15.
+3. Model architecture
+    1. Step 1: Neighborhood embedding ${\vec{N}}=[\vec{N_1}, \vec{N_2},...\vec{N_i}]$:
+        1. Appearance encoder ${\vec{A_i}}$:
+            1. Standard crop of each cell in the frame
+            2. Dense -> normalization -> activation
+            3. Returns appearance embedding
+        2. Centroid encoder ${\vec{C_i}}$:
+            1. X and Y coordinates of the centroid of each cell in the frame
+            2. Dense -> normalization -> activation
+            3. Returns centroid embedding
+        3. Morphology encoder ${\vec{M_i}}$:
+            1. area, perimeter, and eccentricity of each cell in the frame
+            2. Dense -> normalization -> activation
+            3. Returns morphology embedding
+        4. Neighborhood encoder ${\vec{N_i}}$:
+            1. Inputs: appearance, centroid, and morphology embeddings, adjacency matrix
+            2. Inputs concatenated except adjacency matrix
+            3. Dense -> normalization -> activation
+            4. Creates a graph layer with adjacency matrix and node features from embeddings above.
+            5. Normalization -> activation
+            6. Repeat 4-5 twice more.
+            7. Concat appearance, morphology, and node features (for some reason? why do we need to include the appearance and morphology if they're already embedded)
+            8. Dense -> normalization -> activation
+        9. Return node features and centroids
+    2. Step 2: Tracking inference ${P}$ (adjacency/probability matrix):
+        1. Reshape the embeddings to add back the time dimension:
+            1. Unmerge embeddings by reshaping the embeddings and adding time axis with `tf.reshape()`. Output shape is ${(8, 32, 64)}$
+        2. Reshape the centroids to add back the time dimension:
+            1. Unmerge centroids by reshaping the centroids and adding time axis with `tf.reshape()`. Output shape is ${(8, N_{cells}, X_i, Y_i)}$.
+        3. Merge current (-7:0) embeddings in a long short-term memory layer.
+            1. Reshape the temporal axis away from the inputs (-1, cells, 64)
+            2. Pass through an LSTM layer
+            3. Add back the time axis and return (-1, cells, time, 64)
+        4. Compare current LSTM embeddings and future embeddings.
+            1. Add a dimension at dimension 3 (to 5 dimensions) to both `x_current` and `x_future`.
+            2. Tile both to match across dimension 3
+            3. Return concatenated `x_current` and `x_future`
+        5. Encoding deltas (both local and across frames):
+            1. Convert centroids to deltas of cells relative to every other cell
+            2. Convert centroids to deltas of cells relative to every other cell across time
+            3. Activation (absolute value) -> Dense -> Activation (ReLU)
+            4. Merge deltas across frames to remove time axis
+            5. Concatenate current and future delta embeddings
+            6. Return ${[[X_{current}, X_{future}], [C_{current}, C_{future}]]}$
+        6. Decode tracking:
+            1. Concatenate embeddings and deltas
+            2. Dense -> normalization -> activation
+            3. Dense embedding with 3 classes (different, same, parent-child)
+    3. Softmax of three-class embedding to return adjacency matrix of shape ${(N_{cells}, N_{cells})}$, where 0 is different cell, 1 is same cell, 2 is parent-child.
+    4. Post-processing (reconstruction of lineages, swapping of track IDs in labeled image to match tracking labels)
+
+## PyTorch Pipeline
+
+        
+        
+    
+
 

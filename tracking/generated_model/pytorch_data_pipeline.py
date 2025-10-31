@@ -10,6 +10,23 @@ import zarr
 
 import numpy as np
 
+def get_max_cells(y):
+    """Helper function for finding the maximum number of cells in a frame of a movie, across
+    all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
+
+    Args:
+        y (np.array): Annotated image data
+
+    Returns:
+        int: The maximum number of cells in any frame
+    """
+    max_cells = 0
+    for frame in range(y.shape[0]):
+        cells = np.unique(y[frame])
+        n_cells = cells[cells != 0].shape[0]
+        if n_cells > max_cells:
+            max_cells = n_cells
+    return max_cells
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -35,7 +52,7 @@ class TrkDataset(Dataset):
         self,
         trk_path: Union[str, Path],
         track_length: int = 8,
-        max_cells: int = 39,
+        max_cells: int = None,
         crop_size: int = 32,
         stride: int = 1,
         appearance_shape: Tuple[int, int, int] = (32, 32, 1),
@@ -64,6 +81,10 @@ class TrkDataset(Dataset):
         self.y = self.trk_data['y']  # Segmentation masks (B, T, Y, X, C)
         self.lineages = self.trk_data['lineages'][0]  # Lineage information
         
+        self.labels = self._generate_labels(self.lineages)
+
+        self.max_cells = get_max_cells(self.y)
+        
         print(f"  X shape: {self.X.shape}")
         print(f"  y shape: {self.y.shape}")
         print(f"  Lineages: {len(self.lineages)}")
@@ -71,6 +92,24 @@ class TrkDataset(Dataset):
         # Build sample indices
         self.samples = self._build_sample_indices()
         print(f"  Created {len(self.samples)} samples")
+
+    def _get_max_cells(y):
+        """Helper function for finding the maximum number of cells in a frame of a movie, across
+        all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
+
+        Args:
+            y (np.array): Annotated image data
+
+        Returns:
+            int: The maximum number of cells in any frame
+        """
+        max_cells = 0
+        for frame in range(y.shape[0]):
+            cells = np.unique(y[frame])
+            n_cells = cells[cells != 0].shape[0]
+            if n_cells > max_cells:
+                max_cells = n_cells
+        return max_cells
     
     def _build_sample_indices(self) -> List[Dict]:
         """Build list of valid sample indices.
@@ -117,6 +156,7 @@ class TrkDataset(Dataset):
         # Extract raw images and masks for this sample
         raw_images = self.X[batch_idx, start_frame:end_frame]  # (T, Y, X, C)
         masks = self.y[batch_idx, start_frame:end_frame]  # (T, Y, X, C)
+        lineage = self.lineages[batch_idx]
         
         # Extract features from masks
         features = self._extract_features_from_masks(raw_images, masks)
@@ -124,7 +164,7 @@ class TrkDataset(Dataset):
         # Generate labels if in training mode
         if self.mode == 'training':
             labels = self._generate_labels(
-                batch_idx, start_frame, end_frame, features['cell_ids']
+                lineage, start_frame, end_frame
             )
             features['labels'] = labels
         
@@ -300,10 +340,7 @@ class TrkDataset(Dataset):
     
     def _generate_labels(
         self,
-        batch_idx: int,
-        start_frame: int,
-        end_frame: int,
-        cell_ids: np.ndarray
+        lineage: dict
     ) -> np.ndarray:
         """Generate ground truth tracking labels from lineages.
         
@@ -319,36 +356,54 @@ class TrkDataset(Dataset):
                 1: different cell
                 2: same cell (i in frame t links to j in frame t+1)
         """
-        lineages = self.lineages[batch_idx]
-        T = end_frame - start_frame
-        
-        # Initialize labels (default: 0 = no link)
-        linkages = np.zeros((T-1, len(lineages), len(lineages)), dtype=np.int64)
+        def get_max_frames(lineage):
 
-        for _, track in lineages.items():
-            labels[track['frames'], int(track['label'])-1] = int(track['label'])
+            movie_len = 0
+
+            for k, v in lineage.items():
+                curr_max = np.max(v['frames'])
+                if curr_max >= movie_len:
+                    movie_len = curr_max
+
+            return movie_len
         
-        # Generate labels for consecutive frame pairs
-        for t in range(T - 1):
-            ids_current = cell_ids[t]  # (N,)
-            ids_future = cell_ids[t + 1]  # (N,)
-            
-            for i, id_curr in enumerate(ids_current):
-                if id_curr <= 0:  # Padded/invalid cell
-                    continue
-                
-                for j, id_fut in enumerate(ids_future):
-                    if id_fut <= 0:  # Padded/invalid cell
-                        continue
-                    
-                    # Check if same cell
-                    if id_curr == id_fut:
-                        labels[t, i, j] = 2  # Same cell
-                    else:
-                        # Check if both are valid cells
-                        if id_curr in cell_to_track and id_fut in cell_to_track:
-                            labels[t, i, j] = 1  # Different cells
+        def get_max_label(lineage):
+
+            movie_len = 0
+
+            for k, v in lineage.items():
+                curr_max = v['label']
+                if curr_max >= movie_len:
+                    movie_len = curr_max
+
+            return int(movie_len)
         
+        max_label = lineage[list(lineage.keys())[-1]]['label']
+        max_frames = get_max_frames(lineage)
+
+        labels = np.zeros((max_frames, max_label, max_label), dtype=np.int64)
+
+        print(labels.shape)
+
+        for label, track in lineage.items():
+            # The frames where each track is linked to itself (encoded as 1)
+            frames_linked = track['frames'][:-1]
+
+            #Identity label
+            label = int(label) - 1
+
+            # Place all identities
+            labels[frames_linked, label, label] = 1
+
+            # Place all mitotic frames as linkages
+            if track['frame_div']:
+                frame_divided = track['frame_div']
+
+                daughter_label = track['daughters']
+                daughter_label = [daughter-1 for daughter in daughter_label]
+
+                labels[frame_divided-1, label, daughter_label] = 2
+
         return labels
     
     def _to_tensors(self, data: Dict) -> Dict[str, torch.Tensor]:
@@ -480,6 +535,8 @@ def create_trk_dataloaders(
     return tuple(loaders)
 
 
+
+
 # Example usage
 if __name__ == "__main__":
     print("Testing .trk Data Pipeline")
@@ -501,7 +558,7 @@ if __name__ == "__main__":
             track_length=8,
             max_cells=39,
             crop_size=32,
-            stride=4  # Sample every 4 frames for faster testing
+            stride=1  # Sample every 4 frames for faster testing
         )
         
         print(f"   Train batches: {len(train_loader)}")
