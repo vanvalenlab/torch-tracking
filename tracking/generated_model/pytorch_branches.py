@@ -73,17 +73,20 @@ class TrainingBranch(nn.Module):
             embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
             deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
         """
-        batch_size = appearances.shape[0]
+        print(appearances.shape)
+        batch_size, time_steps, max_cells, _, _ = appearances.shape
+        # batch_size = appearances.shape[0]
+        
         
         # Merge batch and temporal dimensions for neighborhood encoder
         # The neighborhood encoder expects (batch*time, ...)
-        time_steps = self.track_length
+        # time_steps = self.track_length
         
         # Reshape inputs: (B, T, ...) -> (B*T, ...)
-        app_reshaped = self._reshape_merge_time(appearances, batch_size, time_steps)
-        morph_reshaped = self._reshape_merge_time(morphologies, batch_size, time_steps)
-        cent_reshaped = self._reshape_merge_time(centroids, batch_size, time_steps)
-        adj_reshaped = self._reshape_merge_time(adj_matrices, batch_size, time_steps)
+        app_reshaped = self._reshape_merge_time(appearances, batch_size, time_steps, max_cells)
+        morph_reshaped = self._reshape_merge_time(morphologies, batch_size, time_steps, max_cells)
+        cent_reshaped = self._reshape_merge_time(centroids, batch_size, time_steps, max_cells)
+        adj_reshaped = self._reshape_merge_time(adj_matrices, batch_size, time_steps, max_cells)
         
         # Encode features with neighborhood encoder
         embeddings, centroids_out = self.neighborhood_encoder(
@@ -132,10 +135,10 @@ class TrainingBranch(nn.Module):
         
         return embedding_comparisons, deltas
 
-    def _reshape_merge_time(self, x, batch_size, time_steps):
+    def _reshape_merge_time(self, x, batch_size, time_steps, max_cells):
         """Helper to merge batch and time dimensions."""
         shape = x.shape
-        new_shape = (batch_size * time_steps,) + shape[2:]
+        new_shape = (batch_size * time_steps, max_cells) + shape[3:]
         return x.reshape(new_shape)
 
 

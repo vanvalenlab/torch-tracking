@@ -150,23 +150,24 @@ class MorphologyEncoder(nn.Module):
     def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
+        self.encoder_dim = encoder_dim
         self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.activation = nn.ReLU()
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch, time, input_dim)
+            x: Tensor of shape (batch, time, n_cells, input_dim)
         
         Returns:
-            Tensor of shape (batch, time, encoder_dim)
+            Tensor of shape (batch, time, n_cells, encoder_dim)
         """
-        batch_size, time_steps, _ = x.shape
+        batch_size, time_steps, max_cells, _ = x.shape
         
         # Reshape for dense layer
-        x = x.reshape(batch_size * time_steps, -1)
+        x = x.reshape(batch_size * time_steps, max_cells, -1)
         x = self.dense(x)
-        x = x.reshape(batch_size, time_steps, -1)
+        # x = x.reshape(batch_size, time_steps, max_cells, -1)
         
         # Apply normalization
         if isinstance(self.norm, nn.BatchNorm1d):
@@ -194,6 +195,7 @@ class CentroidEncoder(nn.Module):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
+        self.encoder_dim = encoder_dim
         self.activation = nn.ReLU()
 
     def forward(self, x):
@@ -204,12 +206,12 @@ class CentroidEncoder(nn.Module):
         Returns:
             Tensor of shape (batch, time, encoder_dim)
         """
-        batch_size, time_steps, _ = x.shape
+        batch_size, time_steps, max_cells, _ = x.shape
         
         # Reshape for dense layer
-        x = x.reshape(batch_size * time_steps, -1)
+        x = x.reshape(batch_size * time_steps, max_cells, -1)
         x = self.dense(x)
-        x = x.reshape(batch_size, time_steps, -1)
+        # x = x.reshape(batch_size, time_steps, -1)
         
         # Apply normalization
         if isinstance(self.norm, nn.BatchNorm1d):
@@ -348,9 +350,9 @@ class NeighborhoodEncoder(nn.Module):
     def forward(self, appearance, morphology, centroids, adj_matrix):
         """
         Args:
-            appearance: (batch, time, height, width, channels)
-            morphology: (batch, time, 3)
-            centroids: (batch, time, 2)
+            appearance: (batch, time, max_cells, height, width, channels)
+            morphology: (batch, time, max_cells, 3)
+            centroids: (batch, time, max_cells, 2)
             adj_matrix: (batch, time, max_cells, max_cells)
         
         Returns:
@@ -358,9 +360,9 @@ class NeighborhoodEncoder(nn.Module):
             centroids: (batch, time, 2) - passed through unchanged
         """
         # Encode each feature type
-        app_features = self.appearance_encoder(appearance)  # (B, T, encoder_dim)
-        morph_features = self.morphology_encoder(morphology)  # (B, T, encoder_dim)
-        centroid_features = self.centroid_encoder(centroids)  # (B, T, encoder_dim)
+        app_features = self.appearance_encoder(appearance)  # (B, T, N, encoder_dim)
+        morph_features = self.morphology_encoder(morphology)  # (B, T, N, encoder_dim)
+        centroid_features = self.centroid_encoder(centroids)  # (B, T, N, encoder_dim)
         
         batch_size, time_steps = app_features.shape[0], app_features.shape[1]
         
@@ -443,37 +445,39 @@ class NeighborhoodEncoder(nn.Module):
 # Example usage and tests
 if __name__ == "__main__":
     print("Testing encoder modules...\n")
+
+    max_cells = 39
     
     # Test AppearanceEncoder
     print("1. AppearanceEncoder")
     app_encoder = AppearanceEncoder(
-        appearance_shape=(1, 32, 32, 1),
+        appearance_shape=(max_cells, 32, 32, 1),
         n_filters=64,
         encoder_dim=64
     )
-    x = torch.randn(2, 1, 8, 32, 32)  # channels_first: (B, C, T, H, W)
+    x = torch.randn(2, max_cells, 8, 32, 32)  # channels_first: (B, C, T, H, W)
     out = app_encoder(x)
     print(f"   Input: {x.shape}, Output: {out.shape}")
-    print(f"   Expected output: (2, 8, 64)\n")
+    print(f"   Expected output: (2, max_cells 8, 64)\n")
     
     # Test MorphologyEncoder
     print("2. MorphologyEncoder")
     morph_encoder = MorphologyEncoder(input_dim=3, encoder_dim=64)
-    x = torch.randn(2, 8, 3)
+    x = torch.randn(2, max_cells, 8, 3)
     out = morph_encoder(x)
     print(f"   Input: {x.shape}, Output: {out.shape}\n")
     
     # Test CentroidEncoder
     print("3. CentroidEncoder")
     cent_encoder = CentroidEncoder(input_dim=2, encoder_dim=64)
-    x = torch.randn(2, 8, 2)
+    x = torch.randn(2, max_cells, 8, 2)
     out = cent_encoder(x)
     print(f"   Input: {x.shape}, Output: {out.shape}\n")
     
     # Test DeltaEncoder
     print("4. DeltaEncoder")
     delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
-    x = torch.randn(2, 8, 39, 2)
+    x = torch.randn(2, 7, max_cells, 39, 2)
     out = delta_encoder(x)
     print(f"   Input: {x.shape}, Output: {out.shape}\n")
     

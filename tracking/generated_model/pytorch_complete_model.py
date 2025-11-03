@@ -5,13 +5,13 @@ import torch
 import torch.nn as nn
 
 # Import all components (assumes they're in separate modules)
-from custom_layers import Unmerge, TemporalMerge
-from encoders import (
+from pytorch_custom_layers import Unmerge, TemporalMerge
+from pytorch_encoders import (
     AppearanceEncoder, MorphologyEncoder, CentroidEncoder,
     DeltaEncoder, NeighborhoodEncoder
 )
-from tracking_decoder import TrackingDecoder
-from branches import TrainingBranch, InferenceBranch
+from pytorch_tracking_decoder import TrackingDecoder
+from pytorch_branches import TrainingBranch, InferenceBranch
 
 
 class GNNTrackingModel(nn.Module):
@@ -362,9 +362,9 @@ if __name__ == "__main__":
     max_cells = 39
     
     # Create dummy data (channels_first format)
-    appearances = torch.randn(batch_size, 1, track_length, 32, 32)
-    morphologies = torch.randn(batch_size, track_length, 3)
-    centroids = torch.randn(batch_size, track_length, 2)
+    appearances = torch.randn(batch_size, track_length, max_cells, 32, 32)
+    morphologies = torch.randn(batch_size, track_length, max_cells, 3)
+    centroids = torch.randn(batch_size, track_length, max_cells, 2)
     adj_matrices = torch.rand(batch_size, track_length, max_cells, max_cells)
     
     print(f"   Input shapes:")
