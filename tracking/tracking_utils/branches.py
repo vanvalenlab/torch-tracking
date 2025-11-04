@@ -5,10 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Assuming these are imported from your other modules
-from pytorch_custom_layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
-from pytorch_custom_layers import compute_deltas, compute_deltas_across_frames
+from layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
+from layers import compute_deltas, compute_deltas_across_frames
 
-from pytorch_encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder
+from encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder
 
 
 class TrainingBranch(nn.Module):
@@ -75,10 +75,8 @@ class TrainingBranch(nn.Module):
             embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
             deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
         """
-        print(appearances.shape, morphologies.shape, centroids.shape)
         batch_size, app_channels, time_steps, max_cells, H, W = appearances.shape
 
-        print(batch_size, time_steps, max_cells)
         # batch_size = appearances.shape[0]
         
         
@@ -89,6 +87,7 @@ class TrainingBranch(nn.Module):
         # Reshape inputs: (B, T, ...) -> (B*T, ...)
         app_newshape = (batch_size * time_steps, app_channels, max_cells, H, W)
         app_reshaped = appearances.reshape(app_newshape)
+        
         morph_reshaped = morphologies.reshape((batch_size * time_steps, max_cells, 3))
         cent_reshaped = centroids.reshape((batch_size * time_steps, max_cells, 2))
         adj_reshaped = adj_matrices.reshape(batch_size*time_steps, max_cells, max_cells)
@@ -241,19 +240,6 @@ class InferenceBranch(nn.Module):
 if __name__ == "__main__":
     print("Testing Training and Inference Branches...\n")
     
-    # Create mock encoders (simplified for testing)
-    class MockNeighborhoodEncoder(nn.Module):
-        def __init__(self, embedding_dim):
-            super().__init__()
-            self.embedding_dim = embedding_dim
-        
-        def forward(self, app, morph, cent, adj):
-            batch_size = app.shape[0]
-            # Return mock embeddings and centroids
-            embeddings = torch.randn(batch_size, self.embedding_dim)
-            centroids = cent
-            return embeddings, centroids
-    
     batch_size = 2
     embedding_dim = 64
     encoder_dim = 64
@@ -268,7 +254,7 @@ if __name__ == "__main__":
     delta_encoder = nn.Linear(2, encoder_dim)
     delta_across_frames_encoder = nn.Linear(2, encoder_dim)
 
-    app_encoder = AppearanceEncoder(appearance_shape=(batch_size * track_length, max_cells, embedding_dim))
+    app_encoder = AppearanceEncoder(appearance_shape=(1, max_cells, 32, 32))
     mo_encoder = MorphologyEncoder(input_dim=3)
     cen_encoder = CentroidEncoder(input_dim=2)
     
@@ -353,10 +339,3 @@ if __name__ == "__main__":
     print()
     
     print("✅ Branch structure tests passed!")
-    
-    print("\n3. Key differences from TensorFlow:")
-    print("   - No Lambda layers - direct tensor operations")
-    print("   - Explicit reshaping with .reshape() and .view()")
-    print("   - No Input() layers needed")
-    print("   - Module composition instead of functional API")
-    print("   - Forward pass defined in forward() method")
