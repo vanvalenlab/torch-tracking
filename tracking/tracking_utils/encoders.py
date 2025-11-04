@@ -41,7 +41,7 @@ class AppearanceEncoder(nn.Module):
         self.data_format = data_format
         
         # Calculate number of pooling layers based on spatial dimensions
-        spatial_dim = appearance_shape[1]  # Assuming square images
+        spatial_dim = appearance_shape[-1]  # Assuming square images
         self.n_layers = int(math.log2(spatial_dim))
         
         # Input normalization
@@ -80,12 +80,21 @@ class AppearanceEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch, time, height, width, channels) if channels_last
-               or (batch, channels, time, height, width) if channels_first
+            x: Tensor of shape (batch, cells, time, height, width, channels) if channels_last
+               or (batch, channels, cells, time, height, width) if channels_first
         
         Returns:
-            Tensor of shape (batch, time, encoder_dim)
+            Tensor of shape (batch, cells, encoder_dim)
         """
+
+        # Merge tensors to be of shape (B*T, C, N, H, W) (rank 4)
+        if x.ndim > 5:
+            x = x.permute(0, 2, 1, 3, 4, 5)
+            x = x.view(x.shape[0]* x.shape[1], *x.shape[2:])
+        elif x.ndim < 5:
+            raise ValueError(f'''Input tensor to appearance encoder must be of rank 5, tensor x is of rank {x.ndim}.
+                             Check shape of tensor, which must be either of shape (B, C, N, T, H, W) or (B*T, C, N, H, W)''')
+        
         # Apply input normalization if needed
         if self.appearance_norm:
             # Need to handle temporal dimension
@@ -100,13 +109,15 @@ class AppearanceEncoder(nn.Module):
                 # Convert to channels_first: (B, T, H, W, C) -> (B, C, T, H, W)
                 x = x.permute(0, 4, 1, 2, 3)
             else:
-                # Already channels first: (B, C, T, H, W)
-                pass
+                # Need to move channel dimension to after big B (b*t)
+                x = self.img_norm(x)
         else:
             if self.data_format == 'channels_last':
                 # Convert to channels_first
                 x = x.permute(0, 4, 1, 2, 3)
         
+        # Before it goes into the conv blocks, it has to have the shape of (B*T, C, N, H, W)
+
         # Apply conv blocks
         for block in self.conv_blocks:
             x = block(x)
@@ -410,7 +421,7 @@ class NeighborhoodEncoder(nn.Module):
             else:
                 node_features_flat = norm(node_features_flat)
             
-            node_features_flat = activation(node_features_flat.permute(0,2,1))
+            node_features_flat = activation(node_features_flat.permute(0, 2, 1))
         
         # Reshape back
         node_features = node_features_flat.reshape(batch_size, time_steps, -1)
@@ -451,7 +462,14 @@ if __name__ == "__main__":
     app_in = torch.randn(16, 1, max_cells, 32, 32)  # channels_first: (B, C, N, H, W)
     app_out = app_encoder(app_in)
     print(f"   Input: {app_in.shape}, Output: {app_out.shape}")
-    
+
+    print()
+    print("1b. Appearance encoder with both batch and time dimensions")
+    app_in = torch.randn(2, 1, 8, max_cells, 32, 32)  # channels_first: (B, C, T, N, H, W)
+    app_out = app_encoder(app_in)
+    print(f"   Input: {app_in.shape}, Output: {app_out.shape}")
+    print()
+
     # Test MorphologyEncoder
     print("2. MorphologyEncoder")
     morph_encoder = MorphologyEncoder(input_dim=3, encoder_dim=64)

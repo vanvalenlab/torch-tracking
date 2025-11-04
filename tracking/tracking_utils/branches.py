@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
 from layers import compute_deltas, compute_deltas_across_frames
 
-from encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder
+from encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder, DeltaEncoder
 
 
 class TrainingBranch(nn.Module):
@@ -251,8 +251,8 @@ if __name__ == "__main__":
     delta_temporal_merge = TemporalMerge(encoder_dim)
     
     # Create delta encoders (simplified)
-    delta_encoder = nn.Linear(2, encoder_dim)
-    delta_across_frames_encoder = nn.Linear(2, encoder_dim)
+    delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
+    delta_across_frames_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
 
     app_encoder = AppearanceEncoder(appearance_shape=(1, max_cells, 32, 32))
     mo_encoder = MorphologyEncoder(input_dim=3)

@@ -58,7 +58,6 @@ class GNNTrackingModel(nn.Module):
         embedding_dim=64,
         n_layers=3,
         graph_layer='gcn',
-        appearance_shape=(1, 32, 32, 1),
         norm_layer='batch',
         appearance_norm=True,
         n_classes=3,
@@ -74,7 +73,7 @@ class GNNTrackingModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         self.graph_layer = graph_layer
-        self.appearance_shape = appearance_shape
+        self.appearance_shape = (1, self.max_cells, 32, 32)
         self.norm_layer = norm_layer
         self.appearance_norm = appearance_norm
         self.n_classes = n_classes
@@ -95,8 +94,8 @@ class GNNTrackingModel(nn.Module):
             raise ValueError(f'appearance_shape should be length 4, got {len(self.appearance_shape)}')
         
         # Check if spatial dims are square and power of 2
-        spatial_dim = self.appearance_shape[1]
-        if self.appearance_shape[1] != self.appearance_shape[2]:
+        spatial_dim = self.appearance_shape[-1]
+        if self.appearance_shape[-1] != self.appearance_shape[-2]:
             raise ValueError('Appearance shape should have square spatial dimensions')
         
         log2 = math.log2(spatial_dim)
@@ -344,8 +343,7 @@ if __name__ == "__main__":
         encoder_dim=64,
         embedding_dim=64,
         n_layers=3,
-        graph_layer='gcn',
-        appearance_shape=(1, 32, 32, 1),
+        graph_layer='gat',
         norm_layer='batch',
         appearance_norm=True,
         n_classes=3
@@ -362,10 +360,10 @@ if __name__ == "__main__":
     max_cells = 39
     
     # Create dummy data (channels_first format)
-    appearances = torch.randn(batch_size, track_length, max_cells, 32, 32)
-    morphologies = torch.randn(batch_size, track_length, max_cells, 3)
-    centroids = torch.randn(batch_size, track_length, max_cells, 2)
-    adj_matrices = torch.rand(batch_size, track_length, max_cells, max_cells)
+    appearances = torch.randn(batch_size, 1, track_length, model.max_cells, 32, 32)
+    morphologies = torch.randn(batch_size, track_length, model.max_cells, 3)
+    centroids = torch.randn(batch_size, track_length, model.max_cells, 2)
+    adj_matrices = torch.rand(batch_size, track_length, model.max_cells, max_cells)
     
     print(f"   Input shapes:")
     print(f"   - Appearances: {appearances.shape}")
@@ -374,18 +372,18 @@ if __name__ == "__main__":
     print(f"   - Adjacency matrices: {adj_matrices.shape}")
     print()
     
-    try:
-        # Get training outputs
-        logits = model.training_forward(
-            appearances, morphologies, centroids, adj_matrices,
-            return_logits=True
-        )
-        print(f"   Output shape: {logits.shape}")
-        print(f"   Expected: ({batch_size}, {track_length-1}, {max_cells}, {max_cells}, 3)")
-        print(f"   ✓ Training forward pass successful!")
-    except Exception as e:
-        print(f"   ✗ Error: {e}")
-    print()
+    # try:
+    # Get training outputs
+    logits = model.training_forward(
+        appearances, morphologies, centroids, adj_matrices,
+        return_logits=True
+    )
+    print(f"   Output shape: {logits.shape}")
+    print(f"   Expected: ({batch_size}, {track_length-1}, {max_cells}, {max_cells}, 3)")
+    print(f"   ✓ Training forward pass successful!")
+    # except Exception as e:
+    #     print(f"   ✗ Error: {e}")
+    # print()
     
     # Test inference forward pass
     print("3. Testing inference forward pass...")
