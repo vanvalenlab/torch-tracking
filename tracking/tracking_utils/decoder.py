@@ -19,9 +19,9 @@ class TrackingDecoder(nn.Module):
         encoder_dim (int): Dimension of delta/position features
         n_filters (int): Number of hidden units in intermediate layers
         n_classes (int): Number of output classes (default: 3)
-            - Class 0: No link / background
-            - Class 1: Different cell
-            - Class 2: Same cell (correct link)
+            - Class 0: No link, different cell
+            - Class 1: Same cell
+            - Class 2: Daughter cell
         norm_layer (str): 'batch' or 'layer' normalization
     """
     def __init__(

@@ -3,6 +3,5 @@ Caliban-2024_Schwartz_et_al/
 data/
 torch-mesmer/
 *.ipynb
-*/__pycache__/
+**/__pycache__/*
 deepcell-tracking/
-segmentation/utils/__pycache__
