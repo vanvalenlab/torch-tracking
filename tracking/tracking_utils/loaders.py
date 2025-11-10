@@ -2,7 +2,7 @@
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 from skimage.measure import regionprops
@@ -369,7 +369,7 @@ class TrkDataset(Dataset):
 
                     labels[i, frame_divided-1, label, daughter_label] = 2
 
-        return torch.as_tensor(labels), curr_max_cells
+        return torch.as_tensor(labels, dtype=torch.long), curr_max_cells
     
     def _to_tensors(self, data: Dict) -> Dict[str, torch.Tensor]:
         """Convert numpy arrays to PyTorch tensors."""
@@ -397,6 +397,95 @@ class TrkDataset(Dataset):
             tensors['labels'] = data['labels']
         
         return tensors
+    
+def unpad_collate_fn(batch):
+
+    actual_max_cells = batch[0]['max_cells']
+
+    assert all(sample['max_cells'] == actual_max_cells for sample in batch), \
+        "Batch contains samples from different movies with different cell counts!"
+    
+    collated = {}
+
+    # Stack appearances: (B, T, N, H, W, C) but slice N to actual_max_cells
+    appearances = torch.stack([
+        sample['appearances'][:, :actual_max_cells]  # (T, N_actual, H, W, C)
+        for sample in batch
+    ])
+    collated['appearances'] = appearances  # (B, T, N_actual, H, W, C)
+    
+    # Stack morphologies
+    morphologies = torch.stack([
+        sample['morphologies'][:, :actual_max_cells]  # (T, N_actual, 3)
+        for sample in batch
+    ])
+    collated['morphologies'] = morphologies
+    
+    # Stack centroids
+    centroids = torch.stack([
+        sample['centroids'][:, :actual_max_cells]  # (T, N_actual, 2)
+        for sample in batch
+    ])
+    collated['centroids'] = centroids
+    
+    # Stack adjacency matrices
+    adj_matrices = torch.stack([
+        sample['adj_matrices'][:, :actual_max_cells, :actual_max_cells]  # (T, N_actual, N_actual)
+        for sample in batch
+    ])
+    collated['adj_matrices'] = adj_matrices
+    
+    # Stack labels (also unpad!)
+    if 'labels' in batch[0]:
+        labels = torch.stack([
+            sample['labels'][:, :actual_max_cells, :actual_max_cells]  # (T-1, N_actual, N_actual)
+            for sample in batch
+        ])
+        collated['labels'] = labels
+    
+    # Store actual_max_cells for reference
+    collated['actual_max_cells'] = actual_max_cells
+    
+    return collated
+
+class BatchSampler(Sampler):
+
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        self.movie_groups = {}
+        for idx, sample in enumerate(dataset.samples):
+            movie_id = sample['batch_idx']
+            if movie_id not in self.movie_groups:
+                self.movie_groups[movie_id] = []
+            self.movie_groups[movie_id].append(idx)
+
+        self.batches = []
+        for movie_id, indices in self.movie_groups.items():
+            for i in range(0, len(indices), self.batch_size):
+                # Split samples from each movie into batches of length batch size
+
+                batch = indices[i:i+self.batch_size]
+                if len(batch) == self.batch_size:
+
+                    # Keep full batches only
+                    self.batches.append(batch)
+
+    def __iter__(self):
+
+        if self.shuffle:
+            indices = torch.randperm(len(self.batches)).tolist()
+            batches = [self.batches[i] for i in indices]
+        else:
+            batches = self.batches
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.batches)
 
 
 def create_trk_dataloaders(
@@ -442,12 +531,11 @@ def create_trk_dataloaders(
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
+        batch_sampler = BatchSampler(train_dataset, batch_size=batch_size, shuffle=True),
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
-    )
+        collate_fn=unpad_collate_fn
+        )
     loaders.append(train_loader)
     
     # Validation loader
@@ -463,10 +551,10 @@ def create_trk_dataloaders(
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_sampler = BatchSampler(val_dataset, batch_size=batch_size, shuffle=False),
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=unpad_collate_fn
         )
         loaders.append(val_loader)
     else:
@@ -485,17 +573,17 @@ def create_trk_dataloaders(
         
         test_loader = DataLoader(
             test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_sampler = BatchSampler(test_dataset, batch_size=batch_size, shuffle=False),
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=unpad_collate_fn
         )
+
         loaders.append(test_loader)
     else:
         loaders.append(None)
     
     return tuple(loaders)
-
 
 
 

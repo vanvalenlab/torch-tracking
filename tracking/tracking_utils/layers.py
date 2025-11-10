@@ -133,15 +133,14 @@ class Unmerge(nn.Module):
         max_cells (int): Maximum number of cells/tracks per frame.
         embedding_dim (int): Dimension of embeddings.
     """
-    def __init__(self, track_length, max_cells, embedding_dim):
+    def __init__(self, track_length, embedding_dim):
         super().__init__()
         self.track_length = track_length
-        self.max_cells = max_cells
         self.embedding_dim = embedding_dim
 
-    def forward(self, x):
+    def forward(self, x, max_cells):
         batch_size = x.shape[0] // self.track_length
-        return x.view(batch_size, self.track_length, self.max_cells, self.embedding_dim)
+        return x.view(batch_size, self.track_length, max_cells, self.embedding_dim)
 
 
 class TemporalMerge(nn.Module):

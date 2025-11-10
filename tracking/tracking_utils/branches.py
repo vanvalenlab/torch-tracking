@@ -57,8 +57,8 @@ class TrainingBranch(nn.Module):
         self.encoder_dim = encoder_dim
         
         # Layers for unmerging temporal dimensions
-        self.unmerge_embeddings = Unmerge(track_length, max_cells, embedding_dim)
-        self.unmerge_centroids = Unmerge(track_length, max_cells, 2)
+        self.unmerge_embeddings = Unmerge(track_length,embedding_dim)
+        self.unmerge_centroids = Unmerge(track_length, 2)
         
         # Comparison layer
         self.comparison = Comparison()
@@ -75,21 +75,18 @@ class TrainingBranch(nn.Module):
             embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
             deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
         """
-        batch_size, app_channels, time_steps, max_cells, H, W = appearances.shape
 
-        # batch_size = appearances.shape[0]
-        
+        batch_size, time_steps, max_cells, H, W, C = appearances.shape
         
         # Merge batch and temporal dimensions for neighborhood encoder
         # The neighborhood encoder expects (batch*time, ...)
-        # time_steps = self.track_length
         
         # Reshape inputs: (B, T, ...) -> (B*T, ...)
-        app_newshape = (batch_size * time_steps, app_channels, max_cells, H, W)
+        app_newshape = (batch_size * time_steps * max_cells, H, W, C)
         app_reshaped = appearances.reshape(app_newshape)
         
-        morph_reshaped = morphologies.reshape((batch_size * time_steps, max_cells, 3))
-        cent_reshaped = centroids.reshape((batch_size * time_steps, max_cells, 2))
+        morph_reshaped = morphologies.reshape((batch_size * time_steps * max_cells, 3))
+        cent_reshaped = centroids.reshape((batch_size * time_steps * max_cells, 2))
         adj_reshaped = adj_matrices.reshape(batch_size*time_steps, max_cells, max_cells)
         
         # Encode features with neighborhood encoder
@@ -98,8 +95,8 @@ class TrainingBranch(nn.Module):
         )
         
         # Unmerge temporal dimension: (B*T, F) -> (B, T, N, F)
-        embeddings = self.unmerge_embeddings(embeddings)
-        centroids_out = self.unmerge_centroids(centroids_out)
+        embeddings = self.unmerge_embeddings(embeddings, max_cells)
+        centroids_out = self.unmerge_centroids(centroids_out, max_cells)
         
         # Split into current and future frames
         embeddings_current = embeddings[:, :-1]  # (B, T-1, N, F)
@@ -113,6 +110,7 @@ class TrainingBranch(nn.Module):
         
         # Process centroids to get deltas
         # 1. Compute deltas within each frame (across tracks)
+
         deltas_within = compute_deltas(centroids_out)  # (B, T, N, 2)
         deltas_within = torch.abs(deltas_within)
         
@@ -132,18 +130,12 @@ class TrainingBranch(nn.Module):
         # (B, T-1, N, encoder_dim) -> (B, T-1, N, 1, encoder_dim)
         deltas_within_current = deltas_within_current.unsqueeze(3)
         # Tile to (B, T-1, N, N, encoder_dim)
-        deltas_within_current = deltas_within_current.expand(-1, -1, -1, self.max_cells, -1)
+        deltas_within_current = deltas_within_current.expand(-1, -1, -1, max_cells, -1)
         
         # Concatenate within and across deltas
         deltas = torch.cat([deltas_within_current, deltas_across_enc], dim=-1)
         
         return embedding_comparisons, deltas
-
-    def _reshape_merge_time(self, x, batch_size, time_steps, max_cells):
-        """Helper to merge batch and time dimensions."""
-        shape = x.shape
-        new_shape = (batch_size * time_steps, max_cells) + shape[3:]
-        return x.reshape(new_shape)
 
 
 class InferenceBranch(nn.Module):
@@ -250,11 +242,10 @@ if __name__ == "__main__":
     embedding_temporal_merge = TemporalMerge(embedding_dim)
     delta_temporal_merge = TemporalMerge(encoder_dim)
     
-    # Create delta encoders (simplified)
     delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
     delta_across_frames_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
 
-    app_encoder = AppearanceEncoder(appearance_shape=(1, max_cells, 32, 32))
+    app_encoder = AppearanceEncoder(appearance_shape=(32, 32, 1), data_format='channels_last')
     mo_encoder = MorphologyEncoder(input_dim=3)
     cen_encoder = CentroidEncoder(input_dim=2)
     
@@ -277,7 +268,7 @@ if __name__ == "__main__":
     )
     
     # Create sample inputs
-    appearances = torch.randn(batch_size, 1, track_length, max_cells,  32, 32)
+    appearances = torch.randn(batch_size, track_length, max_cells,  32, 32, 1)
     morphologies = torch.randn(batch_size, track_length, max_cells, 3)
     centroids = torch.randn(batch_size, track_length, max_cells, 2)
     adj_matrices = torch.randn(batch_size, track_length, max_cells, max_cells)

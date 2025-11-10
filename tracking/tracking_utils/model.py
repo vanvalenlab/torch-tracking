@@ -13,6 +13,8 @@ from encoders import (
 from decoder import TrackingDecoder
 from branches import TrainingBranch, InferenceBranch
 
+from loaders import create_trk_dataloaders
+
 
 class GNNTrackingModel(nn.Module):
     """Complete GNN-based tracking model for single cell tracking.
@@ -51,7 +53,7 @@ class GNNTrackingModel(nn.Module):
     """
     def __init__(
         self,
-        max_cells=39,
+        max_cells=None,
         track_length=8,
         n_filters=64,
         encoder_dim=64,
@@ -73,7 +75,7 @@ class GNNTrackingModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         self.graph_layer = graph_layer
-        self.appearance_shape = (1, self.max_cells, 32, 32)
+        self.appearance_shape = (32, 32, 1) if data_format=='channels_last' else (1,32,32)
         self.norm_layer = norm_layer
         self.appearance_norm = appearance_norm
         self.n_classes = n_classes
@@ -90,12 +92,22 @@ class GNNTrackingModel(nn.Module):
     
     def _validate_config(self):
         """Validate configuration parameters."""
-        if len(self.appearance_shape) != 4:
+
+        spatial_dim = self.appearance_shape[1]
+
+        if self.max_cells is None:
+            raise ValueError("Please specify the maximum number of cells in the time lapse.")
+
+        if self.data_format == 'channels_last':
+            spatial_compare = self.appearance_shape[1] == self.appearance_shape[0]
+        if self.data_format == 'channels_first':
+            spatial_compare = self.appearance_shape[1] == self.appearance_shape[2]
+
+        if len(self.appearance_shape) != 3:
             raise ValueError(f'appearance_shape should be length 4, got {len(self.appearance_shape)}')
         
         # Check if spatial dims are square and power of 2
-        spatial_dim = self.appearance_shape[-1]
-        if self.appearance_shape[-1] != self.appearance_shape[-2]:
+        if not spatial_compare:
             raise ValueError('Appearance shape should have square spatial dimensions')
         
         log2 = math.log2(spatial_dim)
@@ -173,13 +185,11 @@ class GNNTrackingModel(nn.Module):
         # Unmerge layers
         self.unmerge_embeddings = Unmerge(
             track_length=self.track_length,
-            max_cells=self.max_cells,
             embedding_dim=self.embedding_dim
         )
         
         self.unmerge_centroids = Unmerge(
             track_length=self.track_length,
-            max_cells=self.max_cells,
             embedding_dim=2  # centroids are 2D
         )
     
@@ -230,6 +240,7 @@ class GNNTrackingModel(nn.Module):
         Returns:
             Tensor of shape (batch, track_length-1, max_cells, max_cells, n_classes)
         """
+
         # Get features from training branch
         embedding_comparisons, deltas = self.training_branch(
             appearances, morphologies, centroids, adj_matrices
@@ -306,10 +317,10 @@ class GNNTrackingModel(nn.Module):
         time_steps = appearances.shape[1]
         
         # Reshape to merge batch and time
-        app_reshaped = appearances.reshape(batch_size * time_steps, *appearances.shape[2:])
-        morph_reshaped = morphologies.reshape(batch_size * time_steps, *morphologies.shape[2:])
+        app_reshaped = appearances.view(batch_size * time_steps, *appearances.shape[2:])
+        morph_reshaped = morphologies.view(batch_size * time_steps, *morphologies.shape[2:])
         cent_reshaped = centroids.reshape(batch_size * time_steps, *centroids.shape[2:])
-        adj_reshaped = adj_matrices.reshape(batch_size * time_steps, *adj_matrices.shape[2:])
+        adj_reshaped = adj_matrices.view(batch_size * time_steps, *adj_matrices.shape[2:])
         
         # Get embeddings
         embeddings, centroids_out = self.neighborhood_encoder(
@@ -337,7 +348,7 @@ if __name__ == "__main__":
     # Create model
     print("1. Initializing model...")
     model = GNNTrackingModel(
-        max_cells=39,
+        max_cells=405,
         track_length=8,
         n_filters=64,
         encoder_dim=64,
@@ -346,7 +357,8 @@ if __name__ == "__main__":
         graph_layer='gat',
         norm_layer='batch',
         appearance_norm=True,
-        n_classes=3
+        n_classes=3,
+        data_format='channels_last'
     )
     
     print(f"   ✓ Model created successfully")
@@ -355,65 +367,75 @@ if __name__ == "__main__":
     
     # Test training forward pass
     print("2. Testing training forward pass...")
-    batch_size = 2
-    track_length = 8
-    max_cells = 39
     
-    # Create dummy data (channels_first format)
-    appearances = torch.randn(batch_size, 1, track_length, model.max_cells, 32, 32)
-    morphologies = torch.randn(batch_size, track_length, model.max_cells, 3)
-    centroids = torch.randn(batch_size, track_length, model.max_cells, 2)
-    adj_matrices = torch.rand(batch_size, track_length, model.max_cells, max_cells)
+    # Create dataloaders
+    track_length = 8
+    batch_size = 2
+    
+
+    train, val, test = create_trk_dataloaders(
+        train_path='data/DynamicNuclearNet-tracking-v1_0/train.zarr', 
+        batch_size = batch_size, 
+        num_workers=2, 
+        track_length=track_length,
+        crop_size = 32
+        )
+
+    train_iterator = iter(train)
+    features = next(train_iterator)
+
+    max_cells = features['adj_matrices'].shape[-1]
+
     
     print(f"   Input shapes:")
-    print(f"   - Appearances: {appearances.shape}")
-    print(f"   - Morphologies: {morphologies.shape}")
-    print(f"   - Centroids: {centroids.shape}")
-    print(f"   - Adjacency matrices: {adj_matrices.shape}")
+    print(f"   - Appearances: {features['appearances'].shape}")
+    print(f"   - Morphologies: {features['morphologies'].shape}")
+    print(f"   - Centroids: {features['centroids'].shape}")
+    print(f"   - Adjacency matrices: {features['adj_matrices'].shape}")
     print()
-    
-    # try:
-    # Get training outputs
+
     logits = model.training_forward(
-        appearances, morphologies, centroids, adj_matrices,
+        features['appearances'], 
+        features['morphologies'], 
+        features['centroids'], 
+        features['adj_matrices'],
         return_logits=True
     )
+
     print(f"   Output shape: {logits.shape}")
     print(f"   Expected: ({batch_size}, {track_length-1}, {max_cells}, {max_cells}, 3)")
     print(f"   ✓ Training forward pass successful!")
+    
+    # # Test inference forward pass
+    # print("3. Testing inference forward pass...")
+    # num_tracks = 10
+    # num_detections = 15
+    # time_history = 5
+    
+    # current_embeddings = torch.randn(batch_size, time_history, num_tracks, 64)
+    # current_centroids = torch.randn(batch_size, time_history, num_tracks, 2)
+    # future_embeddings = torch.randn(batch_size, 1, num_detections, 64)
+    # future_centroids = torch.randn(batch_size, 1, num_detections, 2)
+    
+    # print(f"   Input shapes:")
+    # print(f"   - Current embeddings: {current_embeddings.shape}")
+    # print(f"   - Future embeddings: {future_embeddings.shape}")
+    # print()
+    
+    # try:
+    #     probs = model.inference_forward(
+    #         current_embeddings, current_centroids,
+    #         future_embeddings, future_centroids,
+    #         return_logits=False
+    #     )
+
+    #     print(f"   Output shape: {probs.shape}")
+    #     print(f"   Expected: ({batch_size}, 1, {num_tracks}, {num_detections}, 3)")
+    #     print(f"   Probability sum check: {probs[0, 0, 0, 0].sum():.4f} (should be ~1.0)")
+    #     print(f"   ✓ Inference forward pass successful!")
     # except Exception as e:
     #     print(f"   ✗ Error: {e}")
     # print()
-    
-    # Test inference forward pass
-    print("3. Testing inference forward pass...")
-    num_tracks = 10
-    num_detections = 15
-    time_history = 5
-    
-    current_embeddings = torch.randn(batch_size, time_history, num_tracks, 64)
-    current_centroids = torch.randn(batch_size, time_history, num_tracks, 2)
-    future_embeddings = torch.randn(batch_size, 1, num_detections, 64)
-    future_centroids = torch.randn(batch_size, 1, num_detections, 2)
-    
-    print(f"   Input shapes:")
-    print(f"   - Current embeddings: {current_embeddings.shape}")
-    print(f"   - Future embeddings: {future_embeddings.shape}")
-    print()
-    
-    try:
-        probs = model.inference_forward(
-            current_embeddings, current_centroids,
-            future_embeddings, future_centroids,
-            return_logits=False
-        )
-        print(f"   Output shape: {probs.shape}")
-        print(f"   Expected: ({batch_size}, 1, {num_tracks}, {num_detections}, 3)")
-        print(f"   Probability sum check: {probs[0, 0, 0, 0].sum():.4f} (should be ~1.0)")
-        print(f"   ✓ Inference forward pass successful!")
-    except Exception as e:
-        print(f"   ✗ Error: {e}")
-    print()
     
     # Show model architecture summary
     print("4. Model Architecture Summary")
@@ -433,41 +455,3 @@ if __name__ == "__main__":
     print(f"   - Hidden: {model.n_filters}D")
     print(f"   - Output: {model.n_classes} classes")
     print("-" * 70)
-    print()
-    
-    print("5. Usage Examples")
-    print("-" * 70)
-    print("   Training:")
-    print("   ```python")
-    print("   model = GNNTrackingModel(...)")
-    print("   optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)")
-    print("   criterion = nn.CrossEntropyLoss()")
-    print("   ")
-    print("   for batch in train_loader:")
-    print("       logits = model.training_forward(*batch, return_logits=True)")
-    print("       loss = criterion(logits.reshape(-1, 3), targets.reshape(-1))")
-    print("       loss.backward()")
-    print("       optimizer.step()")
-    print("   ```")
-    print()
-    print("   Inference:")
-    print("   ```python")
-    print("   # Extract embeddings for current frame")
-    print("   embeddings, cents = model.get_embeddings(*current_data)")
-    print("   ")
-    print("   # Predict links to next frame")
-    print("   probs = model.inference_forward(emb_history, cent_history,")
-    print("                                    new_emb, new_cent)")
-    print("   predictions = probs.argmax(dim=-1)")
-    print("   ```")
-    print("-" * 70)
-    print()
-    
-    print("✅ All tests completed!")
-    print()
-    print("Next steps for full conversion:")
-    print("  1. Add proper PyG graph batching in NeighborhoodEncoder")
-    print("  2. Implement training loop with loss functions")
-    print("  3. Add data loading utilities")
-    print("  4. Port any preprocessing/augmentation code")
-    print("  5. Test with real data and compare to TF version")

@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATv2Conv
+from torch_geometric.data import Data, Batch
+
+from torch_geometric.utils import dense_to_sparse
 
 # Import custom layers (assumes they're in the same directory)
 from layers import ImageNormalization2D
@@ -41,7 +44,7 @@ class AppearanceEncoder(nn.Module):
         self.data_format = data_format
         
         # Calculate number of pooling layers based on spatial dimensions
-        spatial_dim = appearance_shape[-1]  # Assuming square images
+        spatial_dim = appearance_shape[1]  # Assuming square images
         self.n_layers = int(math.log2(spatial_dim))
         
         # Input normalization
@@ -58,17 +61,17 @@ class AppearanceEncoder(nn.Module):
         self.conv_blocks = nn.ModuleList()
         for i in range(self.n_layers):
             block = nn.Sequential(
-                nn.Conv3d(
+                nn.Conv2d(  # Note: Conv2d, not Conv3d!
                     in_channels if i == 0 else n_filters,
                     n_filters,
-                    kernel_size=(1, 3, 3),
+                    kernel_size=3,
                     stride=1,
-                    padding=(0, 1, 1),
+                    padding=1,
                     bias=False
                 ),
-                nn.BatchNorm3d(n_filters) if norm_layer == 'batch' else nn.LayerNorm([n_filters]),
+                nn.BatchNorm2d(n_filters) if norm_layer == 'batch' else nn.GroupNorm(8, n_filters),
                 nn.ReLU(),
-                nn.MaxPool3d(kernel_size=(1, 2, 2))
+                nn.MaxPool2d(kernel_size=2)
             )
             self.conv_blocks.append(block)
         
@@ -80,69 +83,37 @@ class AppearanceEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch, cells, time, height, width, channels) if channels_last
-               or (batch, channels, cells, time, height, width) if channels_first
-        
-        Returns:
-            Tensor of shape (batch, cells, encoder_dim)
-        """
+            x: Tensor of shape (batch * cells * time, channels, height, width)
 
-        # Merge tensors to be of shape (B*T, C, N, H, W) (rank 4)
-        if x.ndim > 5:
-            x = x.permute(0, 2, 1, 3, 4, 5)
-            x = x.view(x.shape[0]* x.shape[1], *x.shape[2:])
-        elif x.ndim < 5:
-            raise ValueError(f'''Input tensor to appearance encoder must be of rank 5, tensor x is of rank {x.ndim}.
-                             Check shape of tensor, which must be either of shape (B, C, N, T, H, W) or (B*T, C, N, H, W)''')
+        Returns:
+            Tensor of shape (batch, time, cells, encoder_dim)
+        """
         
-        # Apply input normalization if needed
         if self.appearance_norm:
-            # Need to handle temporal dimension
-            batch_size = x.shape[0]
+            # For normalization, we need channels_last or channels_first based on config
             if self.data_format == 'channels_last':
-                # (B, T, H, W, C) -> (B*T, H, W, C)
-                time_steps = x.shape[1]
-                x = x.view(batch_size * time_steps, *x.shape[2:])
+                # (B*T*N, H, W, C) format
                 x = self.img_norm(x)
-                # Back to (B, T, H, W, C)
-                x = x.view(batch_size, time_steps, *x.shape[1:])
-                # Convert to channels_first: (B, T, H, W, C) -> (B, C, T, H, W)
-                x = x.permute(0, 4, 1, 2, 3)
+                # Convert to channels_first for Conv2d: (B*T*N, H, W, C) -> (B*T*N, C, H, W)
+                x = x.permute(0, 3, 1, 2)
             else:
-                # Need to move channel dimension to after big B (b*t)
+                # Already channels_first: (B*T*N, C, H, W)
                 x = self.img_norm(x)
         else:
             if self.data_format == 'channels_last':
                 # Convert to channels_first
-                x = x.permute(0, 4, 1, 2, 3)
-        
-        # Before it goes into the conv blocks, it has to have the shape of (B*T, C, N, H, W)
+                x = x.permute(0, 3, 1, 2)
 
         # Apply conv blocks
         for block in self.conv_blocks:
             x = block(x)
-        
+
         # After pooling, spatial dimensions should be 1x1
-        # Squeeze them: (B, C, T, 1, 1) -> (B, C, T)
-        x = x.squeeze(-1).squeeze(-1)
-        
-        # Permute to (B, T, C) for dense layer
-        x = x.permute(0, 2, 1)
-        
-        # Apply final dense layer
-        batch_size, time_steps, _ = x.shape
-        x = x.reshape(batch_size * time_steps, -1)
+        # Squeeze them: (B, C, N, 1, 1) -> (B, C, N)
+        x = x.squeeze(-1).squeeze(-1).squeeze(-1)
+
         x = self.dense(x)
-        x = x.reshape(batch_size, time_steps, -1)
-        
-        # Apply normalization (handling batch norm carefully)
-        if isinstance(self.final_norm, nn.BatchNorm1d):
-            x = x.permute(0, 2, 1)  # (B, T, C) -> (B, C, T)
-            x = self.final_norm(x)
-            x = x.permute(0, 2, 1)  # Back to (B, T, C)
-        else:
-            x = self.final_norm(x)
-        
+        x = self.final_norm(x)
         x = self.final_activation(x)
         
         return x
@@ -168,10 +139,10 @@ class MorphologyEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch, time, n_cells, input_dim)
+            x: Tensor of shape (batch * n_cells, input_dim)
         
         Returns:
-            Tensor of shape (batch, time, n_cells, encoder_dim)
+            Tensor of shape (batch * n_cells, encoder_dim)
         """
         
         # Reshape for dense layer
@@ -179,9 +150,9 @@ class MorphologyEncoder(nn.Module):
         
         # Apply normalization
         if isinstance(self.norm, nn.BatchNorm1d):
-            x = x.permute(0, 2, 1)
+            # x = x.permute(0, 2, 1)
             x = self.norm(x)
-            x = x.permute(0, 2, 1)
+            # x = x.permute(0, 2, 1)
         else:
             x = self.norm(x)
         
@@ -209,10 +180,10 @@ class CentroidEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch, time, input_dim)
+            x: Tensor of shape (batch * time, input_dim)
         
         Returns:
-            Tensor of shape (batch, time, encoder_dim)
+            Tensor of shape (batch * time, encoder_dim)
         """
         
         # Reshape for dense layer
@@ -220,13 +191,12 @@ class CentroidEncoder(nn.Module):
         
         # Apply normalization
         if isinstance(self.norm, nn.BatchNorm1d):
-            x = x.permute(0, 2, 1)
             x = self.norm(x)
-            x = x.permute(0, 2, 1)
         else:
             x = self.norm(x)
         
         x = self.activation(x)
+
         return x
 
 
@@ -262,12 +232,12 @@ class DeltaEncoder(nn.Module):
         original_shape = x.shape
         
         # Flatten all but last dimension
-        x = x.reshape(-1, original_shape[-1])
+        x = x.view(-1, original_shape[-1])
         x = self.dense(x)
         
         # Reshape back
         new_shape = list(original_shape[:-1]) + [x.shape[-1]]
-        x = x.reshape(new_shape)
+        x = x.view(new_shape)
         
         # Apply normalization - LayerNorm is easier for variable shapes
         if self.norm_layer_type == 'batch':
@@ -317,10 +287,8 @@ class NeighborhoodEncoder(nn.Module):
         
         # Initial feature combination
         # Concatenate all encoders' outputs
-        combined_dim = (appearance_encoder.encoder_dim + 
-                       morphology_encoder.encoder_dim + 
-                       centroid_encoder.encoder_dim)
-        
+        combined_dim = (3 * self.embedding_dim)
+                
         self.initial_dense = nn.Linear(combined_dim, n_filters)
         self.initial_norm = nn.BatchNorm1d(n_filters) if norm_layer == 'batch' else nn.LayerNorm(n_filters)
         self.initial_activation = nn.ReLU()
@@ -352,30 +320,70 @@ class NeighborhoodEncoder(nn.Module):
         self.final_norm = nn.BatchNorm1d(embedding_dim) if norm_layer == 'batch' else nn.LayerNorm(embedding_dim)
         self.final_activation = nn.ReLU()
 
+    def _apply_batched_gnn(self, gnn_layer, node_features, adj_matrices):
+            
+            """Apply GNN using PyG batching (efficient)."""
+            batch_size = node_features.shape[0]
+        
+            # Create list of PyG Data objects
+            graph_list = []
+        
+            for i in range(batch_size):
+                nodes = node_features[i]  # (max_cells, features)
+                adj = adj_matrices[i]     # (max_cells, max_cells)
+                
+                # Convert to edge_index
+                edge_index = adj.nonzero().t()
+                
+                graph_list.append(Data(x=nodes, edge_index=edge_index))
+            
+            # Batch graphs
+            batched_graph = Batch.from_data_list(graph_list)
+            
+            # Apply GNN to batched graph
+            out = gnn_layer(batched_graph.x, batched_graph.edge_index)
+            
+            # Unbatch
+            # out is (B*T*max_cells, features)
+            # Reshape to (B*T, max_cells, features)
+            out = out.view(batch_size, -1, out.shape[-1])
+        
+            return out
+
     def forward(self, appearance, morphology, centroids, adj_matrix):
         """
+
         Args:
-            appearance: (batch, time, max_cells, height, width, channels)
-            morphology: (batch, time, max_cells, 3)
-            centroids: (batch, time, max_cells, 2)
-            adj_matrix: (batch, time, max_cells, max_cells)
+            appearance: (batch * time * max_cells, height, width, channels)
+            morphology: (batch * time * max_cells, 3)
+            centroids: (batch * time * max_cells, 2)
+            adj_matrix: (batch * time, max_cells, max_cells)
+            batch_size: (int) size of batch
+            n_frames: (int) number of frames in batch
+            max_cells: (int) max cells in training batch
         
         Returns:
-            node_features: (batch, time, embedding_dim)
-            centroids: (batch, time, 2) - passed through unchanged
+            node_features: (batch * time, max_cells, embedding_dim)
+            centroids: (batch * time, max_cells, 2) - passed through only reshaped
         """
+
+        BT, N, _ = adj_matrix.shape  # (B*T, max_cells, max_cells)
+
         # Encode each feature type
-        app_features = self.appearance_encoder(appearance)  # (B,  N, encoder_dim)
-        morph_features = self.morphology_encoder(morphology)  # (B, N, encoder_dim)
-        centroid_features = self.centroid_encoder(centroids)  # (B, N, encoder_dim)
-        
-        batch_size, time_steps = app_features.shape[0], app_features.shape[1]
-        
+        app_features = self.appearance_encoder(appearance)  # (B * T *  N, encoder_dim)
+        morph_features = self.morphology_encoder(morphology)  # (B * T * N, encoder_dim)
+        centroid_features = self.centroid_encoder(centroids)  # (B * T * N, encoder_dim)
+
+        app_features = app_features.view(BT, N, -1)
+        morph_features = morph_features.view(BT, N, -1)
+        centroid_features = centroid_features.view(BT, N, -1)
+
         # Concatenate features
         node_features = torch.cat([app_features, morph_features, centroid_features], dim=-1)
 
         # Initial dense layer
         node_features = self.initial_dense(node_features)
+
 
         if isinstance(self.initial_norm, nn.BatchNorm1d):
             node_features = node_features.permute(0, 2, 1)
@@ -385,53 +393,36 @@ class NeighborhoodEncoder(nn.Module):
             node_features = self.initial_norm(node_features)
         
         node_features = self.initial_activation(node_features)
-        
+
         # Apply graph convolutions
         # Need to flatten batch and time for PyG
-        node_features_flat = node_features
+
         
         # Convert adj_matrix to edge_index format for PyG
         # adj_matrix shape: (B, T, N, N)
-        adj_flat = adj_matrix
-        
+
         # For each graph in the batch, apply GNN
         # This is simplified - in practice you'd want to create proper batched graphs
         # Here we assume fully connected within each time step
-        for i, (layer, norm, activation) in enumerate(zip(self.graph_layers, self.graph_norms, self.graph_activations)):
-            # Simplified: treat each (B*T) as separate graph
-            # In production, you'd create proper PyG Data objects
-            
-            # For GCN, we need edge_index and edge_weight
-            # This is a simplified version - proper implementation would batch graphs correctly
-            node_features_list = []
-            for b in range(app_features.shape[0]):
-                adj_b = adj_flat[b]
-                edge_index = adj_b.nonzero().t()
+        for gnn_layer, norm, activation in zip(
+            self.graph_layers, self.graph_norms, self.graph_activations
+        ):
+            # GNN expects batched graphs
+            node_features = self._apply_batched_gnn(
+                gnn_layer, node_features, adj_matrix
+            )
 
-                nodes_b = node_features_flat[b:b+1]
+            node_features = node_features.permute(0,2,1)
+            node_features = norm(node_features)
+            node_features = node_features.permute(0,2,1)
 
-                out_b = layer(nodes_b.squeeze(0), edge_index)
-                node_features_list.append(out_b.unsqueeze(0))
-            
-            node_features_flat = torch.cat(node_features_list, dim=0)
-            
-            # Apply normalization
-            if isinstance(norm, nn.BatchNorm1d):
-                node_features_flat = norm(node_features_flat.permute(0, 2, 1))
-            else:
-                node_features_flat = norm(node_features_flat)
-            
-            node_features_flat = activation(node_features_flat.permute(0, 2, 1))
-        
-        # Reshape back
-        node_features = node_features_flat.reshape(batch_size, time_steps, -1)
+            node_features = activation(node_features)
+
         
         # Final concatenation and dense layer
-        concat = torch.cat([app_features, morph_features, node_features], dim=-1)
+        node_features = torch.cat([app_features, morph_features, node_features], dim=-1)
         
-        concat = concat.reshape(batch_size * time_steps, -1)
-        node_features = self.final_dense(concat)
-        node_features = node_features.reshape(batch_size, time_steps, -1)
+        node_features = self.final_dense(node_features)
         
         if isinstance(self.final_norm, nn.BatchNorm1d):
             node_features = node_features.permute(0, 2, 1)
@@ -441,6 +432,7 @@ class NeighborhoodEncoder(nn.Module):
             node_features = self.final_norm(node_features)
         
         node_features = self.final_activation(node_features)
+        centroids = centroids.view(BT, N, -1)
         
         return node_features, centroids
 
@@ -450,43 +442,22 @@ if __name__ == "__main__":
     print("Testing encoder modules...\n")
 
     max_cells = 39
-    
-    # Test AppearanceEncoder
-    print("1. AppearanceEncoder")
-    app_encoder = AppearanceEncoder(
-        appearance_shape=(1, max_cells, 32, 32),
-        n_filters=64,
-        encoder_dim=64
-    )
+    batch_size = 2
+    n_frames = 8
 
-    app_in = torch.randn(16, 1, max_cells, 32, 32)  # channels_first: (B, C, N, H, W)
-    app_out = app_encoder(app_in)
-    print(f"   Input: {app_in.shape}, Output: {app_out.shape}")
+    app_encoder = AppearanceEncoder(appearance_shape=(1, 32, 32))
+    app_in = torch.randn(batch_size * n_frames * max_cells, 1, 32, 32)  # channels_last: (B * T * N, C, H, W)
 
-    print()
-    print("1b. Appearance encoder with both batch and time dimensions")
-    app_in = torch.randn(2, 1, 8, max_cells, 32, 32)  # channels_first: (B, C, T, N, H, W)
-    app_out = app_encoder(app_in)
-    print(f"   Input: {app_in.shape}, Output: {app_out.shape}")
-    print()
-
-    # Test MorphologyEncoder
-    print("2. MorphologyEncoder")
     morph_encoder = MorphologyEncoder(input_dim=3, encoder_dim=64)
-    morph_in = torch.randn(16, max_cells, 3)
-    morph_out = morph_encoder(morph_in)
-    print(f"   Input: {morph_in.shape}, Output: {morph_out.shape}\n")
-    print()
+    morph_in = torch.randn(batch_size * n_frames * max_cells, 3)
 
-    # Test CentroidEncoder
-    print("3. CentroidEncoder")
+
     cent_encoder = CentroidEncoder(input_dim=2, encoder_dim=64)
-    cent_in = torch.randn(16, max_cells, 2)
-    cent_out = cent_encoder(cent_in)
-    print(f"   Input: {cent_in.shape}, Output: {cent_out.shape}\n")
+    cent_in = torch.randn(batch_size * n_frames * max_cells, 2)
+
 
     # Test NeighborhoodEncoder
-    adj_matrix = torch.randn(16, max_cells, max_cells)
+    adj_matrix = torch.randn(batch_size * n_frames, max_cells, max_cells)
     n_encoder = NeighborhoodEncoder(appearance_encoder=app_encoder,
                                     morphology_encoder=morph_encoder,
                                     centroid_encoder=cent_encoder, graph_layer='gat'
