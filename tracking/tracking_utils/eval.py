@@ -410,7 +410,7 @@ def run_online_tracking(
     Returns:
         tracks: List of track dictionaries
     """
-    from trk_data_loader import TrkDataset
+    from loaders import TrkDataset
     
     tracker = CellTracker(
         model=model,

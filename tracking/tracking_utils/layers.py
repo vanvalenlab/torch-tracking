@@ -133,14 +133,11 @@ class Unmerge(nn.Module):
         max_cells (int): Maximum number of cells/tracks per frame.
         embedding_dim (int): Dimension of embeddings.
     """
-    def __init__(self, track_length, embedding_dim):
+    def __init__(self):
         super().__init__()
-        self.track_length = track_length
-        self.embedding_dim = embedding_dim
 
-    def forward(self, x, max_cells):
-        batch_size = x.shape[0] // self.track_length
-        return x.view(batch_size, self.track_length, max_cells, self.embedding_dim)
+    def forward(self, x, batch_size, track_length, max_cells):
+        return x.view(batch_size, track_length, max_cells, -1)
 
 
 class TemporalMerge(nn.Module):
@@ -178,7 +175,7 @@ class TemporalMerge(nn.Module):
         x, _ = self.lstm(x)
         
         # Reshape back
-        # (B*N, T, F) -> (B, T, N, F)
+        # (B*T, T, F) -> (B, T, N, F)
         x = x.reshape(batch_size, time_steps, num_tracks, self.encoder_dim)
         
         return x
@@ -198,7 +195,7 @@ def compute_deltas(x):
     deltas = x[:, 1:] - x[:, :-1]
     
     # Pad at the beginning with zeros
-    pad_shape = [0, 0] * (len(x.shape) - 2) + [1, 0, 0, 0]
+    pad_shape = [0, 0] * (len(x.shape) - 2) + [1, 0]
     deltas = F.pad(deltas, pad_shape)
     
     return deltas

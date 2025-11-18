@@ -7,8 +7,6 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATv2Conv
 from torch_geometric.data import Data, Batch
 
-from torch_geometric.utils import dense_to_sparse
-
 # Import custom layers (assumes they're in the same directory)
 from layers import ImageNormalization2D
 
@@ -216,9 +214,7 @@ class DeltaEncoder(nn.Module):
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
         self.norm_layer_type = norm_layer
-        
-        # We'll create norms dynamically based on input shape
-        # since deltas can have different dimensions
+
 
     def forward(self, x):
         """

@@ -27,19 +27,17 @@ class TrackingDecoder(nn.Module):
     def __init__(
         self,
         embedding_dim=64,
-        encoder_dim=64,
         n_filters=64,
         n_classes=3,
         norm_layer='batch'
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.encoder_dim = encoder_dim
         self.n_filters = n_filters
         self.n_classes = n_classes
         
         # Input dimension: concatenated embeddings (2x) + deltas (2x)
-        input_dim = 2 * embedding_dim + 2 * encoder_dim
+        input_dim = 4 * self.embedding_dim
         
         # First dense layer
         self.dense1 = nn.Linear(input_dim, n_filters)
@@ -77,7 +75,7 @@ class TrackingDecoder(nn.Module):
         batch_size, time_steps, tracks_current, tracks_future, features = x.shape
         
         # Flatten for dense layer: (B, T, X, Y, F) -> (B*T*X*Y, F)
-        x = x.reshape(-1, features)
+        x = x.view(-1, features)
         
         # First dense layer with normalization
         x = self.dense1(x)
@@ -95,7 +93,7 @@ class TrackingDecoder(nn.Module):
         x = self.dense_out(x)
         
         # Reshape back: (B*T*X*Y, C) -> (B, T, X, Y, C)
-        x = x.reshape(batch_size, time_steps, tracks_current, tracks_future, self.n_classes)
+        x = x.view(batch_size, time_steps, tracks_current, tracks_future, self.n_classes)
         
         # Apply softmax if requested (for inference)
         if apply_softmax:
@@ -174,7 +172,7 @@ class TrackingDecoderWithAttention(nn.Module):
         batch_size, time_steps, tracks_current, tracks_future, features = x.shape
         
         # Reshape for attention: treat each (current, future) pair as sequence
-        x = x.reshape(batch_size * time_steps, tracks_current * tracks_future, features)
+        x = x.view(batch_size * time_steps, tracks_current * tracks_future, features)
         
         # Self-attention
         x_attn, _ = self.attention(x, x, x)
@@ -183,7 +181,7 @@ class TrackingDecoderWithAttention(nn.Module):
         x = x + x_attn
         
         # Flatten for dense layers
-        x = x.reshape(-1, features)
+        x = x.view(-1, features)
         
         # First dense block
         x = self.dense1(x)
@@ -205,7 +203,7 @@ class TrackingDecoderWithAttention(nn.Module):
         x = self.dense_out(x)
         
         # Reshape back
-        x = x.reshape(batch_size, time_steps, tracks_current, tracks_future, self.n_classes)
+        x = x.view(batch_size, time_steps, tracks_current, tracks_future, self.n_classes)
         
         # Apply softmax if requested
         if apply_softmax:

@@ -11,55 +11,99 @@ from typing import Dict
 import time
 
 from model import GNNTrackingModel
-from loaders import create_trk_dataloaders
-
+from loader import create_trk_dataloaders
 
 class TrackingLoss(nn.Module):
-    """Custom loss function for cell tracking.
     
-    Combines cross-entropy loss with optional class weights to handle
-    class imbalance (many more "no link" pairs than "same cell" pairs).
-    
-    Args:
-        class_weights (list or tensor): Weights for each class [no_link, different, same]
-        ignore_index (int): Index to ignore in loss computation (for padding)
-    """
-    def __init__(self, class_weights=None, ignore_index=-100):
+    def __init__(self, alpha=None, gamma=2.0, use_focal=True):
         super().__init__()
         
-        if class_weights is not None:
-            if not isinstance(class_weights, torch.Tensor):
-                class_weights = torch.tensor(class_weights, dtype=torch.float32)
+        if alpha is None:
+            # Default: aggressive weighting for minority classes
+            # Adjust these based on your actual class distribution
+            alpha = torch.tensor([1.0, 20.0, 30.0])  # [no_link, same_cell, mitosis]
         
-        self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=ignore_index,
-            reduction='mean'
-        )
+        self.alpha = alpha
+        self.gamma = gamma
+        self.use_focal = use_focal
+        self.pad_value = -1
+        
+        # Standard CrossEntropyLoss with class weights
+        self.criterion = nn.CrossEntropyLoss(weight=alpha, reduction='none', ignore_index=self.pad_value)
+
+    def _weighted_categorical_crossentropy(self, y_true, y_pred,
+                                        n_classes=3, axis=None,
+                                        from_logits=False):
+        
+        """Categorical crossentropy between an output tensor and a target tensor.
+        Automatically computes the class weights from the target image and uses
+        them to weight the cross entropy
+
+        Args:
+            y_true: A tensor of the same shape as ``y_pred``.
+            y_pred: A tensor resulting from a softmax
+                (unless ``from_logits`` is ``True``, in which
+                case ``y_pred`` is expected to be the logits).
+            from_logits: Boolean, whether ``y_pred`` is the
+                result of a softmax, or is a tensor of logits.
+
+        Returns:
+            tensor: Output tensor.
+        """
+
+        # scale preds so that the class probas of each sample sum to 1
+        y_pred = y_pred / torch.sum(y_pred, dim=axis, keepdims=True)
+        # manual computation of crossentropy
+        eps=1e-10
+        _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
+        y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
+        total_sum = torch.sum(y_true)
+        class_sum = torch.sum(y_true, dim=0, keepdims=True)
+        class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
+        return - torch.mean((y_true * torch.log(y_pred) * class_weights), dim=axis)
     
     def forward(self, predictions, targets):
+        
         """
         Args:
-            predictions: (B, T-1, N, M, 3) logits
-            targets: (B, T-1, N, M) class labels
+            predictions: (B, T, N, M, 3) logits from model
+            targets: (B, T, N, M) integer class labels [0, 1, 2]
         
         Returns:
-            loss: scalar tensor
+            loss: scalar loss value
         """
-        # Flatten predictions and targets
-        B, T, N, M, C = predictions.shape
-        predictions_flat = predictions.reshape(-1, C)  # (B*T*N*M, 3)
-        targets_flat = targets.reshape(-1)  # (B*T*N*M,)
+
+        # # Reshape for CrossEntropyLoss
+        predictions_flat = predictions.view(-1, predictions.shape[-1])  # (B*T*N*M, 3)
+        targets_flat = targets.view(-1, targets.shape[-1]).long()  # (B*T*N*M)
         
-        loss = self.criterion(predictions_flat, targets_flat)
-        return loss
+        # Compute weighted cross-entropy
+        ce_loss = self._weighted_categorical_crossentropy(targets_flat, predictions_flat, targets_flat.shape[-1])
+        
+        # Apply focal loss modulation
+        if self.use_focal:
+            with torch.no_grad():
+                # Get probability of true class
+                pt = torch.exp(-ce_loss)
+            
+            # Apply focal weight: focus on hard examples
+            focal_weight = (1 - pt) ** self.gamma
+            loss = focal_weight * ce_loss
+        else:
+            loss = ce_loss
+        
+        return loss.mean()
 
 
 class MetricsTracker:
-    """Track training and validation metrics."""
+    """FIXED: Proper masking and per-class metrics.
+    
+    Replace the MetricsTracker class in training.py with this version.
+    """
     
     def __init__(self):
         self.reset()
+        self.pad_value = -1
     
     def reset(self):
         self.total_loss = 0.0
@@ -70,37 +114,44 @@ class MetricsTracker:
         # Per-class metrics
         self.class_correct = {0: 0, 1: 0, 2: 0}
         self.class_total = {0: 0, 1: 0, 2: 0}
+        self.class_predicted = {0: 0, 1: 0, 2: 0}
     
     def update(self, loss, predictions, targets):
         """
         Args:
             loss: scalar loss value
-            predictions: (B, T-1, N, M, 3) logits
-            targets: (B, T-1, N, M) labels
+            predictions: (B, T, N, M, 3) logits
+            targets: (B, T, N, M) integer labels
+            actual_max_cells: int, actual number of cells in this batch
         """
+
         batch_size = predictions.shape[0]
         self.total_loss += loss.item() * batch_size
         self.total_samples += batch_size
         
-        # Compute accuracy
-        pred_classes = predictions.argmax(dim=-1)  # (B, T-1, N, M)
-        
-        # Mask out padding (assuming -100 or negative values are padding)
-        valid_mask = targets >= 0
-        
-        correct = (pred_classes == targets) & valid_mask
+        # Get predicted classes
+        pred_classes = predictions.argmax(dim=-1)  # (B*T*N*M)
+        target_classes = targets.argmax(dim=-1)
+                
+        # Only consider pairs within actual_max_cells range
+        valid_mask = target_classes != self.pad_value
+
+        # Overall accuracy
+        correct = (pred_classes == target_classes)
         self.correct += correct.sum().item()
-        self.total_predictions += valid_mask.sum().item()
+        self.total_predictions += target_classes.sum().item()
         
-        # Per-class accuracy
+        # Per-class metrics
         for class_idx in range(3):
-            class_mask = (targets == class_idx) & valid_mask
-            class_correct = (pred_classes == class_idx) & class_mask
+            class_mask = (target_classes == class_idx)
+            class_predicted_mask = (pred_classes == class_idx)
+            class_correct = (pred_classes == class_idx) & class_mask 
             
             self.class_correct[class_idx] += class_correct.sum().item()
             self.class_total[class_idx] += class_mask.sum().item()
+            self.class_predicted[class_idx] += class_predicted_mask.sum().item()
     
-    def get_metrics(self) -> Dict[str, float]:
+    def get_metrics(self):
         """Compute and return current metrics."""
         avg_loss = self.total_loss / max(self.total_samples, 1)
         accuracy = self.correct / max(self.total_predictions, 1)
@@ -110,11 +161,22 @@ class MetricsTracker:
             'accuracy': accuracy
         }
         
-        # Add per-class accuracies
+        # Add per-class metrics
         for class_idx in range(3):
-            class_acc = (self.class_correct[class_idx] / 
-                        max(self.class_total[class_idx], 1))
-            metrics[f'accuracy_class_{class_idx}'] = class_acc
+            # Recall: of all true class_idx, how many did we predict correctly?
+            recall = (self.class_correct[class_idx] / 
+                     max(self.class_total[class_idx], 1))
+            
+            # Precision: of all predicted class_idx, how many were correct?
+            precision = (self.class_correct[class_idx] / 
+                        max(self.class_predicted[class_idx], 1))
+            
+            # F1 score
+            f1 = 2 * precision * recall / (precision + recall + 1e-10)
+            
+            metrics[f'recall_class_{class_idx}'] = recall
+            metrics[f'precision_class_{class_idx}'] = precision
+            metrics[f'f1_class_{class_idx}'] = f1
         
         return metrics
 
@@ -202,8 +264,7 @@ class Trainer:
         if loss_fn is None:
             # Default: weighted cross-entropy to handle class imbalance
             # Typically: no_link >> different > same_cell in frequency
-            class_weights = [0.1, 1.0, 2.0]  # Adjust based on your data
-            self.loss_fn = TrackingLoss(class_weights=class_weights)
+            self.loss_fn = TrackingLoss(use_focal=False, gamma=3.0)
         else:
             self.loss_fn = loss_fn
         
@@ -241,7 +302,11 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]')
         
         for batch_idx, batch in enumerate(pbar):
-            # Move batch to device
+            
+            if batch_idx >= 512:
+                break
+
+            # Unpad and move batch to device
             appearances = batch['appearances'].to(self.device)
             morphologies = batch['morphologies'].to(self.device)
             centroids = batch['centroids'].to(self.device)
@@ -253,7 +318,7 @@ class Trainer:
             
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=True
+                return_logits=False
             )
             
             # Compute loss
@@ -273,14 +338,16 @@ class Trainer:
             
             # Update metrics
             with torch.no_grad():
-                predictions_probs = torch.softmax(predictions, dim=-1)
-                metrics_tracker.update(loss, predictions_probs, labels)
+                metrics_tracker.update(loss, predictions, labels)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
+                'mit_acc': f"{current_metrics['precision_class_2']:.4f}",
+                'same_acc': f"{current_metrics['precision_class_1']:.4f}",
+                'no_acc': f"{current_metrics['precision_class_0']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}",
-                'acc': f"{current_metrics['accuracy']:.4f}"
+
             })
         
         return metrics_tracker.get_metrics()
@@ -300,25 +367,27 @@ class Trainer:
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
             labels = batch['labels'].to(self.device)
-            
+            # mask = batch['mask'].to(self.device)
+
             # Forward pass
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=True
+                return_logits=False
             )
             
             # Compute loss
             loss = self.loss_fn(predictions, labels)
             
             # Update metrics
-            predictions_probs = torch.softmax(predictions, dim=-1)
-            metrics_tracker.update(loss, predictions_probs, labels)
+            metrics_tracker.update(loss, predictions, labels)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
-                'loss': f"{current_metrics['loss']:.4f}",
-                'acc': f"{current_metrics['accuracy']:.4f}"
+                'mit_acc': f"{current_metrics['precision_class_2']:.4f}",
+                'same_acc': f"{current_metrics['precision_class_1']:.4f}",
+                'no_acc': f"{current_metrics['precision_class_0']:.4f}",
+                'loss': f"{current_metrics['loss']:.4f}"
             })
         
         return metrics_tracker.get_metrics()
@@ -385,6 +454,7 @@ class Trainer:
         start_time = time.time()
         
         for epoch in range(self.current_epoch, self.max_epochs):
+            
             self.current_epoch = epoch
             epoch_start = time.time()
             
@@ -411,7 +481,13 @@ class Trainer:
             self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
             self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
             self.writer.add_scalar('Learning_rate', current_lr, epoch)
-            
+
+            for i in range(3):
+                self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
+                self.writer.add_scalar(f'Precision/val/class_{i}', val_metrics[f'precision_class_{i}'], epoch)
+                self.writer.add_scalar(f'Recall/train/class_{i}', train_metrics[f'recall_class_{i}'], epoch)
+                self.writer.add_scalar(f'Recall/val/class_{i}', val_metrics[f'recall_class_{i}'], epoch)
+
             # Print epoch summary
             epoch_time = time.time() - epoch_start
             print(f"\nEpoch {epoch} Summary ({epoch_time:.1f}s):")
@@ -490,7 +566,7 @@ def create_scheduler(optimizer, config):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,
+            factor=0.1,
             patience=5
             )
     elif scheduler_name == 'cosine':
@@ -519,19 +595,25 @@ def create_scheduler(optimizer, config):
 # Example usage
 if __name__ == "__main__":
 
-    train_loader, val_loader, _ = create_trk_dataloaders(train_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/train.zarr',
-                                                         test_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/test.zarr',
-                                                         val_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/val.zarr',
-                                                         batch_size=2)
+    model = GNNTrackingModel(
+                             graph_layer='gat', 
+                             data_format='channels_last',
+                             encoder_dim=64
+                             )
     
-    model = GNNTrackingModel(max_cells = train_loader.dataset.max_cells, graph_layer='gat', data_format='channels_last')
-
+    train_loader, val_loader, _ = create_trk_dataloaders(train_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/train.zarr',
+                                                         val_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/val.zarr',
+                                                         batch_size=6,
+                                                         distance_threshold=64,
+                                                         augment=True,
+                                                         num_workers=4)
+    
     config = {
         'optimizer': 'adam',
-        'learning_rate': 1e-3,
+        'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'scheduler': 'reduce_on_plateau',
-        'max_epochs': 100
+        'max_epochs': 50
     }
 
     optimizer = create_optimizer(model, config)
@@ -545,71 +627,8 @@ if __name__ == "__main__":
         scheduler=scheduler,
         device='cuda:6',
         checkpoint_dir='./checkpoints',
-        max_epochs=100,
-        gradient_clip=1.0
+        max_epochs=config['max_epochs'],
+        gradient_clip=0.001
     )   
 
     trainer.train()
-    
-    print("To use this training loop:")
-    print()
-    print("```python")
-    print("from gnn_tracking_model import GNNTrackingModel")
-    print("from trk_data_loader import create_trk_dataloaders")
-    print("from trainer import Trainer, create_optimizer, create_scheduler")
-    print()
-    print("# Create model")
-    print("model = GNNTrackingModel(")
-    print("    max_cells=39,")
-    print("    track_length=8,")
-    print("    n_filters=64,")
-    print("    encoder_dim=64,")
-    print("    embedding_dim=64")
-    print(")")
-    print()
-    print("# Create dataloaders")
-    print("train_loader, val_loader, _ = create_trk_dataloaders(")
-    print("    train_path='train.trk',")
-    print("    val_path='val.trk',")
-    print("    batch_size=4,")
-    print("    track_length=8")
-    print(")")
-    print()
-    print("# Create optimizer and scheduler")
-    print("config = {")
-    print("    'optimizer': 'adam',")
-    print("    'learning_rate': 1e-3,")
-    print("    'weight_decay': 1e-5,")
-    print("    'scheduler': 'reduce_on_plateau',")
-    print("    'max_epochs': 100")
-    print("}")
-    print()
-    print("optimizer = create_optimizer(model, config)")
-    print("scheduler = create_scheduler(optimizer, config)")
-    print()
-    print("# Create trainer")
-    print("trainer = Trainer(")
-    print("    model=model,")
-    print("    train_loader=train_loader,")
-    print("    val_loader=val_loader,")
-    print("    optimizer=optimizer,")
-    print("    scheduler=scheduler,")
-    print("    device='cuda',")
-    print("    checkpoint_dir='./checkpoints',")
-    print("    max_epochs=100,")
-    print("    gradient_clip=1.0")
-    print(")")
-    print()
-    print("# Train!")
-    print("trainer.train()")
-    print("```")
-    print()
-    print("Features:")
-    print("  ✓ Automatic checkpointing")
-    print("  ✓ TensorBoard logging")
-    print("  ✓ Early stopping")
-    print("  ✓ Learning rate scheduling")
-    print("  ✓ Gradient clipping")
-    print("  ✓ Per-class accuracy tracking")
-    print("  ✓ Progress bars with tqdm")
-    print("  ✓ Weighted loss for class imbalance")

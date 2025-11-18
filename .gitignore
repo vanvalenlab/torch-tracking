@@ -7,3 +7,4 @@ torch-mesmer/
 deepcell-tracking/
 checkpoints/
 logs/
+tracking/loader_from_deepcell/

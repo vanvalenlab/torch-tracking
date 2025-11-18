@@ -39,26 +39,19 @@ class TrainingBranch(nn.Module):
         delta_temporal_merge,
         delta_encoder,
         delta_across_frames_encoder,
-        track_length,
-        max_cells,
-        embedding_dim,
-        encoder_dim
-    ):
+        track_length
+        ):
         super().__init__()
         self.neighborhood_encoder = neighborhood_encoder
         self.embedding_temporal_merge = embedding_temporal_merge
         self.delta_temporal_merge = delta_temporal_merge
         self.delta_encoder = delta_encoder
         self.delta_across_frames_encoder = delta_across_frames_encoder
-        
         self.track_length = track_length
-        self.max_cells = max_cells
-        self.embedding_dim = embedding_dim
-        self.encoder_dim = encoder_dim
         
         # Layers for unmerging temporal dimensions
-        self.unmerge_embeddings = Unmerge(track_length,embedding_dim)
-        self.unmerge_centroids = Unmerge(track_length, 2)
+        self.unmerge_embeddings = Unmerge()
+        self.unmerge_centroids = Unmerge()
         
         # Comparison layer
         self.comparison = Comparison()
@@ -81,26 +74,26 @@ class TrainingBranch(nn.Module):
         # Merge batch and temporal dimensions for neighborhood encoder
         # The neighborhood encoder expects (batch*time, ...)
         
-        # Reshape inputs: (B, T, ...) -> (B*T, ...)
+        # Reshape inputs: (B, T, N,...) -> (B*T*N, ...)
         app_newshape = (batch_size * time_steps * max_cells, H, W, C)
-        app_reshaped = appearances.reshape(app_newshape)
+        app_reshaped = appearances.view(app_newshape)
         
-        morph_reshaped = morphologies.reshape((batch_size * time_steps * max_cells, 3))
+        morph_reshaped = morphologies.view((batch_size * time_steps * max_cells, 3))
         cent_reshaped = centroids.reshape((batch_size * time_steps * max_cells, 2))
-        adj_reshaped = adj_matrices.reshape(batch_size*time_steps, max_cells, max_cells)
+        adj_reshaped = adj_matrices.view(batch_size*time_steps, max_cells, max_cells)
         
         # Encode features with neighborhood encoder
         embeddings, centroids_out = self.neighborhood_encoder(
             app_reshaped, morph_reshaped, cent_reshaped, adj_reshaped
         )
         
-        # Unmerge temporal dimension: (B*T, F) -> (B, T, N, F)
-        embeddings = self.unmerge_embeddings(embeddings, max_cells)
-        centroids_out = self.unmerge_centroids(centroids_out, max_cells)
+        # Unmerge temporal dimension: (B*T*N, F) -> (B, T, N, F)
+        embeddings = self.unmerge_embeddings(embeddings, batch_size, time_steps, max_cells)
+        centroids_out = self.unmerge_centroids(centroids_out, batch_size, time_steps, max_cells)
         
         # Split into current and future frames
-        embeddings_current = embeddings[:, :-1]  # (B, T-1, N, F)
-        embeddings_future = embeddings[:, 1:]     # (B, T-1, N, F)
+        embeddings_current = embeddings[:, :-1]  # (B, T-1, N, F) (first to the second to last frame)
+        embeddings_future = embeddings[:, 1:]     # (B, T-1, N, F) (second to the last frame)
         
         # Apply temporal merge to current embeddings
         embeddings_current = self.embedding_temporal_merge(embeddings_current)
@@ -157,18 +150,13 @@ class InferenceBranch(nn.Module):
         embedding_temporal_merge,
         delta_temporal_merge,
         delta_encoder,
-        delta_across_frames_encoder,
-        embedding_dim,
-        encoder_dim
+        delta_across_frames_encoder
     ):
         super().__init__()
         self.embedding_temporal_merge = embedding_temporal_merge
         self.delta_temporal_merge = delta_temporal_merge
         self.delta_encoder = delta_encoder
         self.delta_across_frames_encoder = delta_across_frames_encoder
-        
-        self.embedding_dim = embedding_dim
-        self.encoder_dim = encoder_dim
         
         # Layers
         self.comparison = Comparison()

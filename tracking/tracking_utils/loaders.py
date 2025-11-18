@@ -7,8 +7,9 @@ from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 from skimage.measure import regionprops
 import zarr
-
-import numpy as np
+import torchvision.transforms.v2 as transforms
+import torchvision.transforms.v2.functional as TF
+from scipy.spatial.distance import cdist
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -40,7 +41,10 @@ class TrkDataset(Dataset):
         data_format: str = 'channels_first',
         mode: str = 'training',
         normalize_images: bool = True,
-        distance_threshold: float = 100.0
+        distance_threshold: float = 100.0,
+        augment: bool = True,
+        rotation_range: int = 180,
+        translation_range: float = 0.1,  # As fraction of image size
     ):
         super().__init__()
         self.trk_path = Path(trk_path)
@@ -52,23 +56,26 @@ class TrkDataset(Dataset):
         self.mode = mode
         self.normalize_images = normalize_images
         self.distance_threshold = distance_threshold
+        self.augment = augment
+        self.rotation_range = rotation_range
+        self.translation_range = translation_range
         
         # Load .trk file
         print(f"Loading {self.trk_path}...")
         self.trk_data = zarr.open(self.trk_path, mode='r')
         
-        self.X = self.trk_data['X']  # Raw images (B, T, Y, X, C)
-        self.y = self.trk_data['y']  # Segmentation masks (B, T, Y, X, C)
+        self.X = self.trk_data['X'][:]  # Raw images (B, T, Y, X, C)
+        self.y = self.trk_data['y'][:]  # Segmentation masks (B, T, Y, X, C)
         self.lineages = self.trk_data['lineages'][0]  # Lineage information
 
         m_cells = 0
         for i in self.lineages:
             curr_m = len(i.keys())
-            if curr_m>m_cells:
-                m_cells=curr_m
+            if curr_m > m_cells:
+                m_cells = curr_m
 
         self.max_cells = m_cells
-        (self.labels, self.max_cells_list) = self._generate_labels(self.lineages, max_cells = self.max_cells, max_frames=self.X.shape[1])
+        (self.labels, self.max_cells_list, self.max_frames_list) = self._generate_labels(self.lineages, max_cells = self.max_cells, max_frames=self.X.shape[1])
         
         print(f"  X shape: {self.X.shape}")
         print(f"  y shape: {self.y.shape}")
@@ -78,7 +85,10 @@ class TrkDataset(Dataset):
         self.samples = self._build_sample_indices()
         print(f"  Created {len(self.samples)} samples")
 
-    def _get_max_cells(self):
+        if self.augment:
+            self._build_augmentation_pipeline()
+
+    def _get_max_frames(self, curr_lineage):
         """Helper function for finding the maximum number of cells in a frame of a movie, across
         all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
 
@@ -88,13 +98,19 @@ class TrkDataset(Dataset):
         Returns:
             int: The maximum number of cells in any frame
         """
-        max_cells = 0
-        for frame in range(self.y.shape[0]):
-            cells = np.unique(self.y[frame])
-            n_cells = cells[cells != 0].shape[0]
-            if n_cells > max_cells:
-                max_cells = n_cells
-        return max_cells
+        max_frames = 0
+
+        for key, track in curr_lineage.items():
+
+            if track['frames']:
+                max_frame = track['frames'][-1]
+            else:
+                max_frame=0
+
+            if max_frame > max_frames:
+                max_frames = max_frame
+
+        return max_frames
     
     def _build_sample_indices(self) -> List[Dict]:
         """Build list of valid sample indices.
@@ -109,12 +125,13 @@ class TrkDataset(Dataset):
             # Slide window across time dimension
             for start_frame in range(0, T - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
-                
-                samples.append({
-                    'batch_idx': batch_idx,
-                    'start_frame': start_frame,
-                    'end_frame': end_frame
-                })
+
+                if end_frame <= self.max_frames_list[batch_idx]:                
+                    samples.append({
+                        'batch_idx': batch_idx,
+                        'start_frame': start_frame,
+                        'end_frame': end_frame
+                    })
         
         return samples
     
@@ -132,23 +149,27 @@ class TrkDataset(Dataset):
             - adj_matrices: (track_length, max_cells, max_cells)
             - labels (optional): (track_length-1, max_cells, max_cells)
         """
+
         sample_info = self.samples[idx]
         
         batch_idx = sample_info['batch_idx']
         start_frame = sample_info['start_frame']
         end_frame = sample_info['end_frame']
-        
+
         # Extract raw images and masks for this sample
         raw_images = self.X[batch_idx, start_frame:end_frame]  # (T, Y, X, C)
         masks = self.y[batch_idx, start_frame:end_frame]  # (T, Y, X, C)
+
+        if self.augment:
+            raw_images, masks = self._augment_sequence(raw_images, masks)
         
         # Extract features from masks
         features = self._extract_features_from_masks(raw_images, masks)
         
         # Generate labels if in training mode
         if self.mode == 'training':
-            
-            unpadded_labels = self.labels[batch_idx, start_frame:end_frame-1]
+
+            unpadded_labels = self.labels[batch_idx, start_frame:end_frame-1].clone()
             features['max_cells'] = self.max_cells_list[batch_idx]
             features['labels'] = unpadded_labels
         
@@ -156,6 +177,95 @@ class TrkDataset(Dataset):
         tensor_data = self._to_tensors(features)
         
         return tensor_data
+    
+    def _build_augmentation_pipeline(self):
+        """Build torchvision v2 augmentation pipeline."""
+        # Note: We manually apply these to maintain temporal consistency
+        self.rotation_range_rad = self.rotation_range
+        self.translate_range = self.translation_range
+    
+    def _augment_sequence(
+        self,
+        raw_images: torch.Tensor,
+        masks: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply augmentations using torchvision.transforms.v2.
+        
+        Args:
+            raw_images: (T, H, W, C) tensor
+            masks: (T, H, W, C) tensor (will be treated as masks)
+        
+        Returns:
+            Augmented tensors as numpy arrays
+        """
+        T, H, W, C = raw_images.shape
+        
+        # Sample random parameters ONCE for the entire sequence
+        angle = torch.FloatTensor(1).uniform_(-self.rotation_range, self.rotation_range).item()
+        
+        # Translation in pixels (convert from fraction)
+        translate_x = int(torch.FloatTensor(1).uniform_(-self.translate_range, self.translate_range).item() * W)
+        translate_y = int(torch.FloatTensor(1).uniform_(-self.translate_range, self.translate_range).item() * H)
+        
+        # Random flips
+        do_hflip = torch.rand(1).item() > 0.5
+        do_vflip = torch.rand(1).item() > 0.5
+        
+        augmented_raw = []
+        augmented_masks = []
+        
+        for t in range(T):
+            # Get frame: (H, W, C) -> (C, H, W)
+            raw_frame = torch.as_tensor(raw_images[t], dtype=torch.float32).permute(2, 0, 1)  # (C, H, W)
+            mask_frame = torch.as_tensor(masks[t], dtype=torch.int).permute(2, 0, 1)  # (C, H, W)
+            
+            # Apply rotation
+            raw_frame = TF.rotate(
+                raw_frame,
+                angle=angle,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=0
+            )
+            mask_frame = TF.rotate(
+                mask_frame,
+                angle=angle,
+                interpolation=transforms.InterpolationMode.NEAREST,  # For masks!
+                fill=0
+            )
+            
+            # Apply translation
+            raw_frame = TF.affine(
+                raw_frame,
+                angle=0,
+                translate=[translate_x, translate_y],
+                scale=1.0,
+                shear=0,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=0
+            )
+            mask_frame = TF.affine(
+                mask_frame,
+                angle=0,
+                translate=[translate_x, translate_y],
+                scale=1.0,
+                shear=0,
+                interpolation=transforms.InterpolationMode.NEAREST,
+                fill=0
+            )
+            
+            # Apply flips
+            if do_hflip:
+                raw_frame = TF.hflip(raw_frame)
+                mask_frame = TF.hflip(mask_frame)
+            
+            if do_vflip:
+                raw_frame = TF.vflip(raw_frame)
+                mask_frame = TF.vflip(mask_frame)
+            
+            augmented_raw.append(raw_frame.permute(1, 2, 0).numpy())
+            augmented_masks.append(mask_frame.permute(1, 2, 0).numpy())
+        
+        return np.stack(augmented_raw), np.stack(augmented_masks)
     
     def _extract_features_from_masks(
         self, 
@@ -175,14 +285,15 @@ class TrkDataset(Dataset):
             - centroids: (T, N, 2) [y, x] positions
             - cell_ids: (T, N) cell IDs from masks
         """
+
         T = len(masks)
         
         # Lists to store features for each frame
-        all_appearances = []
-        all_morphologies = []
-        all_centroids = []
-        all_cell_ids = []
-        
+        all_appearances = np.zeros((T, self.max_cells, self.crop_size, self.crop_size, 1))
+        all_morphologies = np.zeros((T, self.max_cells, 3))
+        all_centroids = np.zeros((T, self.max_cells, 2))
+        adj = np.zeros((T, self.max_cells, self.max_cells))
+
         for t in range(T):
             mask_t = masks[t, ..., 0]  # Remove channel dimension
             raw_t = raw_images[t, ..., 0]
@@ -194,10 +305,8 @@ class TrkDataset(Dataset):
             appearances = []
             morphologies = []
             centroids = []
-            cell_ids = []
             
-            for prop in props:
-                cell_id = prop.label
+            for cellid, prop in enumerate(props):
                 
                 # Centroid (y, x)
                 centroid = np.array(prop.centroid)
@@ -230,65 +339,74 @@ class TrkDataset(Dataset):
                 
                 # Normalize if requested
                 if self.normalize_images:
-                    crop = (crop - crop.mean()) / (crop.std() + 1e-7)
+                    std = crop.std()
+                    if std > 1e-7:  # Only normalize if there's actual signal
+                        crop = (crop - crop.mean()) / std
+                    else:
+                        crop = crop - crop.mean()  # Just center if no variance
                 
-                appearances.append(crop)
-                morphologies.append(morphology)
-                centroids.append(centroid)
-                cell_ids.append(cell_id)
+                all_appearances[t, cellid,] = crop
+                all_morphologies[t, cellid,] = morphology
+                all_centroids[t, cellid,] = centroid
             
-            # Convert to arrays and pad/crop to max_cells
-            if len(appearances) > 0:
-                appearances = np.stack(appearances)  # (N, H, W, C)
-                morphologies = np.stack(morphologies)  # (N, 3)
-                centroids = np.stack(centroids)  # (N, 2)
-                cell_ids = np.array(cell_ids)  # (N,)
-            else:
-                # No cells in this frame
-                appearances = np.zeros((0, self.crop_size, self.crop_size, 1))
-                morphologies = np.zeros((0, 3))
-                centroids = np.zeros((0, 2))
-                cell_ids = np.array([])
-            
-            # Pad or crop to max_cells
-            n_cells = len(appearances)
-            if n_cells < self.max_cells:
-                # Pad
-                pad_n = self.max_cells - n_cells
-                appearances = np.pad(
-                    appearances, 
-                    ((0, pad_n), (0, 0), (0, 0), (0, 0))
-                )
-                morphologies = np.pad(morphologies, ((0, pad_n), (0, 0)))
-                centroids = np.pad(centroids, ((0, pad_n), (0, 0)))
-                cell_ids = np.pad(cell_ids, (0, pad_n), constant_values=-1)
-            else:
-                # Crop
-                appearances = appearances[:self.max_cells]
-                morphologies = morphologies[:self.max_cells]
-                centroids = centroids[:self.max_cells]
-                cell_ids = cell_ids[:self.max_cells]
-            
-            all_appearances.append(appearances)
-            all_morphologies.append(morphologies)
-            all_centroids.append(centroids)
-            all_cell_ids.append(cell_ids)
-        
+            # distance = cdist(all_centroids[t], all_centroids[t], metric='euclidean') < self.distance_threshold
+            # adj[t] = distance.astype('float32')
+
+        # Generate adjacency matrices
+        adj = self._generate_adjacency_matrices(all_centroids)
+
+        # norm_adj = self._normalize_adj_matrix(adj)
+
         # Stack across time
         features = {
-            'appearances': np.stack(all_appearances),  # (T, N, H, W, C)
-            'morphologies': np.stack(all_morphologies),  # (T, N, 3)
-            'centroids': np.stack(all_centroids),  # (T, N, 2)
-            'cell_ids': np.stack(all_cell_ids)  # (T, N)
+            'appearances': all_appearances,  # (T, N, H, W, C)
+            'morphologies': all_morphologies,  # (T, N, 3)
+            'centroids': all_centroids,  # (T, N, 2)
+            'adj_matrices': adj # (T, N, N)
         }
-        
-        # Generate adjacency matrices
-        features['adj_matrices'] = self._generate_adjacency_matrices(
-            features['centroids']
-        )
-        
         return features
-    
+
+    def _normalize_adj_matrix(self, adj, epsilon=1e-5):
+        """Normalize the adjacency matrix
+
+        Args:
+            adj (np.array): Adjacency matrix
+            epsilon (float): Used to create the degree matrix
+
+        Returns:
+            np.array: Normalized adjacency matrix
+
+        Raises:
+            ValueError: If ``adj`` has a rank that is not 3 or 4.
+        """
+        input_rank = len(adj.shape)
+        if input_rank not in {3, 4}:
+            raise ValueError('Only 3 & 4 dim adjacency matrices are supported')
+
+        if input_rank == 3:
+            # temporarily include a batch dimension for consistent processing
+            adj = np.expand_dims(adj, axis=0)
+
+        normalized_adj = np.zeros(adj.shape, dtype='float32')
+
+        for t in range(adj.shape[1]):
+            adj_frame = adj[:, t]
+            # create degree matrix
+            degrees = np.sum(adj_frame, axis=1)
+            for batch, degree in enumerate(degrees):
+                degree = (degree + epsilon) ** -0.5
+                degree_matrix = np.diagflat(degree)
+
+                normalized = np.matmul(degree_matrix, adj_frame[batch])
+                normalized = np.matmul(normalized, degree_matrix)
+                normalized_adj[batch, t] = normalized
+
+        if input_rank == 3:
+            # remove batch axis
+            normalized_adj = normalized_adj[0]
+
+        return normalized_adj
+
     def _generate_adjacency_matrices(
         self, 
         centroids: np.ndarray
@@ -344,11 +462,14 @@ class TrkDataset(Dataset):
         """
         
         curr_max_cells = []
-        labels = np.zeros((len(lineage), max_frames, max_cells, max_cells))
+        curr_max_frames = []
+        labels = np.full((len(lineage), max_frames, max_cells, max_cells, 3), -1)
 
         for i, curr_lineage in enumerate(lineage):
 
             curr_max_cells.append(len(curr_lineage))
+            curr_max_frames.append(self._get_max_frames(curr_lineage))
+            labels[i,:curr_max_frames[-1], :len(curr_lineage), :len(curr_lineage), :] = 0
 
             for label, track in curr_lineage.items():
                 # The frames where each track is linked to itself (encoded as 1)
@@ -358,7 +479,7 @@ class TrkDataset(Dataset):
                 label = int(label) - 1
 
                 # Place all identities
-                labels[i, frames_linked, label, label] = 1
+                labels[i, frames_linked, label, label, 1] = 1
 
                 # Place all mitotic frames as linkages
                 if track['frame_div']:
@@ -367,9 +488,18 @@ class TrkDataset(Dataset):
                     daughter_label = track['daughters']
                     daughter_label = [daughter-1 for daughter in daughter_label]
 
-                    labels[i, frame_divided-1, label, daughter_label] = 2
+                    labels[i, frame_divided-1, label, daughter_label, 2] = 1
 
-        return torch.as_tensor(labels, dtype=torch.long), curr_max_cells
+            # Set "no link" (channel 0) where there's neither identity (channel 1) nor mitotic link (channel 2)
+            labels[i, :, :len(curr_lineage), :len(curr_lineage), 0] = np.logical_not(
+                np.logical_or(
+                    labels[i, :, :len(curr_lineage), :len(curr_lineage), 1],
+                    labels[i, :, :len(curr_lineage), :len(curr_lineage), 2]
+                ).astype(bool)
+            )
+
+        return torch.as_tensor(labels, dtype=torch.float), curr_max_cells, curr_max_frames
+
     
     def _to_tensors(self, data: Dict) -> Dict[str, torch.Tensor]:
         """Convert numpy arrays to PyTorch tensors."""
@@ -409,28 +539,28 @@ def unpad_collate_fn(batch):
 
     # Stack appearances: (B, T, N, H, W, C) but slice N to actual_max_cells
     appearances = torch.stack([
-        sample['appearances'][:, :actual_max_cells]  # (T, N_actual, H, W, C)
+        sample['appearances'][:, :actual_max_cells].clone()  # (T, N_actual, H, W, C)
         for sample in batch
     ])
     collated['appearances'] = appearances  # (B, T, N_actual, H, W, C)
     
     # Stack morphologies
     morphologies = torch.stack([
-        sample['morphologies'][:, :actual_max_cells]  # (T, N_actual, 3)
+        sample['morphologies'][:, :actual_max_cells].clone()  # (T, N_actual, 3)
         for sample in batch
     ])
     collated['morphologies'] = morphologies
     
     # Stack centroids
     centroids = torch.stack([
-        sample['centroids'][:, :actual_max_cells]  # (T, N_actual, 2)
+        sample['centroids'][:, :actual_max_cells].clone()  # (T, N_actual, 2)
         for sample in batch
     ])
     collated['centroids'] = centroids
     
     # Stack adjacency matrices
     adj_matrices = torch.stack([
-        sample['adj_matrices'][:, :actual_max_cells, :actual_max_cells]  # (T, N_actual, N_actual)
+        sample['adj_matrices'][:, :actual_max_cells, :actual_max_cells].clone()  # (T, N_actual, N_actual)
         for sample in batch
     ])
     collated['adj_matrices'] = adj_matrices
@@ -438,13 +568,13 @@ def unpad_collate_fn(batch):
     # Stack labels (also unpad!)
     if 'labels' in batch[0]:
         labels = torch.stack([
-            sample['labels'][:, :actual_max_cells, :actual_max_cells]  # (T-1, N_actual, N_actual)
+            sample['labels'][:, :actual_max_cells, :actual_max_cells].clone()  # (T-1, N_actual, N_actual)
             for sample in batch
         ])
         collated['labels'] = labels
     
     # Store actual_max_cells for reference
-    collated['actual_max_cells'] = actual_max_cells
+    collated['max_cells'] = actual_max_cells
     
     return collated
 
@@ -466,6 +596,7 @@ class BatchSampler(Sampler):
         for movie_id, indices in self.movie_groups.items():
             for i in range(0, len(indices), self.batch_size):
                 # Split samples from each movie into batches of length batch size
+                
 
                 batch = indices[i:i+self.batch_size]
                 if len(batch) == self.batch_size:
@@ -497,6 +628,7 @@ def create_trk_dataloaders(
     track_length: int = 8,
     crop_size: int = 32,
     stride: int = 1,
+    collate_fn = None,
     **dataset_kwargs
 ) -> Tuple[DataLoader, ...]:
     """Create dataloaders for .trk format data.
@@ -518,6 +650,7 @@ def create_trk_dataloaders(
         None for loaders where path not provided
     """
     loaders = []
+
     
     # Training loader
     train_dataset = TrkDataset(
@@ -534,7 +667,7 @@ def create_trk_dataloaders(
         batch_sampler = BatchSampler(train_dataset, batch_size=batch_size, shuffle=True),
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=unpad_collate_fn
+        collate_fn=collate_fn
         )
     loaders.append(train_loader)
     
@@ -554,7 +687,7 @@ def create_trk_dataloaders(
             batch_sampler = BatchSampler(val_dataset, batch_size=batch_size, shuffle=False),
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=unpad_collate_fn
+            collate_fn=collate_fn
         )
         loaders.append(val_loader)
     else:
@@ -576,7 +709,7 @@ def create_trk_dataloaders(
             batch_sampler = BatchSampler(test_dataset, batch_size=batch_size, shuffle=False),
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=unpad_collate_fn
+            collate_fn=collate_fn
         )
 
         loaders.append(test_loader)

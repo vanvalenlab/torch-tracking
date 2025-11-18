@@ -15,7 +15,6 @@ from branches import TrainingBranch, InferenceBranch
 
 from loaders import create_trk_dataloaders
 
-
 class GNNTrackingModel(nn.Module):
     """Complete GNN-based tracking model for single cell tracking.
     
@@ -53,11 +52,9 @@ class GNNTrackingModel(nn.Module):
     """
     def __init__(
         self,
-        max_cells=None,
         track_length=8,
         n_filters=64,
         encoder_dim=64,
-        embedding_dim=64,
         n_layers=3,
         graph_layer='gcn',
         norm_layer='batch',
@@ -68,11 +65,9 @@ class GNNTrackingModel(nn.Module):
         super().__init__()
         
         # Store config
-        self.max_cells = max_cells
         self.track_length = track_length
         self.n_filters = n_filters
         self.encoder_dim = encoder_dim
-        self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         self.graph_layer = graph_layer
         self.appearance_shape = (32, 32, 1) if data_format=='channels_last' else (1,32,32)
@@ -94,9 +89,6 @@ class GNNTrackingModel(nn.Module):
         """Validate configuration parameters."""
 
         spatial_dim = self.appearance_shape[1]
-
-        if self.max_cells is None:
-            raise ValueError("Please specify the maximum number of cells in the time lapse.")
 
         if self.data_format == 'channels_last':
             spatial_compare = self.appearance_shape[1] == self.appearance_shape[0]
@@ -166,7 +158,7 @@ class GNNTrackingModel(nn.Module):
             morphology_encoder=self.morphology_encoder,
             centroid_encoder=self.centroid_encoder,
             n_filters=self.n_filters,
-            embedding_dim=self.embedding_dim,
+            embedding_dim=self.encoder_dim,
             n_layers=self.n_layers,
             graph_layer=self.graph_layer,
             norm_layer=self.norm_layer
@@ -175,7 +167,7 @@ class GNNTrackingModel(nn.Module):
     def _build_temporal_modules(self):
         """Build temporal processing modules."""
         self.embedding_temporal_merge = TemporalMerge(
-            encoder_dim=self.embedding_dim
+            encoder_dim=self.encoder_dim
         )
         
         self.delta_temporal_merge = TemporalMerge(
@@ -183,15 +175,9 @@ class GNNTrackingModel(nn.Module):
         )
         
         # Unmerge layers
-        self.unmerge_embeddings = Unmerge(
-            track_length=self.track_length,
-            embedding_dim=self.embedding_dim
-        )
+        self.unmerge_embeddings = Unmerge()
         
-        self.unmerge_centroids = Unmerge(
-            track_length=self.track_length,
-            embedding_dim=2  # centroids are 2D
-        )
+        self.unmerge_centroids = Unmerge()
     
     def _build_branches(self):
         """Build training and inference branches."""
@@ -201,26 +187,20 @@ class GNNTrackingModel(nn.Module):
             delta_temporal_merge=self.delta_temporal_merge,
             delta_encoder=self.delta_encoder,
             delta_across_frames_encoder=self.delta_across_frames_encoder,
-            track_length=self.track_length,
-            max_cells=self.max_cells,
-            embedding_dim=self.embedding_dim,
-            encoder_dim=self.encoder_dim
+            track_length=self.track_length
         )
         
         self.inference_branch = InferenceBranch(
             embedding_temporal_merge=self.embedding_temporal_merge,
             delta_temporal_merge=self.delta_temporal_merge,
             delta_encoder=self.delta_encoder,
-            delta_across_frames_encoder=self.delta_across_frames_encoder,
-            embedding_dim=self.embedding_dim,
-            encoder_dim=self.encoder_dim
+            delta_across_frames_encoder=self.delta_across_frames_encoder
         )
     
     def _build_decoder(self):
         """Build tracking decoder."""
         self.tracking_decoder = TrackingDecoder(
-            embedding_dim=self.embedding_dim,
-            encoder_dim=self.encoder_dim,
+            embedding_dim=self.encoder_dim,
             n_filters=self.n_filters,
             n_classes=self.n_classes,
             norm_layer=self.norm_layer
@@ -231,9 +211,9 @@ class GNNTrackingModel(nn.Module):
         """Forward pass for training.
         
         Args:
-            appearances: (batch, track_length, H, W, C) or channels_first
-            morphologies: (batch, track_length, 3)
-            centroids: (batch, track_length, 2)
+            appearances: (batch, track_length, max_cells, H, W, C) or channels_first
+            morphologies: (batch, track_length, max_cells, 3)
+            centroids: (batch, track_length, max_cells, 2)
             adj_matrices: (batch, track_length, max_cells, max_cells)
             return_logits: If True, return logits; if False, return probabilities
         
@@ -270,16 +250,17 @@ class GNNTrackingModel(nn.Module):
             Tensor of shape (batch, 1, num_tracks, num_detections, n_classes)
         """
         # Get features from inference branch
-        embedding_comparisons, deltas = self.inference_branch(
-            current_embeddings, current_centroids,
-            future_embeddings, future_centroids
-        )
-        
-        # Decode to predictions
-        output = self.tracking_decoder(
-            embedding_comparisons, deltas,
-            apply_softmax=not return_logits
-        )
+        with torch.no_grad():
+            embedding_comparisons, deltas = self.inference_branch(
+                current_embeddings, current_centroids,
+                future_embeddings, future_centroids
+            )
+            
+            # Decode to predictions
+            output = self.tracking_decoder(
+                embedding_comparisons, deltas,
+                apply_softmax=not return_logits
+            )
         
         return output
     
@@ -315,21 +296,23 @@ class GNNTrackingModel(nn.Module):
         """
         batch_size = appearances.shape[0]
         time_steps = appearances.shape[1]
+        n_cells = appearances.shape[2]
         
         # Reshape to merge batch and time
-        app_reshaped = appearances.view(batch_size * time_steps, *appearances.shape[2:])
-        morph_reshaped = morphologies.view(batch_size * time_steps, *morphologies.shape[2:])
-        cent_reshaped = centroids.reshape(batch_size * time_steps, *centroids.shape[2:])
+        app_reshaped = appearances.view(batch_size * time_steps * n_cells, *appearances.shape[3:])
+        morph_reshaped = morphologies.view(batch_size * time_steps * n_cells, *morphologies.shape[3:])
+        cent_reshaped = centroids.view(batch_size * time_steps * n_cells, *centroids.shape[3:])
         adj_reshaped = adj_matrices.view(batch_size * time_steps, *adj_matrices.shape[2:])
         
         # Get embeddings
-        embeddings, centroids_out = self.neighborhood_encoder(
-            app_reshaped, morph_reshaped, cent_reshaped, adj_reshaped
-        )
+        with torch.no_grad():
+            embeddings, centroids_out = self.neighborhood_encoder(
+                app_reshaped, morph_reshaped, cent_reshaped, adj_reshaped
+            )
         
         # Reshape back
-        embeddings = embeddings.reshape(batch_size, time_steps, -1)
-        centroids_out = centroids_out.reshape(batch_size, time_steps, -1)
+        embeddings = embeddings.view(batch_size, time_steps, n_cells, -1)
+        centroids_out = centroids_out.view(batch_size, time_steps, n_cells, -1)
         
         return embeddings, centroids_out
     
