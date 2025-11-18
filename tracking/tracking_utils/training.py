@@ -21,7 +21,7 @@ class TrackingLoss(nn.Module):
         if alpha is None:
             # Default: aggressive weighting for minority classes
             # Adjust these based on your actual class distribution
-            alpha = torch.tensor([1.0, 20.0, 30.0])  # [no_link, same_cell, mitosis]
+            alpha = torch.tensor([20.0, 1.0, 30.0])  # [no_link, same_cell, mitosis]
         
         self.alpha = alpha
         self.gamma = gamma
@@ -29,7 +29,7 @@ class TrackingLoss(nn.Module):
         self.pad_value = -1
         
         # Standard CrossEntropyLoss with class weights
-        self.criterion = nn.CrossEntropyLoss(weight=alpha, reduction='none', ignore_index=self.pad_value)
+        self.criterion = nn.CrossEntropyLoss(weight=alpha, reduction='none')
 
     def _weighted_categorical_crossentropy(self, y_true, y_pred,
                                         n_classes=3, axis=None,
@@ -75,10 +75,10 @@ class TrackingLoss(nn.Module):
 
         # # Reshape for CrossEntropyLoss
         predictions_flat = predictions.view(-1, predictions.shape[-1])  # (B*T*N*M, 3)
-        targets_flat = targets.view(-1, targets.shape[-1]).long()  # (B*T*N*M)
+        targets_flat = targets.view(-1, targets.shape[-1]).argmax(dim=-1).long()  # (B*T*N*M)
         
         # Compute weighted cross-entropy
-        ce_loss = self._weighted_categorical_crossentropy(targets_flat, predictions_flat, targets_flat.shape[-1])
+        ce_loss = self.criterion(predictions_flat, targets_flat)
         
         # Apply focal loss modulation
         if self.use_focal:
@@ -318,7 +318,7 @@ class Trainer:
             
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=False
+                return_logits=True
             )
             
             # Compute loss
@@ -372,7 +372,7 @@ class Trainer:
             # Forward pass
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=False
+                return_logits=True
             )
             
             # Compute loss
@@ -487,6 +487,8 @@ class Trainer:
                 self.writer.add_scalar(f'Precision/val/class_{i}', val_metrics[f'precision_class_{i}'], epoch)
                 self.writer.add_scalar(f'Recall/train/class_{i}', train_metrics[f'recall_class_{i}'], epoch)
                 self.writer.add_scalar(f'Recall/val/class_{i}', val_metrics[f'recall_class_{i}'], epoch)
+                self.writer.add_scalar(f'F1/train/class_{i}', train_metrics[f'f1_class_{i}'], epoch)
+                self.writer.add_scalar(f'F1/val/class_{i}', val_metrics[f'f1_class_{i}'], epoch)
 
             # Print epoch summary
             epoch_time = time.time() - epoch_start
@@ -552,6 +554,7 @@ def create_optimizer(model, config):
             momentum=momentum,
             weight_decay=weight_decay
         )
+
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
     
@@ -584,6 +587,13 @@ def create_scheduler(optimizer, config):
             step_size=step_size,
             gamma=gamma
         )
+    elif scheduler_name == 'exp':
+        step_size = config.get('step_size', 30)
+        decay = config.get('decay', 0.99)
+        scheduler = optim.lr_scheduler.ExponentialLR(
+            optimizer,
+            gamma=decay
+        )
     elif scheduler_name == 'none':
         scheduler = None
     else:
@@ -612,7 +622,8 @@ if __name__ == "__main__":
         'optimizer': 'adam',
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
-        'scheduler': 'reduce_on_plateau',
+        'decay': 0.99,
+        'scheduler': 'exp',
         'max_epochs': 50
     }
 
