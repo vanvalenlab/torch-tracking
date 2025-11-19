@@ -13,7 +13,7 @@ import tqdm
 import warnings
 warnings.filterwarnings("ignore") 
 
-from utils import relabel_sequential_lineage, get_image_features
+from utils import relabel_sequential_lineage, get_image_features, normalize_adj_matrix, resize
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -49,6 +49,7 @@ class TrkDataset(Dataset):
         augment: bool = True,
         rotation_range: int = 180,
         translation_range: float = 0.1,  # As fraction of image size
+        crop_mode: str = 'resize'
     ):
         super().__init__()
         self.trk_path = Path(trk_path)
@@ -63,7 +64,7 @@ class TrkDataset(Dataset):
         self.augment = augment
         self.rotation_range = rotation_range
         self.translation_range = translation_range
-        self.crop_mode = 'fixed'
+        self.crop_mode = crop_mode
         
         # Load .trk file
         print(f"Loading {self.trk_path}...")
@@ -86,7 +87,6 @@ class TrkDataset(Dataset):
             if curr_m > m_cells:
                 m_cells = curr_m
         self.max_cells = m_cells
-        print(self.max_cells)
 
         self.features = self._get_features()
         
@@ -200,7 +200,7 @@ class TrkDataset(Dataset):
             'appearances': self.features['appearances'][batch_idx, start_frame:end_frame],
             'centroids': self.features['centroids'][batch_idx, start_frame:end_frame],
             'morphologies': self.features['morphologies'][batch_idx, start_frame:end_frame],
-            'adj_matrices': self.features['adj_matrix'][batch_idx, start_frame:end_frame],
+            'adj_matrices': self.features['adj_matrix'][batch_idx, start_frame:end_frame]
         }
         
         # Generate labels if in training mode

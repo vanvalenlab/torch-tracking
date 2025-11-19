@@ -2,7 +2,100 @@ import numpy as np
 import warnings
 from skimage.segmentation import relabel_sequential
 from skimage.measure import regionprops
+import torch
+import cv2
+from skimage import transform
 
+def normalize_adjacency_symmetric(
+    adj: torch.Tensor,
+    add_self_loops: bool = True,
+    eps: float = 1e-12
+) -> torch.Tensor:
+    """Symmetric normalization: D^(-1/2) @ A @ D^(-1/2)
+    
+    This is the most common normalization for GCNs (Kipf & Welling, 2017).
+    Results in normalized adjacency where each edge is weighted by the inverse
+    square root of the product of node degrees.
+    
+    Formula: Ã = D^(-1/2) @ A @ D^(-1/2)
+    where D is the degree matrix and A is the adjacency matrix.
+    
+    Args:
+        adj: Adjacency matrices of shape (B, T, N, N)
+        add_self_loops: If True, adds self-connections before normalization
+        eps: Small constant to avoid division by zero
+    
+    Returns:
+        Normalized adjacency matrices of shape (B, T, N, N)
+    
+    Example:
+        >>> adj = torch.rand(2, 8, 39, 39) > 0.5
+        >>> adj = adj.float()
+        >>> adj_norm = normalize_adjacency_symmetric(adj)
+    """
+    with torch.no_grad():
+        B, T, N, _ = adj.shape
+        
+        # Add self-loops: A + I
+        if add_self_loops:
+            identity = torch.eye(N, device=adj.device, dtype=adj.dtype)
+            identity = identity.view(1, 1, N, N).expand(B, T, N, N)
+            adj = adj + identity
+        
+        # Compute degree matrix: D[i,i] = sum_j A[i,j]
+        degree = adj.sum(dim=-1)  # (B, T, N)
+        
+        # D^(-1/2)
+        degree_inv_sqrt = degree.pow(-0.5)
+        degree_inv_sqrt[degree_inv_sqrt == float('inf')] = 0.0
+        degree_inv_sqrt = torch.clamp(degree_inv_sqrt, min=0.0, max=1e10)
+        
+        # Create diagonal matrix from degree^(-1/2)
+        # D^(-1/2) @ A @ D^(-1/2)
+        adj_norm = degree_inv_sqrt.unsqueeze(-1) * adj * degree_inv_sqrt.unsqueeze(-2)
+        
+        return adj_norm
+
+def normalize_adj_matrix(adj, epsilon=1e-5):
+    """Normalize the adjacency matrix
+
+    Args:
+        adj (np.array): Adjacency matrix
+        epsilon (float): Used to create the degree matrix
+
+    Returns:
+        np.array: Normalized adjacency matrix
+
+    Raises:
+        ValueError: If ``adj`` has a rank that is not 3 or 4.
+    """
+    input_rank = len(adj.shape)
+    if input_rank not in {3, 4}:
+        raise ValueError('Only 3 & 4 dim adjacency matrices are supported')
+
+    if input_rank == 3:
+        # temporarily include a batch dimension for consistent processing
+        adj = np.expand_dims(adj, axis=0)
+
+    normalized_adj = np.zeros(adj.shape, dtype='float32')
+
+    for t in range(adj.shape[1]):
+        adj_frame = adj[:, t]
+        # create degree matrix
+        degrees = np.sum(adj_frame, axis=1)
+        for batch, degree in enumerate(degrees):
+            degree = (degree + epsilon) ** -0.5
+            degree_matrix = np.diagflat(degree)
+
+            normalized = np.matmul(degree_matrix, adj_frame[batch])
+            normalized = np.matmul(normalized, degree_matrix)
+            normalized_adj[batch, t] = normalized
+
+    if input_rank == 3:
+        # remove batch axis
+        normalized_adj = normalized_adj[0]
+
+    return normalized_adj
 
 def is_valid_lineage(y, lineage):
     """Check if a cell lineage of a single movie is valid.
@@ -283,3 +376,86 @@ def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
         'labels': labels,
         'morphologies': morphologies,
     }
+
+
+def resize(data, shape, data_format='channels_last', labeled_image=False):
+    """Resize the data to the given shape.
+    Uses openCV to resize the data if the data is a single channel, as it
+    is very fast. However, openCV does not support multi-channel resizing,
+    so if the data has multiple channels, use skimage.
+
+    Args:
+        data (np.array): data to be reshaped. Must have a channel dimension
+        shape (tuple): shape of the output data in the form (x,y).
+            Batch and channel dimensions are handled automatically and preserved.
+        data_format (str): determines the order of the channel axis,
+            one of 'channels_first' and 'channels_last'.
+        labeled_image (bool): flag to determine how interpolation and floats are handled based
+         on whether the data represents raw images or annotations
+
+    Raises:
+        ValueError: ndim of data not 3 or 4
+        ValueError: Shape for resize can only have length of 2, e.g. (x,y)
+
+    Returns:
+        numpy.array: data reshaped to new shape.
+    """
+    if len(data.shape) not in {3, 4}:
+        raise ValueError('Data must have 3 or 4 dimensions, e.g. '
+                         '[batch, x, y], [x, y, channel] or '
+                         '[batch, x, y, channel]. Input data only has {} '
+                         'dimensions.'.format(len(data.shape)))
+
+    if len(shape) != 2:
+        raise ValueError('Shape for resize can only have length of 2, e.g. (x,y).'
+                         'Input shape has {} dimensions.'.format(len(shape)))
+
+    original_dtype = data.dtype
+
+    # cv2 resize is faster but does not support multi-channel data
+    # If the data is multi-channel, use skimage.transform.resize
+    channel_axis = 0 if data_format == 'channels_first' else -1
+    batch_axis = -1 if data_format == 'channels_first' else 0
+
+    # Use skimage for multichannel data
+    if data.shape[channel_axis] > 1:
+        # Adjust output shape to account for channel axis
+        if data_format == 'channels_first':
+            shape = tuple([data.shape[channel_axis]] + list(shape))
+        else:
+            shape = tuple(list(shape) + [data.shape[channel_axis]])
+
+        # linear interpolation (order 1) for image data, nearest neighbor (order 0) for labels
+        # anti_aliasing introduces spurious labels, include only for image data
+        order = 0 if labeled_image else 1
+        anti_aliasing = not labeled_image
+
+        _resize = lambda d: transform.resize(d, shape, mode='constant', preserve_range=True,
+                                             order=order, anti_aliasing=anti_aliasing)
+    # single channel image, resize with cv2
+    else:
+        shape = tuple(shape)[::-1]  # cv2 expects swapped axes.
+
+        # linear interpolation for image data, nearest neighbor for labels
+        # CV2 doesn't support ints for linear interpolation, set to float for image data
+        if labeled_image:
+            interpolation = cv2.INTER_NEAREST
+        else:
+            interpolation = cv2.INTER_LINEAR
+            data = data.astype('float32')
+
+        _resize = lambda d: np.expand_dims(cv2.resize(np.squeeze(d), shape,
+                                                      interpolation=interpolation),
+                                           axis=channel_axis)
+
+    # Check for batch dimension to loop over
+    if len(data.shape) == 4:
+        batch = []
+        for i in range(data.shape[batch_axis]):
+            d = data[i] if batch_axis == 0 else data[..., i]
+            batch.append(_resize(d))
+        resized = np.stack(batch, axis=batch_axis)
+    else:
+        resized = _resize(data)
+
+    return resized.astype(original_dtype)

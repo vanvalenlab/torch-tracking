@@ -9,9 +9,10 @@ from tqdm import tqdm
 import json
 from typing import Dict
 import time
-
+import datetime
 from model import GNNTrackingModel
 from loader import create_trk_dataloaders
+from utils import normalize_adjacency_symmetric
 
 class TrackingLoss(nn.Module):
     
@@ -21,7 +22,7 @@ class TrackingLoss(nn.Module):
         if alpha is None:
             # Default: aggressive weighting for minority classes
             # Adjust these based on your actual class distribution
-            alpha = torch.tensor([20.0, 1.0, 30.0])  # [no_link, same_cell, mitosis]
+            alpha = torch.tensor([100.0, 1.0, 26000.0])  # [same_cell, no_link, mitosis]
         
         self.alpha = alpha
         self.gamma = gamma
@@ -96,10 +97,6 @@ class TrackingLoss(nn.Module):
 
 
 class MetricsTracker:
-    """FIXED: Proper masking and per-class metrics.
-    
-    Replace the MetricsTracker class in training.py with this version.
-    """
     
     def __init__(self):
         self.reset()
@@ -121,8 +118,7 @@ class MetricsTracker:
         Args:
             loss: scalar loss value
             predictions: (B, T, N, M, 3) logits
-            targets: (B, T, N, M) integer labels
-            actual_max_cells: int, actual number of cells in this batch
+            targets: (B, T, N, M, 3) one hot encoding of labels
         """
 
         batch_size = predictions.shape[0]
@@ -133,13 +129,10 @@ class MetricsTracker:
         pred_classes = predictions.argmax(dim=-1)  # (B*T*N*M)
         target_classes = targets.argmax(dim=-1)
                 
-        # Only consider pairs within actual_max_cells range
-        valid_mask = target_classes != self.pad_value
-
         # Overall accuracy
         correct = (pred_classes == target_classes)
         self.correct += correct.sum().item()
-        self.total_predictions += target_classes.sum().item()
+        self.total_predictions += pred_classes.numel()
         
         # Per-class metrics
         for class_idx in range(3):
@@ -246,10 +239,12 @@ class Trainer:
         loss_fn=None,
         device='cuda',
         checkpoint_dir='./checkpoints',
-        log_dir='./logs',
+        log_dir='./logs/',
         max_epochs=100,
         gradient_clip=1.0,
-        early_stopping_patience=10
+        early_stopping_patience=10,
+        enable_early_stopping=True,
+        log_suffix=''
     ):
         self.model = model
         self.train_loader = train_loader
@@ -259,12 +254,13 @@ class Trainer:
         self.device = device
         self.max_epochs = max_epochs
         self.gradient_clip = gradient_clip
+        self.enable_early_stopping = enable_early_stopping
         
         # Loss function
         if loss_fn is None:
             # Default: weighted cross-entropy to handle class imbalance
             # Typically: no_link >> different > same_cell in frequency
-            self.loss_fn = TrackingLoss(use_focal=False, gamma=3.0)
+            self.loss_fn = TrackingLoss(use_focal=False, gamma=2.0)
         else:
             self.loss_fn = loss_fn
         
@@ -276,7 +272,7 @@ class Trainer:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        self.log_dir = Path(log_dir)
+        self.log_dir = Path(log_dir +  log_suffix)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
         # Tensorboard writer
@@ -302,15 +298,13 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]')
         
         for batch_idx, batch in enumerate(pbar):
-            
-            if batch_idx >= 512:
-                break
 
             # Unpad and move batch to device
             appearances = batch['appearances'].to(self.device)
             morphologies = batch['morphologies'].to(self.device)
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
+            adj_matrices = normalize_adjacency_symmetric(adj_matrices)
             labels = batch['labels'].to(self.device)
             
             # Forward pass
@@ -343,14 +337,17 @@ class Trainer:
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
-                'mit_acc': f"{current_metrics['precision_class_2']:.4f}",
-                'same_acc': f"{current_metrics['precision_class_1']:.4f}",
-                'no_acc': f"{current_metrics['precision_class_0']:.4f}",
+                'mit_acc': f"{current_metrics['f1_class_2']:.4f}",
+                'same_acc': f"{current_metrics['f1_class_0']:.4f}",
+                'no_acc': f"{current_metrics['f1_class_1']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}",
 
             })
-        
-        return metrics_tracker.get_metrics()
+
+        metrics = metrics_tracker.get_metrics()
+        metrics_tracker.reset()
+
+        return metrics
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -389,8 +386,11 @@ class Trainer:
                 'no_acc': f"{current_metrics['precision_class_0']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}"
             })
-        
-        return metrics_tracker.get_metrics()
+
+        metrics = metrics_tracker.get_metrics()
+        metrics_tracker.reset()
+
+        return metrics
     
     def save_checkpoint(self, is_best=False):
         """Save model checkpoint."""
@@ -503,11 +503,11 @@ class Trainer:
                 self.best_val_loss = val_metrics['loss']
             
             self.save_checkpoint(is_best=is_best)
-            
-            # Early stopping
-            if self.early_stopping(val_metrics['loss']):
-                print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
-                break
+            if self.enable_early_stopping:
+                # Early stopping
+                if self.early_stopping(val_metrics['loss']):
+                    print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
+                    break
             
             print()
         
@@ -530,6 +530,7 @@ class Trainer:
 
 def create_optimizer(model, config):
     """Create optimizer based on config."""
+
     optimizer_name = config.get('optimizer', 'adam').lower()
     lr = config.get('learning_rate', 1e-3)
     weight_decay = config.get('weight_decay', 1e-5)
@@ -540,12 +541,14 @@ def create_optimizer(model, config):
             lr=lr,
             weight_decay=weight_decay
         )
+
     elif optimizer_name == 'adamw':
         optimizer = optim.AdamW(
             model.parameters(),
             lr=lr,
             weight_decay=weight_decay
         )
+
     elif optimizer_name == 'sgd':
         momentum = config.get('momentum', 0.9)
         optimizer = optim.SGD(
@@ -563,15 +566,18 @@ def create_optimizer(model, config):
 
 def create_scheduler(optimizer, config):
     """Create learning rate scheduler."""
+
     scheduler_name = config.get('scheduler', 'reduce_on_plateau').lower()
     
     if scheduler_name == 'reduce_on_plateau':
+        patience = config.get('patience', 5)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.1,
-            patience=5
+            patience=patience
             )
+        
     elif scheduler_name == 'cosine':
         T_max = config.get('max_epochs', 100)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -579,6 +585,7 @@ def create_scheduler(optimizer, config):
             T_max=T_max,
             eta_min=1e-6
         )
+
     elif scheduler_name == 'step':
         step_size = config.get('step_size', 30)
         gamma = config.get('gamma', 0.1)
@@ -587,45 +594,71 @@ def create_scheduler(optimizer, config):
             step_size=step_size,
             gamma=gamma
         )
+
     elif scheduler_name == 'exp':
-        step_size = config.get('step_size', 30)
         decay = config.get('decay', 0.99)
         scheduler = optim.lr_scheduler.ExponentialLR(
             optimizer,
             gamma=decay
         )
+
     elif scheduler_name == 'none':
         scheduler = None
-    else:
-        raise ValueError(f"Unknown scheduler: {scheduler_name}")
-    
+
+    elif scheduler_name == 'caliban': 
+        step_size = config.get('step_size', 30)
+        decay = config.get('decay', 0.99)
+        scheduler=optim.lr_scheduler.ChainedScheduler([        
+            optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=decay
+            ),
+            optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=step_size
+            )
+        ])
+        
     return scheduler
 
 
 # Example usage
 if __name__ == "__main__":
 
+    config = {
+        'optimizer': 'adam',
+        'learning_rate': 1e-3,
+        'weight_decay': 0,
+        'decay': 0.99,
+        'scheduler': 'reduce_on_plateau',
+        'max_epochs': 50,
+        'batch_size': 6,
+        'n_layers': 1,
+        'num_workers': 4,
+        'clipnorm': 1e-3,
+        'step_size': 5,
+        'crop_mode': 'resize',
+        'patience': 3
+    }
+
     model = GNNTrackingModel(
                              graph_layer='gat', 
                              data_format='channels_last',
-                             encoder_dim=64
+                             encoder_dim=64,
+                             n_layers=config['n_layers']
                              )
     
-    train_loader, val_loader, _ = create_trk_dataloaders(train_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/train.zarr',
-                                                         val_path='/home/sholtzen/torch-tracking/data/DynamicNuclearNet-tracking-v1_0/val.zarr',
-                                                         batch_size=6,
-                                                         distance_threshold=64,
-                                                         augment=True,
-                                                         num_workers=4)
-    
-    config = {
-        'optimizer': 'adam',
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-5,
-        'decay': 0.99,
-        'scheduler': 'exp',
-        'max_epochs': 50
-    }
+    train_loader, val_loader, _ = create_trk_dataloaders(
+        train_path='data/DynamicNuclearNet-tracking-v1_0/train.zarr',
+        val_path='data/DynamicNuclearNet-tracking-v1_0/val.zarr',
+        batch_size=config['batch_size'],
+        distance_threshold=64,
+        augment=True,
+        crop_mode=config['crop_mode'],
+        num_workers=config['num_workers']
+        )
+
+    log_suffix = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config)
@@ -639,7 +672,9 @@ if __name__ == "__main__":
         device='cuda:6',
         checkpoint_dir='./checkpoints',
         max_epochs=config['max_epochs'],
-        gradient_clip=0.001
+        gradient_clip=config['clipnorm'],
+        log_suffix = log_suffix,
+        enable_early_stopping=False
     )   
 
     trainer.train()
