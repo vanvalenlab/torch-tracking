@@ -6,6 +6,41 @@ import torch
 import cv2
 from skimage import transform
 
+def weighted_categorical_crossentropy(y_true, y_pred,
+                                      n_classes=3, axis=None,
+                                      from_logits=False):
+    """Categorical crossentropy between an output tensor and a target tensor.
+    Automatically computes the class weights from the target image and uses
+    them to weight the cross entropy
+
+    Args:
+        y_true: A tensor of the same shape as ``y_pred``.
+        y_pred: A tensor resulting from a softmax
+            (unless ``from_logits`` is ``True``, in which
+            case ``y_pred`` is expected to be the logits).
+        from_logits: Boolean, whether ``y_pred`` is the
+            result of a softmax, or is a tensor of logits.
+
+    Returns:
+        tensor: Output tensor.
+    """
+    if from_logits:
+        raise Exception('weighted_categorical_crossentropy cannot take logits')
+    if axis is None:
+        axis = -1 # if K.image_data_format() == 'channels_first' else K.ndim(y_pred) - 1
+    reduce_axis = [x for x in list(range(torch.Tensor.dim(y_pred))) if x != axis]
+    # scale preds so that the class probas of each sample sum to 1
+    y_pred = y_pred / torch.sum(y_pred, dim=axis, keepdims=True)
+    # manual computation of crossentropy
+    eps=1e-10
+    _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
+    y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
+    total_sum = torch.sum(y_true)
+    class_sum = torch.sum(y_true, dim=reduce_axis, keepdims=True)
+    class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
+    return - (y_true * torch.log(y_pred) * class_weights)
+
+
 def normalize_adjacency_symmetric(
     adj: torch.Tensor,
     add_self_loops: bool = True,
@@ -196,7 +231,6 @@ def is_valid_lineage(y, lineage):
         is_valid = False
 
     return is_valid  # if unchanged, all cell lineages are valid!
-
 
 
 def relabel_sequential_lineage(y, lineage):
@@ -459,3 +493,39 @@ def resize(data, shape, data_format='channels_last', labeled_image=False):
         resized = _resize(data)
 
     return resized.astype(original_dtype)
+
+def clean_up_annotations(y, uid=None, data_format='channels_last'):
+    """Relabels every frame in the label matrix.
+
+    Args:
+        y (np.array): annotations to relabel sequentially.
+        uid (int, optional): starting ID to begin labeling cells.
+        data_format (str): determines the order of the channel axis,
+            one of 'channels_first' and 'channels_last'.
+
+    Returns:
+        np.array: Cleaned up annotations.
+    """
+    y = y.astype('int32')
+    time_axis = 1 if data_format == 'channels_first' else 0
+    num_frames = y.shape[time_axis]
+
+    all_uniques = []
+    for f in range(num_frames):
+        cells = np.unique(y[:, f] if data_format == 'channels_first' else y[f])
+        cells = np.delete(cells, np.where(cells == 0))
+        all_uniques.append(cells)
+
+    # The annotations need to be unique across all frames
+    uid = sum(len(x) for x in all_uniques) + 1 if uid is None else uid
+    for frame, unique_cells in zip(range(num_frames), all_uniques):
+        y_frame = y[:, frame] if data_format == 'channels_first' else y[frame]
+        y_frame_new = np.zeros(y_frame.shape)
+        for cell_label in unique_cells:
+            y_frame_new[y_frame == cell_label] = uid
+            uid += 1
+        if data_format == 'channels_first':
+            y[:, frame] = y_frame_new
+        else:
+            y[frame] = y_frame_new
+    return y

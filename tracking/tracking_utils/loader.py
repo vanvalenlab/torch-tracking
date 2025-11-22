@@ -41,7 +41,6 @@ class TrkDataset(Dataset):
         track_length: int = 8,
         crop_size: int = 32,
         stride: int = 1,
-        appearance_shape: Tuple[int, int, int] = (32, 32, 1),
         data_format: str = 'channels_first',
         mode: str = 'training',
         normalize_images: bool = True,
@@ -49,14 +48,15 @@ class TrkDataset(Dataset):
         augment: bool = True,
         rotation_range: int = 180,
         translation_range: float = 0.1,  # As fraction of image size
-        crop_mode: str = 'resize'
+        crop_mode: str = 'resize',
+        truncate_dataset=None
     ):
         super().__init__()
         self.trk_path = Path(trk_path)
         self.track_length = track_length
         self.crop_size = crop_size
         self.stride = stride
-        self.appearance_shape = appearance_shape
+        self.appearance_shape = (crop_size, crop_size, 1)
         self.data_format = data_format
         self.mode = mode
         self.normalize_images = normalize_images
@@ -65,14 +65,21 @@ class TrkDataset(Dataset):
         self.rotation_range = rotation_range
         self.translation_range = translation_range
         self.crop_mode = crop_mode
+        self.truncate_dataset = truncate_dataset
         
         # Load .trk file
         print(f"Loading {self.trk_path}...")
         self.trk_data = zarr.open(self.trk_path, mode='r')
         
-        self.X = self.trk_data['X'] # Raw images (B, T, Y, X, C)
-        self.y = self.trk_data['y'] # Segmentation masks (B, T, Y, X, C)
-        self.lineages = self.trk_data['lineages'][0] # Lineage information
+        if self.truncate_dataset is not None:
+            self.X = self.trk_data['X'][:self.truncate_dataset] # Raw images (B, T, Y, X, C)
+            self.y = self.trk_data['y'][:self.truncate_dataset] # Segmentation masks (B, T, Y, X, C)
+            self.lineages = self.trk_data['lineages'][0][:self.truncate_dataset] # Lineage information
+
+        else:
+            self.X = self.trk_data['X'] # Raw images (B, T, Y, X, C)
+            self.y = self.trk_data['y'] # Segmentation masks (B, T, Y, X, C)
+            self.lineages = self.trk_data['lineages'][0] # Lineage information
 
         if not len(self.X) == len(self.y) == len(self.lineages):
             raise ValueError(
@@ -322,14 +329,14 @@ class TrkDataset(Dataset):
             for i in range(temporal_adj_matrix.shape[2]):
                 # index + 1 is the cell label
                 if i + 1 not in self.lineages[batch]:
-                    temporal_adj_matrix[batch, :, i] = 0
-                    temporal_adj_matrix[batch, :, :, i] = 0
+                    temporal_adj_matrix[batch, :, i] = -1
+                    temporal_adj_matrix[batch, :, :, i] = -1
 
             # Identify temporal padding
             for b in range(temporal_adj_matrix.shape[0]):
                 sames = temporal_adj_matrix[b, ..., 0]
                 sames = np.sum(sames, axis=(1, 2))
-                temporal_adj_matrix[b, sames == 0] = 0
+                temporal_adj_matrix[b, sames == 0] = -1
 
         features = {
             'adj_matrix': adj_matrix,

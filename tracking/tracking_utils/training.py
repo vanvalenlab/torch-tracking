@@ -1,5 +1,3 @@
-"""Complete training loop for GNN cell tracking model"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,29 +10,83 @@ import time
 import datetime
 from model import GNNTrackingModel
 from loader import create_trk_dataloaders
-from utils import normalize_adjacency_symmetric
+from utils import normalize_adjacency_symmetric, weighted_categorical_crossentropy
+import torch.nn.functional as F
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+from typing import Optional
+from torch import Tensor
+
+class FocalLoss(nn.Module):
+    def __init__(self,
+                 alpha: Optional[Tensor] = None,
+                 gamma: float = 0.,
+                 reduction: str = 'mean',
+                 ignore_index: int = -1):
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(
+                'Reduction must be one of: "mean", "sum", "none".')
+
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+        self.nll_loss = nn.NLLLoss(
+            weight=alpha, reduction='none', ignore_index=ignore_index)
+
+    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+        if x.ndim > 2:
+            c = x.shape[1]
+            x = x.permute(0, *range(2, x.ndim), 1).reshape(-1, c)
+            y = y.view(-1)
+
+        unignored_mask = y != self.ignore_index
+        y = y[unignored_mask]
+        if len(y) == 0:
+            return torch.tensor(0.)
+        x = x[unignored_mask]
+
+        log_p = F.log_softmax(x, dim=-1)
+        ce = self.nll_loss(log_p, y)
+
+        all_rows = torch.arange(len(x))
+        log_pt = log_p[all_rows, y]
+
+        pt = log_pt.exp()
+        focal_term = (1 - pt)**self.gamma
+
+        loss = focal_term * ce
+
+        if self.reduction == 'mean':
+            loss = loss.mean()
+        elif self.reduction == 'sum':
+            loss = loss.sum()
+
+        return loss
 
 class TrackingLoss(nn.Module):
     
-    def __init__(self, alpha=None, gamma=2.0, use_focal=True):
+    def __init__(self, gamma=2.0, use_focal=True):
         super().__init__()
+
+        weights = torch.tensor([100.0, 1.0, 26000.0])  # [same_cell, no_link, mitosis]
         
-        if alpha is None:
-            # Default: aggressive weighting for minority classes
-            # Adjust these based on your actual class distribution
-            alpha = torch.tensor([100.0, 1.0, 26000.0])  # [same_cell, no_link, mitosis]
-        
-        self.alpha = alpha
+        self.weights = weights
         self.gamma = gamma
         self.use_focal = use_focal
         self.pad_value = -1
+
+        if use_focal:
+            self.criterion = FocalLoss(alpha=self.weights, gamma=self.gamma)
         
         # Standard CrossEntropyLoss with class weights
-        self.criterion = nn.CrossEntropyLoss(weight=alpha, reduction='none')
+        else:
+            self.criterion = nn.CrossEntropyLoss(reduction='none', 
+                                                 ignore_index=self.pad_value)
 
-    def _weighted_categorical_crossentropy(self, y_true, y_pred,
-                                        n_classes=3, axis=None,
-                                        from_logits=False):
+    def _get_class_weights(self, y_true):
         
         """Categorical crossentropy between an output tensor and a target tensor.
         Automatically computes the class weights from the target image and uses
@@ -51,17 +103,11 @@ class TrackingLoss(nn.Module):
         Returns:
             tensor: Output tensor.
         """
-
-        # scale preds so that the class probas of each sample sum to 1
-        y_pred = y_pred / torch.sum(y_pred, dim=axis, keepdims=True)
-        # manual computation of crossentropy
-        eps=1e-10
-        _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
-        y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
+        n_classes = y_true.shape[-1]
         total_sum = torch.sum(y_true)
-        class_sum = torch.sum(y_true, dim=0, keepdims=True)
+        class_sum = torch.sum(y_true, dim=-1)
         class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
-        return - torch.mean((y_true * torch.log(y_pred) * class_weights), dim=axis)
+        return class_weights
     
     def forward(self, predictions, targets):
         
@@ -76,24 +122,20 @@ class TrackingLoss(nn.Module):
 
         # # Reshape for CrossEntropyLoss
         predictions_flat = predictions.view(-1, predictions.shape[-1])  # (B*T*N*M, 3)
-        targets_flat = targets.view(-1, targets.shape[-1]).argmax(dim=-1).long()  # (B*T*N*M)
-        
+        targets_flat = targets.view(-1, targets.shape[-1])
+        # class_weights = self._get_class_weights(targets_flat)
+
+        valid_mask = targets_flat >= 0
+
+        # targets_flat = targets_flat.argmax(dim=-1).long()  # (B*T*N*M)
+
         # Compute weighted cross-entropy
-        ce_loss = self.criterion(predictions_flat, targets_flat)
+        loss = weighted_categorical_crossentropy(targets_flat, predictions_flat.softmax(dim=-1), 3)
         
-        # Apply focal loss modulation
-        if self.use_focal:
-            with torch.no_grad():
-                # Get probability of true class
-                pt = torch.exp(-ce_loss)
+        # if not self.use_focal:
+        #     loss = loss*class_weights
             
-            # Apply focal weight: focus on hard examples
-            focal_weight = (1 - pt) ** self.gamma
-            loss = focal_weight * ce_loss
-        else:
-            loss = ce_loss
-        
-        return loss.mean()
+        return loss[valid_mask].mean()
 
 
 class MetricsTracker:
@@ -128,17 +170,19 @@ class MetricsTracker:
         # Get predicted classes
         pred_classes = predictions.argmax(dim=-1)  # (B*T*N*M)
         target_classes = targets.argmax(dim=-1)
-                
+
+        valid_mask = targets.min(dim=-1).values >= 0   
+
         # Overall accuracy
-        correct = (pred_classes == target_classes)
+        correct = (pred_classes == target_classes) & valid_mask
         self.correct += correct.sum().item()
-        self.total_predictions += pred_classes.numel()
+        self.total_predictions += valid_mask.sum().item()
         
         # Per-class metrics
         for class_idx in range(3):
-            class_mask = (target_classes == class_idx)
-            class_predicted_mask = (pred_classes == class_idx)
-            class_correct = (pred_classes == class_idx) & class_mask 
+            class_mask = (target_classes == class_idx) & valid_mask
+            class_predicted_mask = (pred_classes == class_idx) & valid_mask
+            class_correct = (pred_classes == class_idx) & class_mask
             
             self.class_correct[class_idx] += class_correct.sum().item()
             self.class_total[class_idx] += class_mask.sum().item()
@@ -238,13 +282,15 @@ class Trainer:
         scheduler=None,
         loss_fn=None,
         device='cuda',
-        checkpoint_dir='./checkpoints',
+        checkpoint_dir='./checkpoints/',
         log_dir='./logs/',
         max_epochs=100,
         gradient_clip=1.0,
         early_stopping_patience=10,
         enable_early_stopping=True,
-        log_suffix=''
+        log_and_save=True,
+        use_focal=False,
+        config=None,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -255,12 +301,21 @@ class Trainer:
         self.max_epochs = max_epochs
         self.gradient_clip = gradient_clip
         self.enable_early_stopping = enable_early_stopping
-        
+        self.log_and_save = log_and_save
+        self.use_focal = use_focal
+        self.config=config
+
+        curr_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        self.log_suffix = curr_time
+        self.log_dir = Path(log_dir +  self.log_suffix)
+        self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
+
         # Loss function
         if loss_fn is None:
             # Default: weighted cross-entropy to handle class imbalance
             # Typically: no_link >> different > same_cell in frequency
-            self.loss_fn = TrackingLoss(use_focal=False, gamma=2.0)
+            self.loss_fn = TrackingLoss(use_focal=use_focal, gamma=2.0)
         else:
             self.loss_fn = loss_fn
         
@@ -268,15 +323,17 @@ class Trainer:
         self.model = self.model.to(device)
         self.loss_fn = self.loss_fn.to(device)
         
-        # Setup directories
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Setup directories and Tensorboard writer
+        if self.log_and_save:
+            self.writer = SummaryWriter(log_dir=str(self.log_dir))
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(f"{self.checkpoint_dir}/config.json", 'w') as f:
+                json.dump(self.config, f, indent=4)
         
-        self.log_dir = Path(log_dir +  log_suffix)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Tensorboard writer
-        self.writer = SummaryWriter(log_dir=str(self.log_dir))
+        else:
+            self.writer = None
         
         # Early stopping
         self.early_stopping = EarlyStopping(
@@ -345,7 +402,6 @@ class Trainer:
             })
 
         metrics = metrics_tracker.get_metrics()
-        metrics_tracker.reset()
 
         return metrics
     
@@ -374,21 +430,20 @@ class Trainer:
             
             # Compute loss
             loss = self.loss_fn(predictions, labels)
-            
+
             # Update metrics
             metrics_tracker.update(loss, predictions, labels)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
-                'mit_acc': f"{current_metrics['precision_class_2']:.4f}",
-                'same_acc': f"{current_metrics['precision_class_1']:.4f}",
-                'no_acc': f"{current_metrics['precision_class_0']:.4f}",
+                'mit_acc': f"{current_metrics['f1_class_2']:.4f}",
+                'same_acc': f"{current_metrics['f1_class_0']:.4f}",
+                'no_acc': f"{current_metrics['f1_class_1']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}"
             })
 
         metrics = metrics_tracker.get_metrics()
-        metrics_tracker.reset()
 
         return metrics
     
@@ -474,21 +529,30 @@ class Trainer:
                     self.scheduler.step()
             
             current_lr = self.optimizer.param_groups[0]['lr']
-            
-            # Log to tensorboard
-            self.writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
-            self.writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
-            self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
-            self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
-            self.writer.add_scalar('Learning_rate', current_lr, epoch)
 
-            for i in range(3):
-                self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
-                self.writer.add_scalar(f'Precision/val/class_{i}', val_metrics[f'precision_class_{i}'], epoch)
-                self.writer.add_scalar(f'Recall/train/class_{i}', train_metrics[f'recall_class_{i}'], epoch)
-                self.writer.add_scalar(f'Recall/val/class_{i}', val_metrics[f'recall_class_{i}'], epoch)
-                self.writer.add_scalar(f'F1/train/class_{i}', train_metrics[f'f1_class_{i}'], epoch)
-                self.writer.add_scalar(f'F1/val/class_{i}', val_metrics[f'f1_class_{i}'], epoch)
+            # Save checkpoint
+            is_best = val_metrics['loss'] < self.best_val_loss
+            
+            if is_best:
+                self.best_val_loss = val_metrics['loss']
+
+            if self.writer is not None:
+            # Log to tensorboard
+                self.writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
+                self.writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
+                self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
+                self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
+                self.writer.add_scalar('Learning_rate', current_lr, epoch)
+
+                for i in range(3):
+                    self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
+                    self.writer.add_scalar(f'Precision/val/class_{i}', val_metrics[f'precision_class_{i}'], epoch)
+                    self.writer.add_scalar(f'Recall/train/class_{i}', train_metrics[f'recall_class_{i}'], epoch)
+                    self.writer.add_scalar(f'Recall/val/class_{i}', val_metrics[f'recall_class_{i}'], epoch)
+                    self.writer.add_scalar(f'F1/train/class_{i}', train_metrics[f'f1_class_{i}'], epoch)
+                    self.writer.add_scalar(f'F1/val/class_{i}', val_metrics[f'f1_class_{i}'], epoch)
+
+                self.save_checkpoint(is_best=is_best)
 
             # Print epoch summary
             epoch_time = time.time() - epoch_start
@@ -497,12 +561,8 @@ class Trainer:
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
             print(f"  LR: {current_lr:.6f}")
             
-            # Save checkpoint
-            is_best = val_metrics['loss'] < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_metrics['loss']
-            
-            self.save_checkpoint(is_best=is_best)
+
+
             if self.enable_early_stopping:
                 # Early stopping
                 if self.early_stopping(val_metrics['loss']):
@@ -516,8 +576,9 @@ class Trainer:
         print(f"Training completed in {total_time/3600:.2f} hours")
         print(f"Best validation loss: {self.best_val_loss:.4f}")
         print("="*70)
-        
-        self.writer.close()
+
+        if self.writer is not None:
+            self.writer.close()
         
         # Save final training history
         history_path = self.checkpoint_dir / 'training_history.json'
@@ -541,6 +602,11 @@ def create_optimizer(model, config):
             lr=lr,
             weight_decay=weight_decay
         )
+    if optimizer_name == 'muon':
+        optimizer = optim.Muon(
+            model.parameters(),
+            lr=lr
+            )
 
     elif optimizer_name == 'adamw':
         optimizer = optim.AdamW(
@@ -625,8 +691,10 @@ def create_scheduler(optimizer, config):
 # Example usage
 if __name__ == "__main__":
 
+    # Make config dictionary
+
     config = {
-        'optimizer': 'adam',
+        'optimizer': 'adamw',
         'learning_rate': 1e-3,
         'weight_decay': 0,
         'decay': 0.99,
@@ -637,16 +705,32 @@ if __name__ == "__main__":
         'num_workers': 4,
         'clipnorm': 1e-3,
         'step_size': 5,
-        'crop_mode': 'resize',
-        'patience': 3
+        'crop_mode': 'fixed',
+        'patience': 3,
+        'log_and_save': True,
+        'enable_early_stopping': False,
+        'use_focal': False,
+        'crop_size': 16,
+        'attention': False,
+        'truncate_dataset': None
     }
+
+    # Initialize model
 
     model = GNNTrackingModel(
                              graph_layer='gat', 
                              data_format='channels_last',
                              encoder_dim=64,
-                             n_layers=config['n_layers']
+                             n_layers=config['n_layers'],
+                             crop_size=config['crop_size'],
+                             attention=config['attention']
                              )
+    
+
+    # Create optimizer and rate scheduler
+
+    optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config)
     
     train_loader, val_loader, _ = create_trk_dataloaders(
         train_path='data/DynamicNuclearNet-tracking-v1_0/train.zarr',
@@ -655,13 +739,10 @@ if __name__ == "__main__":
         distance_threshold=64,
         augment=True,
         crop_mode=config['crop_mode'],
-        num_workers=config['num_workers']
+        num_workers=config['num_workers'],
+        crop_size=config['crop_size'],
+        truncate_dataset = config['truncate_dataset']
         )
-
-    log_suffix = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-
-    optimizer = create_optimizer(model, config)
-    scheduler = create_scheduler(optimizer, config)
 
     trainer = Trainer(
         model=model,
@@ -670,11 +751,13 @@ if __name__ == "__main__":
         optimizer=optimizer,
         scheduler=scheduler,
         device='cuda:6',
-        checkpoint_dir='./checkpoints',
+        checkpoint_dir='./checkpoints/',
         max_epochs=config['max_epochs'],
         gradient_clip=config['clipnorm'],
-        log_suffix = log_suffix,
-        enable_early_stopping=False
+        enable_early_stopping=config['enable_early_stopping'],
+        log_and_save = config['log_and_save'],
+        use_focal=config['use_focal'],
+        config=config
     )   
 
     trainer.train()

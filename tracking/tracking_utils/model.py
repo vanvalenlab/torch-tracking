@@ -10,7 +10,7 @@ from encoders import (
     AppearanceEncoder, MorphologyEncoder, CentroidEncoder,
     DeltaEncoder, NeighborhoodEncoder
 )
-from decoder import TrackingDecoder
+from decoder import TrackingDecoder, TrackingDecoderWithAttention
 from branches import TrainingBranch, InferenceBranch
 
 class GNNTrackingModel(nn.Module):
@@ -58,7 +58,9 @@ class GNNTrackingModel(nn.Module):
         norm_layer='batch',
         appearance_norm=True,
         n_classes=3,
-        data_format='channels_first'
+        crop_size=32,
+        data_format='channels_first',
+        attention=False
     ):
         super().__init__()
         
@@ -68,11 +70,12 @@ class GNNTrackingModel(nn.Module):
         self.encoder_dim = encoder_dim
         self.n_layers = n_layers
         self.graph_layer = graph_layer
-        self.appearance_shape = (32, 32, 1) if data_format=='channels_last' else (1,32,32)
+        self.appearance_shape = (crop_size, crop_size, 1)
         self.norm_layer = norm_layer
         self.appearance_norm = appearance_norm
         self.n_classes = n_classes
         self.data_format = data_format
+        self.attention = attention
         
         # Validate inputs
         self._validate_config()
@@ -197,13 +200,23 @@ class GNNTrackingModel(nn.Module):
     
     def _build_decoder(self):
         """Build tracking decoder."""
-        self.tracking_decoder = TrackingDecoder(
-            embedding_dim=self.encoder_dim,
-            n_filters=self.n_filters,
-            n_classes=self.n_classes,
-            norm_layer=self.norm_layer
-        )
-    
+        if self.attention:
+            self.tracking_decoder = TrackingDecoderWithAttention(
+                embedding_dim=self.encoder_dim,
+                n_filters=self.n_filters,
+                n_classes=self.n_classes,
+                norm_layer=self.norm_layer,
+                attention_heads = 2
+            )
+
+        else:
+            self.tracking_decoder = TrackingDecoder(
+                embedding_dim=self.encoder_dim,
+                n_filters=self.n_filters,
+                n_classes=self.n_classes,
+                norm_layer=self.norm_layer
+            )            
+        
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
                         return_logits=True):
         """Forward pass for training.
