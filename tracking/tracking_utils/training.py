@@ -12,7 +12,6 @@ from model import GNNTrackingModel
 from loader import create_trk_dataloaders
 from utils import normalize_adjacency_symmetric, weighted_categorical_crossentropy
 import torch.nn.functional as F
-from sklearn.metrics import precision_score, recall_score, f1_score
 
 from typing import Optional
 from torch import Tensor
@@ -68,46 +67,23 @@ class FocalLoss(nn.Module):
 
 class TrackingLoss(nn.Module):
     
-    def __init__(self, gamma=2.0, use_focal=True):
+    def __init__(self, gamma=2.0, loss='wcce'):
         super().__init__()
 
         weights = torch.tensor([100.0, 1.0, 26000.0])  # [same_cell, no_link, mitosis]
         
         self.weights = weights
         self.gamma = gamma
-        self.use_focal = use_focal
+        self.loss = loss
         self.pad_value = -1
 
-        if use_focal:
+        if self.loss == 'focal':
             self.criterion = FocalLoss(alpha=self.weights, gamma=self.gamma)
-        
         # Standard CrossEntropyLoss with class weights
-        else:
+        elif self.loss == 'cce':
             self.criterion = nn.CrossEntropyLoss(reduction='none', 
                                                  ignore_index=self.pad_value)
 
-    def _get_class_weights(self, y_true):
-        
-        """Categorical crossentropy between an output tensor and a target tensor.
-        Automatically computes the class weights from the target image and uses
-        them to weight the cross entropy
-
-        Args:
-            y_true: A tensor of the same shape as ``y_pred``.
-            y_pred: A tensor resulting from a softmax
-                (unless ``from_logits`` is ``True``, in which
-                case ``y_pred`` is expected to be the logits).
-            from_logits: Boolean, whether ``y_pred`` is the
-                result of a softmax, or is a tensor of logits.
-
-        Returns:
-            tensor: Output tensor.
-        """
-        n_classes = y_true.shape[-1]
-        total_sum = torch.sum(y_true)
-        class_sum = torch.sum(y_true, dim=-1)
-        class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
-        return class_weights
     
     def forward(self, predictions, targets):
         
@@ -130,14 +106,14 @@ class TrackingLoss(nn.Module):
         # targets_flat = targets_flat.argmax(dim=-1).long()  # (B*T*N*M)
 
         # Compute weighted cross-entropy
-        loss = weighted_categorical_crossentropy(targets_flat, predictions_flat.softmax(dim=-1), 3)
-        
-        # if not self.use_focal:
-        #     loss = loss*class_weights
+        if self.loss == 'wcce':
+            loss = weighted_categorical_crossentropy(targets_flat, predictions_flat, 3)
+            return loss[valid_mask].mean()
+
+        else:
+            loss = self.criterion(predictions_flat, targets_flat.argmax(dim=-1))
+            return loss.mean()
             
-        return loss[valid_mask].mean()
-
-
 class MetricsTracker:
     
     def __init__(self):
@@ -289,8 +265,8 @@ class Trainer:
         early_stopping_patience=10,
         enable_early_stopping=True,
         log_and_save=True,
-        use_focal=False,
         config=None,
+        loss='wcce'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -302,8 +278,13 @@ class Trainer:
         self.gradient_clip = gradient_clip
         self.enable_early_stopping = enable_early_stopping
         self.log_and_save = log_and_save
-        self.use_focal = use_focal
         self.config=config
+        self.loss=loss
+
+        if loss=='wcce':
+            self.return_logits = False
+        else:
+            self.return_logits = True
 
         curr_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -311,13 +292,7 @@ class Trainer:
         self.log_dir = Path(log_dir +  self.log_suffix)
         self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
 
-        # Loss function
-        if loss_fn is None:
-            # Default: weighted cross-entropy to handle class imbalance
-            # Typically: no_link >> different > same_cell in frequency
-            self.loss_fn = TrackingLoss(use_focal=use_focal, gamma=2.0)
-        else:
-            self.loss_fn = loss_fn
+        self.loss_fn = TrackingLoss(loss=loss)
         
         # Move to device
         self.model = self.model.to(device)
@@ -351,6 +326,7 @@ class Trainer:
         """Train for one epoch."""
         self.model.train()
         metrics_tracker = MetricsTracker()
+
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]')
         
@@ -369,7 +345,7 @@ class Trainer:
             
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=True
+                return_logits=self.return_logits
             )
             
             # Compute loss
@@ -394,11 +370,10 @@ class Trainer:
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
-                'mit_acc': f"{current_metrics['f1_class_2']:.4f}",
-                'same_acc': f"{current_metrics['f1_class_0']:.4f}",
-                'no_acc': f"{current_metrics['f1_class_1']:.4f}",
+                'mit_f1': f"{current_metrics['f1_class_2']:.4f}",
+                'same_f1': f"{current_metrics['f1_class_0']:.4f}",
+                'no_f1': f"{current_metrics['f1_class_1']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}",
-
             })
 
         metrics = metrics_tracker.get_metrics()
@@ -425,7 +400,7 @@ class Trainer:
             # Forward pass
             predictions = self.model.training_forward(
                 appearances, morphologies, centroids, adj_matrices,
-                return_logits=True
+                return_logits=self.return_logits
             )
             
             # Compute loss
@@ -437,9 +412,9 @@ class Trainer:
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
-                'mit_acc': f"{current_metrics['f1_class_2']:.4f}",
-                'same_acc': f"{current_metrics['f1_class_0']:.4f}",
-                'no_acc': f"{current_metrics['f1_class_1']:.4f}",
+                'mit_f1': f"{current_metrics['f1_class_2']:.4f}",
+                'same_f1': f"{current_metrics['f1_class_0']:.4f}",
+                'no_f1': f"{current_metrics['f1_class_1']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}"
             })
 
@@ -596,13 +571,14 @@ def create_optimizer(model, config):
     lr = config.get('learning_rate', 1e-3)
     weight_decay = config.get('weight_decay', 1e-5)
     
-    if optimizer_name == 'adam':
+    if optimizer_name == 'radam':
         optimizer = optim.RAdam(
             model.parameters(),
             lr=lr,
             weight_decay=weight_decay
         )
-    if optimizer_name == 'muon':
+        
+    elif optimizer_name == 'muon':
         optimizer = optim.Muon(
             model.parameters(),
             lr=lr
@@ -694,7 +670,7 @@ if __name__ == "__main__":
     # Make config dictionary
 
     config = {
-        'optimizer': 'adamw',
+        'optimizer': 'radam',
         'learning_rate': 1e-3,
         'weight_decay': 0,
         'decay': 0.99,
@@ -702,17 +678,17 @@ if __name__ == "__main__":
         'max_epochs': 50,
         'batch_size': 6,
         'n_layers': 1,
-        'num_workers': 4,
+        'num_workers': 8,
         'clipnorm': 1e-3,
         'step_size': 5,
         'crop_mode': 'fixed',
-        'patience': 3,
+        'patience': 5,
         'log_and_save': True,
         'enable_early_stopping': False,
-        'use_focal': False,
         'crop_size': 16,
         'attention': False,
-        'truncate_dataset': None
+        'truncate_dataset': None,
+        'loss': 'wcce'
     }
 
     # Initialize model
@@ -756,8 +732,8 @@ if __name__ == "__main__":
         gradient_clip=config['clipnorm'],
         enable_early_stopping=config['enable_early_stopping'],
         log_and_save = config['log_and_save'],
-        use_focal=config['use_focal'],
-        config=config
+        config=config,
+        loss=config['loss']
     )   
 
     trainer.train()
