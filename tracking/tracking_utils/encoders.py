@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATv2Conv
 from torch_geometric.data import Data, Batch
+from utils import normalize_adjacency_symmetric
 
 # Import custom layers (assumes they're in the same directory)
 from layers import ImageNormalization2D
@@ -364,6 +365,7 @@ class NeighborhoodEncoder(nn.Module):
         """
 
         BT, N, _ = adj_matrix.shape  # (B*T, max_cells, max_cells)
+        adj_matrix = normalize_adjacency_symmetric(adj_matrix)
 
         # Encode each feature type
         app_features = self.appearance_encoder(appearance)  # (B * T *  N, encoder_dim)

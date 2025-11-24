@@ -10,7 +10,7 @@ import time
 import datetime
 from model import GNNTrackingModel
 from loader import create_trk_dataloaders
-from utils import normalize_adjacency_symmetric, weighted_categorical_crossentropy
+from utils import weighted_categorical_crossentropy
 import torch.nn.functional as F
 
 from typing import Optional
@@ -337,7 +337,7 @@ class Trainer:
             morphologies = batch['morphologies'].to(self.device)
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
-            adj_matrices = normalize_adjacency_symmetric(adj_matrices)
+            # adj_matrices = normalize_adjacency_symmetric(adj_matrices)
             labels = batch['labels'].to(self.device)
             
             # Forward pass
@@ -444,7 +444,8 @@ class Trainer:
         if is_best:
             best_path = self.checkpoint_dir / 'best_model.pt'
             torch.save(checkpoint, best_path)
-            print(f"  💾 Saved best model (val_loss: {self.best_val_loss:.4f})")
+            print()
+            print(f"    Saved best model (val_loss: {self.best_val_loss:.4f})")
         
         # Keep only last 3 checkpoints to save space
         checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
@@ -671,7 +672,7 @@ if __name__ == "__main__":
 
     config = {
         'optimizer': 'radam',
-        'learning_rate': 1e-3,
+        'learning_rate': 5e-4,
         'weight_decay': 0,
         'decay': 0.99,
         'scheduler': 'reduce_on_plateau',
@@ -684,7 +685,7 @@ if __name__ == "__main__":
         'crop_mode': 'fixed',
         'patience': 5,
         'log_and_save': True,
-        'enable_early_stopping': False,
+        'enable_early_stopping': True,
         'crop_size': 16,
         'attention': False,
         'truncate_dataset': None,
@@ -731,7 +732,7 @@ if __name__ == "__main__":
         max_epochs=config['max_epochs'],
         gradient_clip=config['clipnorm'],
         enable_early_stopping=config['enable_early_stopping'],
-        log_and_save = config['log_and_save'],
+        log_and_save = True if config['truncate_dataset'] is None else False,
         config=config,
         loss=config['loss']
     )   

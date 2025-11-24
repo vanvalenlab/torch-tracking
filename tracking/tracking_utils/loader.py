@@ -13,7 +13,7 @@ import tqdm
 import warnings
 warnings.filterwarnings("ignore") 
 
-from utils import relabel_sequential_lineage, get_image_features, normalize_adj_matrix, resize
+from utils import relabel_sequential_lineage, get_image_features, resize
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -390,7 +390,7 @@ class TrkDataset(Dataset):
         return tensors
 
 def create_trk_dataloaders(
-    train_path: Union[str, Path],
+    train_path: Optional[Union[str, Path]] = None,
     val_path: Optional[Union[str, Path]] = None,
     test_path: Optional[Union[str, Path]] = None,
     batch_size: int = 4,
@@ -421,26 +421,28 @@ def create_trk_dataloaders(
     """
     loaders = []
 
-    
-    # Training loader
-    train_dataset = TrkDataset(
-        trk_path=train_path,
-        track_length=track_length,
-        crop_size=crop_size,
-        stride=stride,
-        mode='training',
-        **dataset_kwargs
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
+    if train_path is not None:
+        # Training loader
+        train_dataset = TrkDataset(
+            trk_path=train_path,
+            track_length=track_length,
+            crop_size=crop_size,
+            stride=stride,
+            # mode='training',
+            **dataset_kwargs
         )
-    loaders.append(train_loader)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+            )
+        loaders.append(train_loader)
+    else:
+        loaders.append(None)
     
     # Validation loader
     if val_path is not None:
@@ -449,7 +451,7 @@ def create_trk_dataloaders(
             track_length=track_length,
             crop_size=crop_size,
             stride=stride,
-            mode='training',
+            # mode='training',
             **dataset_kwargs
         )
         
@@ -472,7 +474,7 @@ def create_trk_dataloaders(
             track_length=track_length,
             crop_size=crop_size,
             stride=stride,
-            mode='inference',
+            # mode='inference',
             **dataset_kwargs
         )
         

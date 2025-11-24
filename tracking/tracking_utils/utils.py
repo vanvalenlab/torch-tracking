@@ -69,12 +69,12 @@ def normalize_adjacency_symmetric(
         >>> adj_norm = normalize_adjacency_symmetric(adj)
     """
     with torch.no_grad():
-        B, T, N, _ = adj.shape
+        T, N, _ = adj.shape
         
         # Add self-loops: A + I
         if add_self_loops:
             identity = torch.eye(N, device=adj.device, dtype=adj.dtype)
-            identity = identity.view(1, 1, N, N).expand(B, T, N, N)
+            identity = identity.view(1, N, N).expand(T, N, N)
             adj = adj + identity
         
         # Compute degree matrix: D[i,i] = sum_j A[i,j]
@@ -90,47 +90,6 @@ def normalize_adjacency_symmetric(
         adj_norm = degree_inv_sqrt.unsqueeze(-1) * adj * degree_inv_sqrt.unsqueeze(-2)
         
         return adj_norm
-
-def normalize_adj_matrix(adj, epsilon=1e-5):
-    """Normalize the adjacency matrix
-
-    Args:
-        adj (np.array): Adjacency matrix
-        epsilon (float): Used to create the degree matrix
-
-    Returns:
-        np.array: Normalized adjacency matrix
-
-    Raises:
-        ValueError: If ``adj`` has a rank that is not 3 or 4.
-    """
-    input_rank = len(adj.shape)
-    if input_rank not in {3, 4}:
-        raise ValueError('Only 3 & 4 dim adjacency matrices are supported')
-
-    if input_rank == 3:
-        # temporarily include a batch dimension for consistent processing
-        adj = np.expand_dims(adj, axis=0)
-
-    normalized_adj = np.zeros(adj.shape, dtype='float32')
-
-    for t in range(adj.shape[1]):
-        adj_frame = adj[:, t]
-        # create degree matrix
-        degrees = np.sum(adj_frame, axis=1)
-        for batch, degree in enumerate(degrees):
-            degree = (degree + epsilon) ** -0.5
-            degree_matrix = np.diagflat(degree)
-
-            normalized = np.matmul(degree_matrix, adj_frame[batch])
-            normalized = np.matmul(normalized, degree_matrix)
-            normalized_adj[batch, t] = normalized
-
-    if input_rank == 3:
-        # remove batch axis
-        normalized_adj = normalized_adj[0]
-
-    return normalized_adj
 
 def is_valid_lineage(y, lineage):
     """Check if a cell lineage of a single movie is valid.

@@ -2,25 +2,167 @@ import numpy as np
 from typing import Dict
 from skimage.measure import regionprops
 import torch
+from utils import relabel_sequential_lineage, get_image_features
+import tqdm
+
+from scipy.spatial.distance import cdist
+
+
+def correct_lineages(X, y, lineages):
+
+    new_X = []
+    new_y = []
+    new_lineages = []
+    for batch in tqdm.tqdm(range(y.shape[0])):
+
+        y_relabel, new_lineage = relabel_sequential_lineage(
+            y[batch], lineages[batch])
+
+        new_X.append(X[batch])
+        new_y.append(y_relabel)
+        new_lineages.append(new_lineage)
+
+    new_X = np.stack(new_X, axis=0)
+    new_y = np.stack(new_y, axis=0)
+
+    return new_X, new_y, new_lineages
+
+def get_features(X, y, lineages, appearance_shape=(16, 16, 1), crop_mode='fixed', distance_threshold=64):
+    """
+    Extract the relevant features from the label movie
+    Appearance, morphologies, centroids, and adjacency matrices
+    """
+
+    max_tracks = get_max_cells(y)
+    n_batches = X.shape[0]
+    n_frames = X.shape[1]
+    n_channels = X.shape[-1]
+
+    batch_shape = (n_batches, n_frames, max_tracks)
+
+    appearance_shape = appearance_shape
+
+    appearances = np.zeros(batch_shape + appearance_shape, dtype='float32')
+
+    morphologies = np.zeros(batch_shape + (3,), dtype='float32')
+
+    centroids = np.zeros(batch_shape + (2,), dtype='float32')
+
+    adj_matrix = np.zeros(batch_shape + (max_tracks,), dtype='float32')
+
+    temporal_adj_matrix = np.zeros((n_batches,
+                                    n_frames - 1,
+                                    max_tracks,
+                                    max_tracks,
+                                    3), dtype='float32')
+
+    mask = np.zeros(batch_shape, dtype='float32')
+
+    track_length = np.zeros((n_batches, max_tracks, 2), dtype='int32')
+
+    for batch in tqdm.tqdm(range(n_batches)):
+        for frame in range(n_frames):
+
+            frame_features = get_image_features(
+                X[batch, frame], y[batch, frame],
+                appearance_dim=appearance_shape[1],
+                crop_mode=crop_mode)
+
+            track_ids = frame_features['labels'] - 1
+            centroids[batch, frame, track_ids] = frame_features['centroids']
+            morphologies[batch, frame, track_ids] = frame_features['morphologies']
+            appearances[batch, frame, track_ids] = frame_features['appearances']
+            mask[batch, frame, track_ids] = 1
+
+            # Get adjacency matrix, cannot filter on track ids.
+            cent = centroids[batch, frame]
+            distance = cdist(cent, cent, metric='euclidean')
+            distance = distance < distance_threshold
+
+            # Disconnect the padded nodes
+            morphs = morphologies[batch, frame]
+            is_pad = np.matmul(morphs, morphs.T) == 0
+
+            adj = distance * (1 - is_pad)
+            adj_matrix[batch, frame] = adj.astype(np.float32)
+
+        # Get track length and temporal adjacency matrix
+        for label in lineages[batch]:
+
+            # Get track length
+            start_frame = lineages[batch][label]['frames'][0]
+            end_frame = lineages[batch][label]['frames'][-1]
+
+            track_id = int(label) - 1
+            track_length[batch, track_id, 0] = start_frame
+            track_length[batch, track_id, 1] = end_frame
+
+            # Get temporal adjacency matrix
+            frames = lineages[batch][label]['frames']
+
+            # Assign same
+            for f0, f1 in zip(frames[0:-1], frames[1:]):
+                if f1 - f0 == 1:
+                    temporal_adj_matrix[batch, f0, track_id, track_id, 0] = 1
+
+            # Assign daughter
+            # WARNING: This wont work if there's a time gap between mother
+            # cell disappearing and daughter cells appearing
+            last_frame = frames[-1]
+            daughters = lineages[batch][label]['daughters']
+            for daughter in daughters:
+                daughter_id = daughter - 1
+                temporal_adj_matrix[batch, last_frame, track_id, daughter_id, 2] = 1
+
+        # Assign different
+        same_prob = temporal_adj_matrix[batch, ..., 0]
+        daughter_prob = temporal_adj_matrix[batch, ..., 2]
+        temporal_adj_matrix[batch, ..., 1] = 1 - same_prob - daughter_prob
+
+        # Identify cell padding
+        for i in range(temporal_adj_matrix.shape[2]):
+            # index + 1 is the cell label
+            if i + 1 not in lineages[batch]:
+                temporal_adj_matrix[batch, :, i] = -1
+                temporal_adj_matrix[batch, :, :, i] = -1
+
+        # Identify temporal padding
+        for b in range(temporal_adj_matrix.shape[0]):
+            sames = temporal_adj_matrix[b, ..., 0]
+            sames = np.sum(sames, axis=(1, 2))
+            temporal_adj_matrix[b, sames == 0] = -1
+
+    features = {
+        'adj_matrix': adj_matrix,
+        'appearances': appearances,
+        'morphologies': morphologies,
+        'centroids': centroids,
+        'labels': temporal_adj_matrix,
+        'mask': mask,
+        'track_length': track_length
+        }
+
+    return features
+
 
 
 def get_max_cells(labels):
-        """Helper function for finding the maximum number of cells in a frame of a movie, across
-        all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
+    """Helper function for finding the maximum number of cells in a frame of a movie, across
+    all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
 
-        Args:
-            y (np.array): Annotated image data
+    Args:
+        y (np.array): Annotated image data
 
-        Returns:
-            int: The maximum number of cells in any frame
-        """
-        max_cells = 0
-        for frame in range(labels.shape[0]):
-            cells = np.unique(labels[frame])
-            n_cells = cells[cells != 0].shape[0]
-            if n_cells > max_cells:
-                max_cells = n_cells
-        return max_cells
+    Returns:
+        int: The maximum number of cells in any frame
+    """
+    max_cells = 0
+    for frame in range(labels.shape[0]):
+        cells = np.unique(labels[frame])
+        n_cells = cells[cells != 0].shape[0]
+        if n_cells > max_cells:
+            max_cells = n_cells
+    return max_cells
 
 def generate_adjacency_matrices(
     centroids: np.ndarray,
@@ -55,166 +197,29 @@ def generate_adjacency_matrices(
     
     return adj_matrices
 
-def extract_features(
-    X: np.ndarray, 
-    y: np.ndarray,
-    crop_size=32,
-    normalize_images = True
-) -> Dict[str, np.ndarray]:
-    """Extract cell features from segmentation masks.
-    
-    Args:
-        raw_images: (T, Y, X, C) raw fluorescent images
-        masks: (T, Y, X, C) segmentation masks
-    
-    Returns:
-        Dictionary with:
-        - appearances: (T, N, H, W, C) cropped cell images
-        - morphologies: (T, N, 3) [area, perimeter, eccentricity]
-        - centroids: (T, N, 2) [y, x] positions
-        - cell_ids: (T, N) cell IDs from masks
-    """
-
-    max_cells = np.unique(y)[-1]
-    T = y.shape[0]
-    
-    # Lists to store features for each frame
-    all_appearances = []
-    all_morphologies = []
-    all_centroids = []
-    all_cell_ids = []
-    
-    for t in range(T):
-        mask_t = y[t, ..., 0]  # Remove channel dimension
-        raw_t = X[t, ..., 0]
-        
-        # Get region properties
-        props = regionprops(mask_t.astype(int))
-        
-        # Extract features for each cell
-        appearances = []
-        morphologies = []
-        centroids = []
-        cell_ids = []
-        
-        for prop in props:
-            cell_id = prop.label
-            
-            # Centroid (y, x)
-            centroid = np.array(prop.centroid)
-            
-            # Morphology features
-            area = prop.area
-            perimeter = prop.perimeter
-            eccentricity = prop.eccentricity
-            morphology = np.array([area, perimeter, eccentricity])
-            
-            # Extract appearance crop
-            y_center, x_center = int(centroid[0]), int(centroid[1])
-            half_crop = crop_size // 2
-            
-            y_min = max(0, y_center - half_crop)
-            y_max = min(raw_t.shape[0], y_center + half_crop)
-            x_min = max(0, x_center - half_crop)
-            x_max = min(raw_t.shape[1], x_center + half_crop)
-            
-            crop = raw_t[y_min:y_max, x_min:x_max]
-            
-            # Pad if necessary
-            if crop.shape[0] < crop_size or crop.shape[1] < crop_size:
-                padded_crop = np.zeros((crop_size, crop_size))
-                padded_crop[:crop.shape[0], :crop.shape[1]] = crop
-                crop = padded_crop
-            
-            # Add channel dimension
-            crop = crop[..., np.newaxis]
-            
-            # Normalize if requested
-            if normalize_images:
-                crop = (crop - crop.mean()) / (crop.std() + 1e-7)
-            
-            appearances.append(crop)
-            morphologies.append(morphology)
-            centroids.append(centroid)
-            cell_ids.append(cell_id)
-        
-        # Convert to arrays and pad/crop to max_cells
-        if len(appearances) > 0:
-            appearances = np.stack(appearances)  # (N, H, W, C)
-            morphologies = np.stack(morphologies)  # (N, 3)
-            centroids = np.stack(centroids)  # (N, 2)
-            cell_ids = np.array(cell_ids)  # (N,)
-        else:
-            # No cells in this frame
-            appearances = np.zeros((0, crop_size, crop_size, 1))
-            morphologies = np.zeros((0, 3))
-            centroids = np.zeros((0, 2))
-            cell_ids = np.array([])
-        
-        # Pad or crop to max_cells
-        n_cells = len(appearances)
-        if n_cells < max_cells:
-            # Pad
-            pad_n = max_cells - n_cells
-            appearances = np.pad(
-                appearances, 
-                ((0, pad_n), (0, 0), (0, 0), (0, 0))
-            )
-            morphologies = np.pad(morphologies, ((0, pad_n), (0, 0)))
-            centroids = np.pad(centroids, ((0, pad_n), (0, 0)))
-            cell_ids = np.pad(cell_ids, (0, pad_n), constant_values=-1)
-        else:
-            # Crop
-            appearances = appearances[:max_cells]
-            morphologies = morphologies[:max_cells]
-            centroids = centroids[:max_cells]
-            cell_ids = cell_ids[:max_cells]
-        
-        all_appearances.append(appearances)
-        all_morphologies.append(morphologies)
-        all_centroids.append(centroids)
-        all_cell_ids.append(cell_ids)
-    
-    # Stack across time
-    features = {
-        'appearances': np.stack(all_appearances),  # (T, N, H, W, C)
-        'morphologies': np.stack(all_morphologies),  # (T, N, 3)
-        'centroids': np.stack(all_centroids),  # (T, N, 2)
-        'cell_ids': np.stack(all_cell_ids)  # (T, N)
-    }
-    
-    # Generate adjacency matrices
-    features['adj_matrices'] = generate_adjacency_matrices(
-        features['centroids']
-    )
-
-    features = to_tensors(features)
-    
-    return features
-
 def to_tensors(data: Dict, 
-               unbatched: bool = True
+               unbatched: bool = True,
+               device=None
                ) -> Dict[str, torch.Tensor]:
     """Convert numpy arrays to PyTorch tensors."""
     tensors = {}
     
     # Appearances: (T, N, H, W, C)
-    appearances = torch.from_numpy(data['appearances']).float()
+    appearances = torch.from_numpy(data['appearances']).float().to(device)
     
     tensors['appearances'] = appearances
-    tensors['morphologies'] = torch.from_numpy(data['morphologies']).float()
-    tensors['centroids'] = torch.from_numpy(data['centroids']).float()
-    tensors['adj_matrices'] = torch.from_numpy(data['adj_matrices']).float()
+    tensors['morphologies'] = torch.from_numpy(data['morphologies']).float().to(device)
+    tensors['centroids'] = torch.from_numpy(data['centroids']).float().to(device)
+    tensors['adj_matrix'] = torch.from_numpy(data['adj_matrix']).float().to(device)
     
     if 'labels' in data:
-        tensors['max_cells'] = data['max_cells']
-        tensors['labels'] = data['labels']
+        tensors['labels'] = torch.from_numpy(data['labels']).float().to(device)
     
     if unbatched:
-        tensors['appearances'] = tensors['appearances'].unsqueeze(0)
-        tensors['morphologies'] = tensors['morphologies'].unsqueeze(0)
-        tensors['centroids'] = tensors['centroids'].unsqueeze(0)
-        tensors['adj_matrices'] = tensors['adj_matrices'].unsqueeze(0)
+        tensors['appearances'] = tensors['appearances'].unsqueeze(0).to(device)
+        tensors['morphologies'] = tensors['morphologies'].unsqueeze(0).to(device)
+        tensors['centroids'] = tensors['centroids'].unsqueeze(0).to(device)
+        tensors['adj_matrix'] = tensors['adj_matrix'].unsqueeze(0).to(device)
         
     return tensors
 
