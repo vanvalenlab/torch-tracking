@@ -4,10 +4,16 @@ import torch
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from tqdm import tqdm
+import tqdm
 from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 import json
+from model import GNNTrackingModel
+from loader import create_trk_dataloaders
+from inference import get_image_features, get_max_cells
+from skimage.segmentation import relabel_sequential
+from scipy.spatial.distance import cdist
+import zarr
 
 
 class CellTracker:
@@ -28,7 +34,11 @@ class CellTracker:
         device='cuda',
         max_history_length=8,
         link_threshold=0.5,
-        max_gap=3
+        max_gap=3,
+        distance_threshold=64,
+        crop_mode='fixed',
+        appearance_dim=16,
+        data_format='channels_last'
     ):
         self.model = model.to(device)
         self.model.eval()
@@ -36,17 +46,196 @@ class CellTracker:
         self.max_history_length = max_history_length
         self.link_threshold = link_threshold
         self.max_gap = max_gap
+        self.distance_threshold = distance_threshold
+        self.crop_mode = crop_mode
+        self.appearance_dim = appearance_dim
+        self.data_format = data_format
         
         # Track state
         self.tracks = {}  # track_id -> track info
         self.next_track_id = 0
         self.current_frame = 0
-    
+
+    def _configure(self, X, y):
+
+        '''
+        Initialize batch size, frame size, and max cells
+        test for shape problems and raise errors
+        '''
+
+        if np.ndim(X) != 4 or np.ndim(y) != 4:
+            raise ValueError('input X and y must be of dimension 4')
+        
+        if self.data_format not in {'channels_first', 'channels_last'}:
+            raise ValueError('data format must be either `channels_first` or `channels_last`.')
+        
+        self.channels_dim = -1 if self.data_format=='channels_last' else 1
+
+        if self.data_format=='channels_last':
+            self.appearance_shape=(self.appearance_dim, self.appearance_dim, 1)
+        else:
+            self.appearance_shape=(1, self.appearance_dim, self.appearance_dim)
+
+        if X.shape[self.channels_dim] > 1:
+            raise ValueError('Multichannel images not supported (yet).')
+        
+        self.X = np.expand_dims(X, 0)
+        self._clean_labels(y)
+
+        self.max_cells = get_max_cells(self.y)
+        self.n_batch = 1
+        self.n_frames = self.X.shape[1]
+
+
+    def load_movie(self, X, y):
+        
+        # Set dimensions and ensure data shapes are valid
+        # Ensure labels of the segmentation are sequentially labeled and harmonized
+        self._configure(X, y)
+
+        # Extract appearances, morphologies, centroids, and adjacency matrix
+        self._get_features()
+
+
+    @torch.no_grad()
+    def embed_images(self):
+
+        tensors = self._to_tensors()
+
+        self.embeddings, self.centroids = self.model.get_embeddings(
+            appearances=tensors['appearances'],
+            morphologies=tensors['morphologies'],
+            centroids=tensors['centroids'],
+            adj_matrices=tensors['adj_matrix'],
+        )
+
+
+    def _get_features(self):
+
+        """
+        Extract the relevant features from the label movie
+        Appearance, morphologies, centroids, and adjacency matrices
+        """
+
+        batch_shape = (self.n_batch, self.n_frames, self.max_cells)
+        appearances = np.zeros(batch_shape + self.appearance_shape, dtype='float32')
+        morphologies = np.zeros(batch_shape + (3,), dtype='float32')
+        centroids = np.zeros(batch_shape + (2,), dtype='float32')
+        adj_matrix = np.zeros(batch_shape + (self.max_cells,), dtype='float32')
+
+        for batch in tqdm.tqdm(range(self.n_batch)):
+            for frame in range(self.n_frames):
+
+                frame_features = get_image_features(
+                    self.X[batch, frame], self.y[batch, frame],
+                    appearance_dim=self.appearance_shape[1],
+                    crop_mode=self.crop_mode)
+
+                track_ids = frame_features['labels'] - 1
+                centroids[batch, frame, track_ids] = frame_features['centroids']
+                morphologies[batch, frame, track_ids] = frame_features['morphologies']
+                appearances[batch, frame, track_ids] = frame_features['appearances']
+
+                # Get adjacency matrix, cannot filter on track ids.
+                cent = centroids[batch, frame]
+                distance = cdist(cent, cent, metric='euclidean')
+                distance = distance < self.distance_threshold
+
+                # Disconnect the padded nodes
+                morphs = morphologies[batch, frame]
+                is_pad = np.matmul(morphs, morphs.T) == 0
+
+                adj = distance * (1 - is_pad)
+                adj_matrix[batch, frame] = adj.astype(np.float32)
+
+        self.features = {
+            'adj_matrix': adj_matrix,
+            'appearances': appearances,
+            'morphologies': morphologies,
+            'centroids': centroids,
+            }
+
+
+    def _to_tensors(self) -> Dict[str, torch.Tensor]:
+        """Convert numpy arrays to PyTorch tensors."""
+        tensors = {}
+        
+        # Appearances: (T, N, H, W, C)
+        tensors['appearances'] = torch.from_numpy(self.features['appearances']).float().to(self.device)
+        tensors['morphologies'] = torch.from_numpy(self.features['morphologies']).float().to(self.device)
+        tensors['centroids'] = torch.from_numpy(self.features['centroids']).float().to(self.device)
+        tensors['adj_matrix'] = torch.from_numpy(self.features['adj_matrix']).float().to(self.device)
+
+        return tensors
+
+
+    def _clean_labels(self, y):
+
+        """Ensure valid lineages and sequential labels for all batches"""
+        y_relabel, _, _ = relabel_sequential(y)
+        self.y = np.expand_dims(y_relabel, 0)
+
+
     def reset(self):
         """Reset tracker state."""
         self.tracks = {}
         self.next_track_id = 0
         self.current_frame = 0
+
+    def _get_cells_in_frame(self, frame):
+        """Find the labels of cells in the given frame.
+
+        Args:
+            frame (int): Frame of interest.
+
+        Returns:
+            list: All cell labels in the frame.
+        """
+        cells = np.unique(self.y[frame])
+        cells = np.delete(cells, np.where(cells == 0))  # remove the background
+        return list(cells)
+    
+    def _create_new_track(self, frame, old_label):
+            """
+            This function creates new tracks
+            """
+            track_id = len(self.tracks)
+            new_label = track_id + 1
+            embedding = self.embeddings[:, frame, old_label]
+            centroid = self.centroids[:, frame, old_label]
+
+            self.tracks[track_id] = {
+                'label': new_label,
+                'frames': [frame],
+                'frame_labels': [old_label],
+                'daughters': [],
+                'capped': False,
+                'frame_div': None,
+                'parent': None,
+                'embedding': embedding,
+                'centroid': centroid
+            }
+
+            if frame > 0 and np.any(self.y[frame] == new_label):
+                raise Exception('new_label already in annotated frame and frame > 0')
+
+            if self.data_format == 'channels_first':
+                self.y[:, frame][self.y[:, frame] == old_label] = new_label
+            else:
+                self.y[frame][self.y[frame] == old_label] = new_label
+    
+    def initialize_tracks(self):
+        """Intialize the tracks. Tracks are stored in a dictionary.
+        """
+        frame = 0  # initial frame
+        cell_ids = self._get_cells_in_frame(frame)
+        print(max(cell_ids))
+
+        for cell_id in cell_ids:
+            self._create_new_track(frame, cell_id)
+
+        # Start a tracked label array
+        self.y_tracked = self.y[[frame]].copy().astype('int32')
     
     @torch.no_grad()
     def update(
@@ -410,7 +599,6 @@ def run_online_tracking(
     Returns:
         tracks: List of track dictionaries
     """
-    from loaders import TrkDataset
     
     tracker = CellTracker(
         model=model,
@@ -425,6 +613,8 @@ def run_online_tracking(
     
     # For each frame, extract features and update tracker
     for frame_idx in tqdm(range(len(raw_images))):
+
+
         # Extract cell features from mask (simplified - use your actual extraction)
         # This would use the same logic as in TrkDataset._extract_features_from_masks
         
@@ -462,6 +652,59 @@ def save_evaluation_results(
 
 # Example usage
 if __name__ == "__main__":
+
+    config = {
+        'optimizer': 'radam',
+        'learning_rate': 5e-4,
+        'weight_decay': 0,
+        'decay': 0.99,
+        'scheduler': 'reduce_on_plateau',
+        'max_epochs': 50,
+        'batch_size': 6,
+        'n_layers': 1,
+        'num_workers': 8,
+        'clipnorm': 1e-3,
+        'step_size': 5,
+        'crop_mode': 'fixed',
+        'patience': 5,
+        'log_and_save': True,
+        'enable_early_stopping': True,
+        'crop_size': 16,
+        'attention': False,
+        'truncate_dataset': None,
+        'loss': 'wcce'
+    }
+
+    # Initialize model
+
+    model = GNNTrackingModel(
+                             graph_layer='gat', 
+                             data_format='channels_last',
+                             encoder_dim=64,
+                             n_layers=config['n_layers'],
+                             crop_size=config['crop_size'],
+                             attention=config['attention']
+                             )    
+    
+    tracker = CellTracker(model=model,
+                          device='cuda:6',
+                          max_history_length=8
+                          )
+    
+    z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
+
+    X = z['X'][:][8]
+    y = z['y'][:][8]
+    lin = z['lineages'][0][8]
+
+    # internalize movie and label image
+    tracker.load_movie(X, y)
+
+    # embed the image using the encoder
+    tracker.embed_images()
+
+    tracker.initialize_tracks()
+    
     print("Inference & Evaluation Example")
     print("="*70)
     print()

@@ -40,13 +40,12 @@ from scipy.spatial.distance import cdist
 
 import pandas as pd
 
-# from deepcell_tracking.utils import clean_up_annotations
-# from deepcell_tracking.utils import get_max_cells
-# from deepcell_tracking.utils import normalize_adj_matrix
-# from deepcell_tracking.utils import get_image_features
-# from deepcell_tracking.trk_io import save_trk
+from utils import clean_up_annotations
+from utils import get_max_cells
+from utils import normalize_adj_matrix
+from utils import get_image_features
+from trk_io import save_trk
 
-from utils import clean_up_annotations, get_max_cells, normalize_adjacency_symmetric, get_image_features
 
 class CellTracker(object):  # pylint: disable=useless-object-inheritance
     """Solves the linear assingment problem to build a cell lineage graph.
@@ -115,9 +114,8 @@ class CellTracker(object):  # pylint: disable=useless-object-inheritance
         self.y = copy.copy(annotation)
         self.tracks = {}
 
+        self.neighborhood_encoder = neighborhood_encoder
         self.tracking_model = tracking_model
-
-        self.neighborhood_encoder = self.gtr
         self.distance_threshold = distance_threshold
         self.appearance_dim = appearance_dim
         self.death = death
@@ -233,20 +231,25 @@ class CellTracker(object):  # pylint: disable=useless-object-inheritance
             distance = cdist(cent, cent, metric='euclidean') < self.distance_threshold
             adj_matrix[frame] = distance.astype('float32')
 
-        return adj_matrix, appearances, morphologies, centroids
+        # Normalize adj matrix
+        norm_adj_matrices = normalize_adj_matrix(adj_matrix)
+
+        return norm_adj_matrices, appearances, morphologies, centroids
 
     def _get_neighborhood_embeddings(self, appearances, morphologies,
                                      centroids, adj_matrices):
         """Compute the embeddings using the neighborhood encoder"""
         # Build input dictionary for neighborhood encoder model
-
+        inputs = {
+            'encoder_app_input': appearances,
+            'encoder_morph_input': morphologies,
+            'encoder_centroid_input': centroids,
+            'encoder_adj_input': adj_matrices,
+        }
 
         # TODO: current model doesnt organize outputs according to ordered list
         #       patching with embedding_axis
-        embeddings = self.tracking_model.get_embeddings(appearances=appearances,
-                                                        morphologies=morphologies,
-                                                        centroids=centroids,
-                                                        adj_matrices=adj_matrices)
+        embeddings = self.neighborhood_encoder.predict(inputs)[self.embedding_axis]
         embeddings = np.array(embeddings)
         return embeddings
 
