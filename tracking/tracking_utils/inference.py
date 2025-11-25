@@ -2,149 +2,117 @@ import numpy as np
 from typing import Dict
 from skimage.measure import regionprops
 import torch
-from utils import relabel_sequential_lineage, get_image_features
+from utils import resize
 import tqdm
+from skimage.segmentation import relabel_sequential
+import warnings
 
-from scipy.spatial.distance import cdist
 
+def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
+    """Return features for every object in the array.
 
-def correct_lineages(X, y, lineages):
+    Args:
+        X (np.array): a 3D numpy array of raw data of shape (x, y, c).
+        y (np.array): a 3D numpy array of integer labels of shape (x, y, 1).
+        appearance_dim (int): The resized shape of the appearance feature.
+        crop_mode (str): Whether to do a fixed crop or to crop and resize
+            to create the appearance features
+        norm (bool): Whether to remove non cell features and normalize the
+            foreground pixels by zero-meaning and dividing by the standard
+            deviation. Applies to fixed crop mode only.
 
-    new_X = []
-    new_y = []
-    new_lineages = []
-    for batch in tqdm.tqdm(range(y.shape[0])):
-
-        y_relabel, new_lineage = relabel_sequential_lineage(
-            y[batch], lineages[batch])
-
-        new_X.append(X[batch])
-        new_y.append(y_relabel)
-        new_lineages.append(new_lineage)
-
-    new_X = np.stack(new_X, axis=0)
-    new_y = np.stack(new_y, axis=0)
-
-    return new_X, new_y, new_lineages
-
-def get_features(X, y, lineages, appearance_shape=(16, 16, 1), crop_mode='fixed', distance_threshold=64):
+    Returns:
+        dict: A dictionary of feature names to np.arrays of shape
+            (n, c) or (n, x, y, c) where n is the number of objects.
     """
-    Extract the relevant features from the label movie
-    Appearance, morphologies, centroids, and adjacency matrices
-    """
+    # X must be float32 for the resize norm option to work correctly
+    X = X.astype('float32')
+    y = y.astype('int32')
 
-    max_tracks = get_max_cells(y)
-    n_batches = X.shape[0]
-    n_frames = X.shape[1]
-    n_channels = X.shape[-1]
+    if crop_mode not in ['resize', 'fixed']:
+        raise ValueError('crop_mode must be either resize or fixed')
 
-    batch_shape = (n_batches, n_frames, max_tracks)
+    appearance_dim = int(appearance_dim)
 
-    appearance_shape = appearance_shape
+    # each feature will be ordered based on the label.
+    # labels are also stored and can be fetched by index.
+    num_labels = len(np.unique(y)) - 1
+    labels = np.zeros((num_labels,), dtype='int32')
+    centroids = np.zeros((num_labels, 2), dtype='float32')
+    morphologies = np.zeros((num_labels, 3), dtype='float32')
+    appearances = np.zeros((num_labels, appearance_dim,
+                            appearance_dim, X.shape[-1]), dtype='float32')
 
-    appearances = np.zeros(batch_shape + appearance_shape, dtype='float32')
+    if crop_mode == 'fixed':
+        # Zero-pad the X array for fixed crop mode
+        pad_width = ((appearance_dim, appearance_dim),
+                     (appearance_dim, appearance_dim),
+                     (0, 0))
+        X_padded = np.pad(X, pad_width=pad_width)
+        y_padded = np.pad(y, pad_width=pad_width)
 
-    morphologies = np.zeros(batch_shape + (3,), dtype='float32')
+        props = regionprops(y_padded[..., 0], cache=False)
 
-    centroids = np.zeros(batch_shape + (2,), dtype='float32')
+    # iterate over all objects in y
+    if crop_mode == 'resize':
+        props = regionprops(y[..., 0], cache=False)
 
-    adj_matrix = np.zeros(batch_shape + (max_tracks,), dtype='float32')
+    for i, prop in enumerate(props):
 
-    temporal_adj_matrix = np.zeros((n_batches,
-                                    n_frames - 1,
-                                    max_tracks,
-                                    max_tracks,
-                                    3), dtype='float32')
+        # Get label
+        labels[i] = prop.label
 
-    mask = np.zeros(batch_shape, dtype='float32')
+        # Get centroid
+        centroid = np.array(prop.centroid)
+        centroids[i] = centroid
 
-    track_length = np.zeros((n_batches, max_tracks, 2), dtype='int32')
+        # Get morphology
+        morphology = np.array([
+            prop.area,
+            prop.perimeter,
+            prop.eccentricity
+        ])
+        morphologies[i] = morphology
 
-    for batch in tqdm.tqdm(range(n_batches)):
-        for frame in range(n_frames):
+        if crop_mode == 'resize':
+            # Get appearance
+            minr, minc, maxr, maxc = prop.bbox
+            appearance = np.copy(X[minr:maxr, minc:maxc, :])
+            resize_shape = (appearance_dim, appearance_dim)
+            appearance = resize(appearance, resize_shape)
+            appearances[i] = appearance
 
-            frame_features = get_image_features(
-                X[batch, frame], y[batch, frame],
-                appearance_dim=appearance_shape[1],
-                crop_mode=crop_mode)
+        if crop_mode == 'fixed':
+            cent = np.array(prop.centroid)
+            delta = appearance_dim // 2
+            minr = int(cent[0]) - delta
+            maxr = int(cent[0]) + delta
+            minc = int(cent[1]) - delta
+            maxc = int(cent[1]) + delta
 
-            track_ids = frame_features['labels'] - 1
-            centroids[batch, frame, track_ids] = frame_features['centroids']
-            morphologies[batch, frame, track_ids] = frame_features['morphologies']
-            appearances[batch, frame, track_ids] = frame_features['appearances']
-            mask[batch, frame, track_ids] = 1
+            app = np.copy(X_padded[minr:maxr, minc:maxc, :])
+            label = np.copy(y_padded[minr:maxr, minc:maxc])
 
-            # Get adjacency matrix, cannot filter on track ids.
-            cent = centroids[batch, frame]
-            distance = cdist(cent, cent, metric='euclidean')
-            distance = distance < distance_threshold
+            if norm:
+                # Use label as a mask to zero out non-label information
+                app = app * (label == prop.label)
+                idx = np.nonzero(app)
 
-            # Disconnect the padded nodes
-            morphs = morphologies[batch, frame]
-            is_pad = np.matmul(morphs, morphs.T) == 0
+                # Check data and normalize
+                if len(idx) > 0:
+                    masked_app = app[idx]
+                    mean = np.mean(masked_app)
+                    std = np.std(masked_app)
+                    app[idx] = (masked_app - mean) / (std + 1e-4)
 
-            adj = distance * (1 - is_pad)
-            adj_matrix[batch, frame] = adj.astype(np.float32)
+            appearances[i] = app
 
-        # Get track length and temporal adjacency matrix
-        for label in lineages[batch]:
-
-            # Get track length
-            start_frame = lineages[batch][label]['frames'][0]
-            end_frame = lineages[batch][label]['frames'][-1]
-
-            track_id = int(label) - 1
-            track_length[batch, track_id, 0] = start_frame
-            track_length[batch, track_id, 1] = end_frame
-
-            # Get temporal adjacency matrix
-            frames = lineages[batch][label]['frames']
-
-            # Assign same
-            for f0, f1 in zip(frames[0:-1], frames[1:]):
-                if f1 - f0 == 1:
-                    temporal_adj_matrix[batch, f0, track_id, track_id, 0] = 1
-
-            # Assign daughter
-            # WARNING: This wont work if there's a time gap between mother
-            # cell disappearing and daughter cells appearing
-            last_frame = frames[-1]
-            daughters = lineages[batch][label]['daughters']
-            for daughter in daughters:
-                daughter_id = daughter - 1
-                temporal_adj_matrix[batch, last_frame, track_id, daughter_id, 2] = 1
-
-        # Assign different
-        same_prob = temporal_adj_matrix[batch, ..., 0]
-        daughter_prob = temporal_adj_matrix[batch, ..., 2]
-        temporal_adj_matrix[batch, ..., 1] = 1 - same_prob - daughter_prob
-
-        # Identify cell padding
-        for i in range(temporal_adj_matrix.shape[2]):
-            # index + 1 is the cell label
-            if i + 1 not in lineages[batch]:
-                temporal_adj_matrix[batch, :, i] = -1
-                temporal_adj_matrix[batch, :, :, i] = -1
-
-        # Identify temporal padding
-        for b in range(temporal_adj_matrix.shape[0]):
-            sames = temporal_adj_matrix[b, ..., 0]
-            sames = np.sum(sames, axis=(1, 2))
-            temporal_adj_matrix[b, sames == 0] = -1
-
-    features = {
-        'adj_matrix': adj_matrix,
+    return {
         'appearances': appearances,
-        'morphologies': morphologies,
         'centroids': centroids,
-        'labels': temporal_adj_matrix,
-        'mask': mask,
-        'track_length': track_length
-        }
-
-    return features
-
-
+        'labels': labels,
+        'morphologies': morphologies,
+    }
 
 def get_max_cells(labels):
     """Helper function for finding the maximum number of cells in a frame of a movie, across
@@ -158,11 +126,10 @@ def get_max_cells(labels):
     """
     max_cells = 0
     for frame in range(labels.shape[0]):
-        cells = np.unique(labels[frame])
-        n_cells = cells[cells != 0].shape[0]
-        if n_cells > max_cells:
-            max_cells = n_cells
-    return max_cells
+        cells = np.max(labels[frame])
+        if cells > max_cells:
+            max_cells = cells
+    return max_cells+1
 
 def generate_adjacency_matrices(
     centroids: np.ndarray,
@@ -198,24 +165,22 @@ def generate_adjacency_matrices(
     return adj_matrices
 
 def to_tensors(data: Dict, 
-               unbatched: bool = True,
+               mode: str = 'test',
                device=None
                ) -> Dict[str, torch.Tensor]:
     """Convert numpy arrays to PyTorch tensors."""
     tensors = {}
     
     # Appearances: (T, N, H, W, C)
-    appearances = torch.from_numpy(data['appearances']).float().to(device)
-    
-    tensors['appearances'] = appearances
-    tensors['morphologies'] = torch.from_numpy(data['morphologies']).float().to(device)
-    tensors['centroids'] = torch.from_numpy(data['centroids']).float().to(device)
-    tensors['adj_matrix'] = torch.from_numpy(data['adj_matrix']).float().to(device)
-    
-    if 'labels' in data:
+
+    if mode=='test':    
+        tensors['appearances'] = torch.from_numpy(data['appearances']).float().to(device)
+        tensors['morphologies'] = torch.from_numpy(data['morphologies']).float().to(device)
+        tensors['centroids'] = torch.from_numpy(data['centroids']).float().to(device)
+        tensors['adj_matrix'] = torch.from_numpy(data['adj_matrix']).float().to(device)
         tensors['labels'] = torch.from_numpy(data['labels']).float().to(device)
     
-    if unbatched:
+    else:
         tensors['appearances'] = tensors['appearances'].unsqueeze(0).to(device)
         tensors['morphologies'] = tensors['morphologies'].unsqueeze(0).to(device)
         tensors['centroids'] = tensors['centroids'].unsqueeze(0).to(device)
@@ -270,3 +235,57 @@ def generate_labels(
                 labels[i, frame_divided-1, label, daughter_label] = 2
 
     return labels, curr_max_cells
+
+def relabel_sequential_lineage(y, lineage):
+    """Ensure the lineage information is sequentially labeled.
+
+    Args:
+        y (np.array): Annotated z-stack of image labels.
+        lineage (dict): Lineage data for y.
+
+    Returns:
+        tuple(np.array, dict): The relabeled array and corrected lineage.
+    """
+
+
+    y_relabel, fw, _ = relabel_sequential(y)
+
+    new_lineage = {}
+
+    cell_ids = np.unique(y)
+    cell_ids = cell_ids[cell_ids != 0]
+    cell_ids = cell_ids.tolist()
+    
+    for cell_id in cell_ids:
+        
+        new_cell_id = int(fw[cell_id])
+
+        new_lineage[new_cell_id] = {}
+
+        # Fix label
+        # TODO: label == track ID?
+        new_lineage[new_cell_id]['label'] = new_cell_id
+        cell_id = str(cell_id)
+        # Fix parent
+        parent = lineage[cell_id]['parent']
+        new_parent = int(fw[parent]) if parent is not None else parent
+        new_lineage[new_cell_id]['parent'] = new_parent
+
+        # Fix daughters
+        daughters = lineage[cell_id]['daughters']
+        new_lineage[new_cell_id]['daughters'] = []
+        for d in daughters:
+            new_daughter = int(fw[d])
+            if not new_daughter:  # missing labels get mapped to 0
+                warnings.warn('Cell {} has daughter {} which is not found '
+                              'in the label image `y`.'.format(cell_id, d))
+            else:
+                new_lineage[new_cell_id]['daughters'].append(new_daughter)
+                
+        # Fix frames
+        y_true = np.any(y == np.int64(cell_id), axis=(1, 2))
+        y_index = np.nonzero(y_true)[0]
+
+        new_lineage[new_cell_id]['frames'] = y_index.tolist()
+
+    return y_relabel, new_lineage
