@@ -2,7 +2,6 @@
 Caliban-2024_Schwartz_et_al/
 data/
 torch-mesmer/
-*.ipynb
 **/__pycache__/*
 deepcell-tracking/
 checkpoints/
