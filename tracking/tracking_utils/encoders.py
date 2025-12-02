@@ -110,7 +110,6 @@ class AppearanceEncoder(nn.Module):
         # After pooling, spatial dimensions should be 1x1
         # Squeeze them: (B, C, N, 1, 1) -> (B, C, N)
         x = x.squeeze(-1).squeeze(-1).squeeze(-1)
-
         x = self.dense(x)
         x = self.final_norm(x)
         x = self.final_activation(x)

@@ -10,7 +10,9 @@ import torchvision.transforms.v2 as transforms
 import torchvision.transforms.v2.functional as TF
 from scipy.spatial.distance import cdist
 import tqdm
+import os
 import warnings
+import json
 warnings.filterwarnings("ignore") 
 
 from utils import relabel_sequential_lineage, get_image_features, resize
@@ -69,17 +71,23 @@ class TrkDataset(Dataset):
         
         # Load .trk file
         print(f"Loading {self.trk_path}...")
-        self.trk_data = zarr.open(self.trk_path, mode='r')
+        self.basename = os.path.splitext(os.path.basename(self.trk_path))[0]
+        self.data_path = os.path.dirname(self.trk_path)
+
+        self.zarr_path = os.path.join(self.data_path, self.basename)+'.zarr'
+        self.json_path = os.path.join(self.data_path, self.basename)+'.json'
+        self.trk_data = zarr.open(self.zarr_path, mode='r')
+        with open(self.json_path) as f:
+            self.lineages = json.load(f)
         
         if self.truncate_dataset is not None:
             self.X = self.trk_data['X'][:self.truncate_dataset] # Raw images (B, T, Y, X, C)
             self.y = self.trk_data['y'][:self.truncate_dataset] # Segmentation masks (B, T, Y, X, C)
-            self.lineages = self.trk_data['lineages'][0][:self.truncate_dataset] # Lineage information
+            self.lineages = self.lineages[:self.truncate_dataset] # Lineage information
 
         else:
-            self.X = self.trk_data['X'] # Raw images (B, T, Y, X, C)
-            self.y = self.trk_data['y'] # Segmentation masks (B, T, Y, X, C)
-            self.lineages = self.trk_data['lineages'][0] # Lineage information
+            self.X = self.trk_data['X'][:] # Raw images (B, T, Y, X, C)
+            self.y = self.trk_data['y'][:] # Segmentation masks (B, T, Y, X, C)
 
         if not len(self.X) == len(self.y) == len(self.lineages):
             raise ValueError(

@@ -3,435 +3,433 @@
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import tqdm
 from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 import json
 from model import GNNTrackingModel
-from loader import create_trk_dataloaders
+from tracker import CellTracker
 from inference import get_image_features, get_max_cells
 from skimage.segmentation import relabel_sequential
 from scipy.spatial.distance import cdist
 import zarr
 
 
-class CellTracker:
-    """Online cell tracker using the trained model.
+# class CellTracker:
+#     """Online cell tracker using the trained model.
     
-    Maintains track history and links new detections to existing tracks.
+#     Maintains track history and links new detections to existing tracks.
     
-    Args:
-        model: Trained GNNTrackingModel
-        device: Device to run inference on
-        max_history_length: Maximum frames to keep in history
-        link_threshold: Minimum probability to create a link (class 2)
-        max_gap: Maximum frames a track can be missing before termination
-    """
-    def __init__(
-        self,
-        model,
-        device='cuda',
-        max_history_length=8,
-        link_threshold=0.5,
-        max_gap=3,
-        distance_threshold=64,
-        crop_mode='fixed',
-        appearance_dim=16,
-        data_format='channels_last'
-    ):
-        self.model = model.to(device)
-        self.model.eval()
-        self.device = device
-        self.max_history_length = max_history_length
-        self.link_threshold = link_threshold
-        self.max_gap = max_gap
-        self.distance_threshold = distance_threshold
-        self.crop_mode = crop_mode
-        self.appearance_dim = appearance_dim
-        self.data_format = data_format
+#     Args:
+#         model: Trained GNNTrackingModel
+#         device: Device to run inference on
+#         max_history_length: Maximum frames to keep in history
+#         link_threshold: Minimum probability to create a link (class 2)
+#         max_gap: Maximum frames a track can be missing before termination
+#     """
+#     def __init__(
+#         self,
+#         model,
+#         device='cuda',
+#         max_history_length=8,
+#         link_threshold=0.5,
+#         max_gap=3,
+#         distance_threshold=64,
+#         crop_mode='fixed',
+#         appearance_dim=16,
+#         data_format='channels_last'
+#     ):
+#         self.model = model.to(device)
+#         self.model.eval()
+#         self.device = device
+#         self.max_history_length = max_history_length
+#         self.link_threshold = link_threshold
+#         self.max_gap = max_gap
+#         self.distance_threshold = distance_threshold
+#         self.crop_mode = crop_mode
+#         self.appearance_dim = appearance_dim
+#         self.data_format = data_format
         
-        # Track state
-        self.tracks = {}  # track_id -> track info
-        self.next_track_id = 0
-        self.current_frame = 0
+#         # Track state
+#         self.tracks = {}  # track_id -> track info
+#         self.next_track_id = 0
+#         self.current_frame = 0
 
-    def _configure(self, X, y):
+#     def _configure(self, X, y):
 
-        '''
-        Initialize batch size, frame size, and max cells
-        test for shape problems and raise errors
-        '''
+#         '''
+#         Initialize batch size, frame size, and max cells
+#         test for shape problems and raise errors
+#         '''
 
-        if np.ndim(X) != 4 or np.ndim(y) != 4:
-            raise ValueError('input X and y must be of dimension 4')
+#         if np.ndim(X) != 4 or np.ndim(y) != 4:
+#             raise ValueError('input X and y must be of dimension 4')
         
-        if self.data_format not in {'channels_first', 'channels_last'}:
-            raise ValueError('data format must be either `channels_first` or `channels_last`.')
+#         if self.data_format not in {'channels_first', 'channels_last'}:
+#             raise ValueError('data format must be either `channels_first` or `channels_last`.')
         
-        self.channels_dim = -1 if self.data_format=='channels_last' else 1
+#         self.channels_dim = -1 if self.data_format=='channels_last' else 1
 
-        if self.data_format=='channels_last':
-            self.appearance_shape=(self.appearance_dim, self.appearance_dim, 1)
-        else:
-            self.appearance_shape=(1, self.appearance_dim, self.appearance_dim)
+#         if self.data_format=='channels_last':
+#             self.appearance_shape=(self.appearance_dim, self.appearance_dim, 1)
+#         else:
+#             self.appearance_shape=(1, self.appearance_dim, self.appearance_dim)
 
-        if X.shape[self.channels_dim] > 1:
-            raise ValueError('Multichannel images not supported (yet).')
+#         if X.shape[self.channels_dim] > 1:
+#             raise ValueError('Multichannel images not supported (yet).')
         
-        self.X = np.expand_dims(X, 0)
-        self._clean_labels(y)
+#         self.X = np.expand_dims(X, 0)
+#         self._clean_labels(y)
 
-        self.max_cells = get_max_cells(self.y)
-        self.n_batch = 1
-        self.n_frames = self.X.shape[1]
+#         self.max_cells = get_max_cells(self.y)
+#         self.n_batch = 1
+#         self.n_frames = self.X.shape[1]
 
 
-    def load_movie(self, X, y):
+#     def load_movie(self, X, y):
         
-        # Set dimensions and ensure data shapes are valid
-        # Ensure labels of the segmentation are sequentially labeled and harmonized
-        self._configure(X, y)
+#         # Set dimensions and ensure data shapes are valid
+#         # Ensure labels of the segmentation are sequentially labeled and harmonized
+#         self._configure(X, y)
 
-        # Extract appearances, morphologies, centroids, and adjacency matrix
-        self._get_features()
-
-
-    @torch.no_grad()
-    def embed_images(self):
-
-        tensors = self._to_tensors()
-
-        self.embeddings, self.centroids = self.model.get_embeddings(
-            appearances=tensors['appearances'],
-            morphologies=tensors['morphologies'],
-            centroids=tensors['centroids'],
-            adj_matrices=tensors['adj_matrix'],
-        )
+#         # Extract appearances, morphologies, centroids, and adjacency matrix
+#         self._get_features()
 
 
-    def _get_features(self):
+#     @torch.no_grad()
+#     def embed_images(self):
 
-        """
-        Extract the relevant features from the label movie
-        Appearance, morphologies, centroids, and adjacency matrices
-        """
+#         tensors = self._to_tensors()
 
-        batch_shape = (self.n_batch, self.n_frames, self.max_cells)
-        appearances = np.zeros(batch_shape + self.appearance_shape, dtype='float32')
-        morphologies = np.zeros(batch_shape + (3,), dtype='float32')
-        centroids = np.zeros(batch_shape + (2,), dtype='float32')
-        adj_matrix = np.zeros(batch_shape + (self.max_cells,), dtype='float32')
+#         self.embeddings, self.centroids = self.model.get_embeddings(
+#             appearances=tensors['appearances'],
+#             morphologies=tensors['morphologies'],
+#             centroids=tensors['centroids'],
+#             adj_matrices=tensors['adj_matrix'],
+#         )
 
-        for batch in tqdm.tqdm(range(self.n_batch)):
-            for frame in range(self.n_frames):
+#     def initialize_tracks(self):
+#         """Intialize the tracks. Tracks are stored in a dictionary.
+#         """
+#         frame = 0  # initial frame
+#         cell_ids = self._get_cells_in_frame(frame)
 
-                frame_features = get_image_features(
-                    self.X[batch, frame], self.y[batch, frame],
-                    appearance_dim=self.appearance_shape[1],
-                    crop_mode=self.crop_mode)
+#         for cell_id in cell_ids:
+#             self._create_new_track(frame, cell_id)
 
-                track_ids = frame_features['labels'] - 1
-                centroids[batch, frame, track_ids] = frame_features['centroids']
-                morphologies[batch, frame, track_ids] = frame_features['morphologies']
-                appearances[batch, frame, track_ids] = frame_features['appearances']
+#         # Start a tracked label array
+#         self.y_tracked = self.y[[frame]].copy().astype('int32')
 
-                # Get adjacency matrix, cannot filter on track ids.
-                cent = centroids[batch, frame]
-                distance = cdist(cent, cent, metric='euclidean')
-                distance = distance < self.distance_threshold
+#     def _get_features(self):
 
-                # Disconnect the padded nodes
-                morphs = morphologies[batch, frame]
-                is_pad = np.matmul(morphs, morphs.T) == 0
+#         """
+#         Extract the relevant features from the label movie
+#         Appearance, morphologies, centroids, and adjacency matrices
+#         """
 
-                adj = distance * (1 - is_pad)
-                adj_matrix[batch, frame] = adj.astype(np.float32)
+#         batch_shape = (self.n_batch, self.n_frames, self.max_cells)
+#         appearances = np.zeros(batch_shape + self.appearance_shape, dtype='float32')
+#         morphologies = np.zeros(batch_shape + (3,), dtype='float32')
+#         centroids = np.zeros(batch_shape + (2,), dtype='float32')
+#         adj_matrix = np.zeros(batch_shape + (self.max_cells,), dtype='float32')
 
-        self.features = {
-            'adj_matrix': adj_matrix,
-            'appearances': appearances,
-            'morphologies': morphologies,
-            'centroids': centroids,
-            }
+#         for batch in tqdm.tqdm(range(self.n_batch)):
+#             for frame in range(self.n_frames):
+
+#                 frame_features = get_image_features(
+#                     self.X[batch, frame], self.y[batch, frame],
+#                     appearance_dim=self.appearance_shape[1],
+#                     crop_mode=self.crop_mode)
+
+#                 track_ids = frame_features['labels'] - 1
+#                 centroids[batch, frame, track_ids] = frame_features['centroids']
+#                 morphologies[batch, frame, track_ids] = frame_features['morphologies']
+#                 appearances[batch, frame, track_ids] = frame_features['appearances']
+
+#                 # Get adjacency matrix, cannot filter on track ids.
+#                 cent = centroids[batch, frame]
+#                 distance = cdist(cent, cent, metric='euclidean')
+#                 distance = distance < self.distance_threshold
+
+#                 # Disconnect the padded nodes
+#                 morphs = morphologies[batch, frame]
+#                 is_pad = np.matmul(morphs, morphs.T) == 0
+
+#                 adj = distance * (1 - is_pad)
+#                 adj_matrix[batch, frame] = adj.astype(np.float32)
+
+#         self.features = {
+#             'adj_matrix': adj_matrix,
+#             'appearances': appearances,
+#             'morphologies': morphologies,
+#             'centroids': centroids,
+#             }
 
 
-    def _to_tensors(self) -> Dict[str, torch.Tensor]:
-        """Convert numpy arrays to PyTorch tensors."""
-        tensors = {}
+#     def _to_tensors(self) -> Dict[str, torch.Tensor]:
+#         """Convert numpy arrays to PyTorch tensors."""
+#         tensors = {}
         
-        # Appearances: (T, N, H, W, C)
-        tensors['appearances'] = torch.from_numpy(self.features['appearances']).float().to(self.device)
-        tensors['morphologies'] = torch.from_numpy(self.features['morphologies']).float().to(self.device)
-        tensors['centroids'] = torch.from_numpy(self.features['centroids']).float().to(self.device)
-        tensors['adj_matrix'] = torch.from_numpy(self.features['adj_matrix']).float().to(self.device)
+#         # Appearances: (T, N, H, W, C)
+#         tensors['appearances'] = torch.from_numpy(self.features['appearances']).float().to(self.device)
+#         tensors['morphologies'] = torch.from_numpy(self.features['morphologies']).float().to(self.device)
+#         tensors['centroids'] = torch.from_numpy(self.features['centroids']).float().to(self.device)
+#         tensors['adj_matrix'] = torch.from_numpy(self.features['adj_matrix']).float().to(self.device)
 
-        return tensors
-
-
-    def _clean_labels(self, y):
-
-        """Ensure valid lineages and sequential labels for all batches"""
-        y_relabel, _, _ = relabel_sequential(y)
-        self.y = np.expand_dims(y_relabel, 0)
+#         return tensors
 
 
-    def reset(self):
-        """Reset tracker state."""
-        self.tracks = {}
-        self.next_track_id = 0
-        self.current_frame = 0
+#     def _clean_labels(self, y):
 
-    def _get_cells_in_frame(self, frame):
-        """Find the labels of cells in the given frame.
+#         """Ensure valid lineages and sequential labels for all batches"""
+#         y_relabel, _, _ = relabel_sequential(y)
+#         self.y = np.expand_dims(y_relabel, 0)
 
-        Args:
-            frame (int): Frame of interest.
 
-        Returns:
-            list: All cell labels in the frame.
-        """
-        cells = np.unique(self.y[frame])
-        cells = np.delete(cells, np.where(cells == 0))  # remove the background
-        return list(cells)
+#     def reset(self):
+#         """Reset tracker state."""
+#         self.tracks = {}
+#         self.next_track_id = 0
+#         self.current_frame = 0
+
+#     def _get_cells_in_frame(self, frame):
+#         """Find the labels of cells in the given frame.
+
+#         Args:
+#             frame (int): Frame of interest.
+
+#         Returns:
+#             list: All cell labels in the frame.
+#         """
+#         cells = np.unique(self.y[frame])
+#         cells = np.delete(cells, np.where(cells == 0))  # remove the background
+#         return list(cells)
     
-    def _create_new_track(self, frame, old_label):
-            """
-            This function creates new tracks
-            """
-            track_id = len(self.tracks)
-            new_label = track_id + 1
-            embedding = self.embeddings[:, frame, old_label]
-            centroid = self.centroids[:, frame, old_label]
+#     def _create_new_track(self, frame, old_label):
+#             """
+#             This function creates new tracks
+#             """
+#             track_id = len(self.tracks)
+#             new_label = track_id + 1
+#             embedding = self.embeddings[:, frame, old_label]
+#             centroid = self.centroids[:, frame, old_label]
 
-            self.tracks[track_id] = {
-                'label': new_label,
-                'frames': [frame],
-                'frame_labels': [old_label],
-                'daughters': [],
-                'capped': False,
-                'frame_div': None,
-                'parent': None,
-                'embedding': embedding,
-                'centroid': centroid
-            }
+#             self.tracks[track_id] = {
+#                 'label': new_label,
+#                 'frames': [frame],
+#                 'frame_labels': [old_label],
+#                 'daughters': [],
+#                 'capped': False,
+#                 'frame_div': None,
+#                 'parent': None,
+#                 'embedding': embedding,
+#                 'centroid': centroid
+#             }
 
-            if frame > 0 and np.any(self.y[frame] == new_label):
-                raise Exception('new_label already in annotated frame and frame > 0')
+#             if frame > 0 and np.any(self.y[frame] == new_label):
+#                 raise Exception('new_label already in annotated frame and frame > 0')
 
-            if self.data_format == 'channels_first':
-                self.y[:, frame][self.y[:, frame] == old_label] = new_label
-            else:
-                self.y[frame][self.y[frame] == old_label] = new_label
+#             if self.data_format == 'channels_first':
+#                 self.y[:, frame][self.y[:, frame] == old_label] = new_label
+#             else:
+#                 self.y[frame][self.y[frame] == old_label] = new_label
     
-    def initialize_tracks(self):
-        """Intialize the tracks. Tracks are stored in a dictionary.
-        """
-        frame = 0  # initial frame
-        cell_ids = self._get_cells_in_frame(frame)
-        print(max(cell_ids))
-
-        for cell_id in cell_ids:
-            self._create_new_track(frame, cell_id)
-
-        # Start a tracked label array
-        self.y_tracked = self.y[[frame]].copy().astype('int32')
+#     @torch.no_grad()
+#     def update(
+#         self,
+#         embeddings: torch.Tensor,
+#         centroids: torch.Tensor,
+#         frame_idx: int
+#     ) -> Dict[int, int]:
+#         """Update tracks with new frame detections.
+        
+#         Args:
+#             embeddings: (num_detections, embedding_dim) new cell embeddings
+#             centroids: (num_detections, 2) new cell positions
+#             frame_idx: Current frame index
+        
+#         Returns:
+#             assignments: Dict mapping detection_idx -> track_id
+#         """
+#         self.current_frame = frame_idx
+#         num_detections = len(embeddings)
+        
+#         # Handle first frame or no active tracks
+#         active_tracks = self._get_active_tracks()
+#         if len(active_tracks) == 0:
+#             assignments = {}
+#             for i in range(num_detections):
+#                 track_id = self._create_track(embeddings[i], centroids[i], frame_idx)
+#                 assignments[i] = track_id
+#             return assignments
+        
+#         # Prepare track histories
+#         track_ids = list(active_tracks.keys())
+#         track_embeddings, track_centroids = self._prepare_track_histories(track_ids)
+        
+#         # Move to device
+#         track_embeddings = track_embeddings.to(self.device).unsqueeze(0)  # (1, T, N, D)
+#         track_centroids = track_centroids.to(self.device).unsqueeze(0)  # (1, T, N, 2)
+#         embeddings = embeddings.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, M, D)
+#         centroids = centroids.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, M, 2)
+        
+#         # Run inference
+#         predictions = self.model.inference_forward(
+#             track_embeddings, track_centroids,
+#             embeddings, centroids,
+#             return_logits=False
+#         )
+        
+#         # Extract probabilities: (1, 1, N, M, 3) -> (N, M, 3)
+#         probs = predictions[0, 0].cpu().numpy()
+        
+#         # Perform assignment using Hungarian algorithm
+#         assignments = self._assign_detections_to_tracks(
+#             probs, track_ids, num_detections
+#         )
+        
+#         # Update tracks
+#         for det_idx, track_id in assignments.items():
+#             self.tracks[track_id]['embeddings'].append(embeddings[0, 0, det_idx])
+#             self.tracks[track_id]['centroids'].append(centroids[0, 0, det_idx])
+#             self.tracks[track_id]['frames'].append(frame_idx)
+#             self.tracks[track_id]['last_seen'] = frame_idx
+        
+#         # Create new tracks for unassigned detections
+#         assigned_detections = set(assignments.keys())
+#         for i in range(num_detections):
+#             if i not in assigned_detections:
+#                 track_id = self._create_track(
+#                     embeddings[0, 0, i], centroids[0, 0, i], frame_idx
+#                 )
+#                 assignments[i] = track_id
+        
+#         # Terminate old tracks
+#         self._terminate_old_tracks(frame_idx)
+        
+#         return assignments
     
-    @torch.no_grad()
-    def update(
-        self,
-        embeddings: torch.Tensor,
-        centroids: torch.Tensor,
-        frame_idx: int
-    ) -> Dict[int, int]:
-        """Update tracks with new frame detections.
-        
-        Args:
-            embeddings: (num_detections, embedding_dim) new cell embeddings
-            centroids: (num_detections, 2) new cell positions
-            frame_idx: Current frame index
-        
-        Returns:
-            assignments: Dict mapping detection_idx -> track_id
-        """
-        self.current_frame = frame_idx
-        num_detections = len(embeddings)
-        
-        # Handle first frame or no active tracks
-        active_tracks = self._get_active_tracks()
-        if len(active_tracks) == 0:
-            assignments = {}
-            for i in range(num_detections):
-                track_id = self._create_track(embeddings[i], centroids[i], frame_idx)
-                assignments[i] = track_id
-            return assignments
-        
-        # Prepare track histories
-        track_ids = list(active_tracks.keys())
-        track_embeddings, track_centroids = self._prepare_track_histories(track_ids)
-        
-        # Move to device
-        track_embeddings = track_embeddings.to(self.device).unsqueeze(0)  # (1, T, N, D)
-        track_centroids = track_centroids.to(self.device).unsqueeze(0)  # (1, T, N, 2)
-        embeddings = embeddings.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, M, D)
-        centroids = centroids.to(self.device).unsqueeze(0).unsqueeze(0)  # (1, 1, M, 2)
-        
-        # Run inference
-        predictions = self.model.inference_forward(
-            track_embeddings, track_centroids,
-            embeddings, centroids,
-            return_logits=False
-        )
-        
-        # Extract probabilities: (1, 1, N, M, 3) -> (N, M, 3)
-        probs = predictions[0, 0].cpu().numpy()
-        
-        # Perform assignment using Hungarian algorithm
-        assignments = self._assign_detections_to_tracks(
-            probs, track_ids, num_detections
-        )
-        
-        # Update tracks
-        for det_idx, track_id in assignments.items():
-            self.tracks[track_id]['embeddings'].append(embeddings[0, 0, det_idx])
-            self.tracks[track_id]['centroids'].append(centroids[0, 0, det_idx])
-            self.tracks[track_id]['frames'].append(frame_idx)
-            self.tracks[track_id]['last_seen'] = frame_idx
-        
-        # Create new tracks for unassigned detections
-        assigned_detections = set(assignments.keys())
-        for i in range(num_detections):
-            if i not in assigned_detections:
-                track_id = self._create_track(
-                    embeddings[0, 0, i], centroids[0, 0, i], frame_idx
-                )
-                assignments[i] = track_id
-        
-        # Terminate old tracks
-        self._terminate_old_tracks(frame_idx)
-        
-        return assignments
+#     def _get_active_tracks(self) -> Dict[int, Dict]:
+#         """Get tracks that are still active."""
+#         active = {}
+#         for track_id, track in self.tracks.items():
+#             if not track['terminated']:
+#                 gap = self.current_frame - track['last_seen']
+#                 if gap <= self.max_gap:
+#                     active[track_id] = track
+#         return active
     
-    def _get_active_tracks(self) -> Dict[int, Dict]:
-        """Get tracks that are still active."""
-        active = {}
-        for track_id, track in self.tracks.items():
-            if not track['terminated']:
-                gap = self.current_frame - track['last_seen']
-                if gap <= self.max_gap:
-                    active[track_id] = track
-        return active
-    
-    def _prepare_track_histories(
-        self, 
-        track_ids: List[int]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Prepare track histories for inference.
+#     def _prepare_track_histories(
+#         self, 
+#         track_ids: List[int]
+#     ) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """Prepare track histories for inference.
         
-        Returns:
-            embeddings: (T, N, D) track embeddings
-            centroids: (T, N, 2) track centroids
-        """
-        max_len = min(self.max_history_length, 
-                     max(len(self.tracks[tid]['frames']) for tid in track_ids))
+#         Returns:
+#             embeddings: (T, N, D) track embeddings
+#             centroids: (T, N, 2) track centroids
+#         """
+#         max_len = min(self.max_history_length, 
+#                      max(len(self.tracks[tid]['frames']) for tid in track_ids))
         
-        num_tracks = len(track_ids)
-        embedding_dim = self.tracks[track_ids[0]]['embeddings'][0].shape[-1]
+#         num_tracks = len(track_ids)
+#         embedding_dim = self.tracks[track_ids[0]]['embeddings'][0].shape[-1]
         
-        embeddings = torch.zeros(max_len, num_tracks, embedding_dim)
-        centroids = torch.zeros(max_len, num_tracks, 2)
+#         embeddings = torch.zeros(max_len, num_tracks, embedding_dim)
+#         centroids = torch.zeros(max_len, num_tracks, 2)
         
-        for i, track_id in enumerate(track_ids):
-            track = self.tracks[track_id]
-            history_len = min(len(track['embeddings']), max_len)
+#         for i, track_id in enumerate(track_ids):
+#             track = self.tracks[track_id]
+#             history_len = min(len(track['embeddings']), max_len)
             
-            # Take most recent frames
-            embeddings[:history_len, i] = torch.stack(track['embeddings'][-history_len:])
-            centroids[:history_len, i] = torch.stack(track['centroids'][-history_len:])
+#             # Take most recent frames
+#             embeddings[:history_len, i] = torch.stack(track['embeddings'][-history_len:])
+#             centroids[:history_len, i] = torch.stack(track['centroids'][-history_len:])
         
-        return embeddings, centroids
+#         return embeddings, centroids
     
-    def _assign_detections_to_tracks(
-        self,
-        probs: np.ndarray,
-        track_ids: List[int],
-        num_detections: int
-    ) -> Dict[int, int]:
-        """Assign detections to tracks using Hungarian algorithm.
+#     def _assign_detections_to_tracks(
+#         self,
+#         probs: np.ndarray,
+#         track_ids: List[int],
+#         num_detections: int
+#     ) -> Dict[int, int]:
+#         """Assign detections to tracks using Hungarian algorithm.
         
-        Args:
-            probs: (N, M, 3) probability matrix
-            track_ids: List of N track IDs
-            num_detections: M detections
+#         Args:
+#             probs: (N, M, 3) probability matrix
+#             track_ids: List of N track IDs
+#             num_detections: M detections
         
-        Returns:
-            assignments: Dict mapping detection_idx -> track_id
-        """
-        # Extract "same cell" probabilities (class 2)
-        same_cell_probs = probs[:, :, 2]  # (N, M)
+#         Returns:
+#             assignments: Dict mapping detection_idx -> track_id
+#         """
+#         # Extract "same cell" probabilities (class 2)
+#         same_cell_probs = probs[:, :, 2]  # (N, M)
         
-        # Convert to cost matrix (maximize probability = minimize negative log prob)
-        cost_matrix = -np.log(same_cell_probs + 1e-10)
+#         # Convert to cost matrix (maximize probability = minimize negative log prob)
+#         cost_matrix = -np.log(same_cell_probs + 1e-10)
         
-        # Apply threshold: set high cost for links below threshold
-        mask = same_cell_probs < self.link_threshold
-        cost_matrix[mask] = 1e10
+#         # Apply threshold: set high cost for links below threshold
+#         mask = same_cell_probs < self.link_threshold
+#         cost_matrix[mask] = 1e10
         
-        # Hungarian algorithm
-        track_indices, det_indices = linear_sum_assignment(cost_matrix)
+#         # Hungarian algorithm
+#         track_indices, det_indices = linear_sum_assignment(cost_matrix)
         
-        # Build assignments
-        assignments = {}
-        for track_idx, det_idx in zip(track_indices, det_indices):
-            if same_cell_probs[track_idx, det_idx] >= self.link_threshold:
-                assignments[det_idx] = track_ids[track_idx]
+#         # Build assignments
+#         assignments = {}
+#         for track_idx, det_idx in zip(track_indices, det_indices):
+#             if same_cell_probs[track_idx, det_idx] >= self.link_threshold:
+#                 assignments[det_idx] = track_ids[track_idx]
         
-        return assignments
+#         return assignments
     
-    def _create_track(
-        self,
-        embedding: torch.Tensor,
-        centroid: torch.Tensor,
-        frame_idx: int
-    ) -> int:
-        """Create a new track."""
-        track_id = self.next_track_id
-        self.next_track_id += 1
+#     def _create_track(
+#         self,
+#         embedding: torch.Tensor,
+#         centroid: torch.Tensor,
+#         frame_idx: int
+#     ) -> int:
+#         """Create a new track."""
+#         track_id = self.next_track_id
+#         self.next_track_id += 1
         
-        self.tracks[track_id] = {
-            'embeddings': [embedding.cpu()],
-            'centroids': [centroid.cpu()],
-            'frames': [frame_idx],
-            'last_seen': frame_idx,
-            'terminated': False
-        }
+#         self.tracks[track_id] = {
+#             'embeddings': [embedding.cpu()],
+#             'centroids': [centroid.cpu()],
+#             'frames': [frame_idx],
+#             'last_seen': frame_idx,
+#             'terminated': False
+#         }
         
-        return track_id
+#         return track_id
     
-    def _terminate_old_tracks(self, current_frame: int):
-        """Terminate tracks that haven't been seen recently."""
-        for track_id, track in self.tracks.items():
-            if not track['terminated']:
-                gap = current_frame - track['last_seen']
-                if gap > self.max_gap:
-                    track['terminated'] = True
+#     def _terminate_old_tracks(self, current_frame: int):
+#         """Terminate tracks that haven't been seen recently."""
+#         for track_id, track in self.tracks.items():
+#             if not track['terminated']:
+#                 gap = current_frame - track['last_seen']
+#                 if gap > self.max_gap:
+#                     track['terminated'] = True
     
-    def get_tracks(self) -> Dict[int, Dict]:
-        """Get all tracks."""
-        return self.tracks
+#     def get_tracks(self) -> Dict[int, Dict]:
+#         """Get all tracks."""
+#         return self.tracks
     
-    def export_tracks(self) -> List[Dict]:
-        """Export tracks in a standard format."""
-        exported = []
-        for track_id, track in self.tracks.items():
-            exported.append({
-                'track_id': track_id,
-                'frames': track['frames'],
-                'centroids': [c.numpy().tolist() for c in track['centroids']],
-                'length': len(track['frames']),
-                'terminated': track['terminated']
-            })
-        return exported
+#     def export_tracks(self) -> List[Dict]:
+#         """Export tracks in a standard format."""
+#         exported = []
+#         for track_id, track in self.tracks.items():
+#             exported.append({
+#                 'track_id': track_id,
+#                 'frames': track['frames'],
+#                 'centroids': [c.numpy().tolist() for c in track['centroids']],
+#                 'length': len(track['frames']),
+#                 'terminated': track['terminated']
+#             })
+#         return exported
 
 
 class ModelEvaluator:
@@ -684,26 +682,34 @@ if __name__ == "__main__":
                              n_layers=config['n_layers'],
                              crop_size=config['crop_size'],
                              attention=config['attention']
-                             )    
-    
-    tracker = CellTracker(model=model,
-                          device='cuda:6',
-                          max_history_length=8
-                          )
+                             )
+
+    checkpoint_dir = 'checkpoints/20251123-063939/best_model.pt'
+    checkpoint = torch.load(checkpoint_dir) 
+    model.load_state_dict(checkpoint['model_state_dict'])   
     
     z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
 
     X = z['X'][:][8]
     y = z['y'][:][8]
-    lin = z['lineages'][0][8]
 
-    # internalize movie and label image
-    tracker.load_movie(X, y)
+    tracker = CellTracker(
+        movie=X,  # (T, Y, X, C)
+        annotation=y,  # (T, Y, X, C)
+        tracking_model=model,
+        device='cuda',
+        appearance_dim=16,
+        division=0.9  # Threshold for detecting mitosis
+    )
 
-    # embed the image using the encoder
-    tracker.embed_images()
+    # tracker.track_cells()
+    # # internalize movie and label image
+    # tracker.load_movie(X, y)
 
-    tracker.initialize_tracks()
+    # # embed the image using the encoder
+    # tracker.embed_images()
+
+    # tracker.initialize_tracks()
     
     print("Inference & Evaluation Example")
     print("="*70)

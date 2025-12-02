@@ -69,7 +69,12 @@ def normalize_adjacency_symmetric(
         >>> adj_norm = normalize_adjacency_symmetric(adj)
     """
     with torch.no_grad():
-        T, N, _ = adj.shape
+
+        if adj.ndim == 3:
+            T, N, _ = adj.shape
+        if adj.ndim == 4:
+            # batched
+            B, T, N, _ = adj.shape
         
         # Add self-loops: A + I
         if add_self_loops:

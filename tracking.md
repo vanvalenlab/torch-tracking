@@ -8,7 +8,6 @@
     1. Uses `get_training_dataset` function from `deepcell.utils.tfrecords_utils` to load a TensorFlow records CSV with no additional arguments.
         1. `get_training_dataset` loads a CSV file using `tf.data.TFRecordDataset` with no additional keyword arguments.
         2. I assume the output of this is in the same shape as the `test.trks` dataset stored in the tracking data folder.
-        3 **to do** configure the loading function to bypass the TFRecord and load directly from either JSON or numpy.
         4. The TFRecordDataset object has built in functions like `.shuffle` for shuffling the data, `.map` for mapping the augmentations, and `.batch` for preparing batches. These have similarities to the `DataLoader` functions in PyTorch.
         5. Loading the validation dataset in the similar manner.
 3. Model architecture
@@ -64,3 +63,26 @@
 
 ## PyTorch Pipeline
 
+### Model
+
+
+
+### Training
+
+Initial port from the TensorFlow to PyTorch was done with Claude, which got much of the pipeline wrong. After working through it, the initial training loop works, and has a pretty good training and validation metrics. The model architecture is the same, but the preprocessing and postprocessing steps can be improved.
+
+Converted `.trk` files to `.zarr` files for faster loading and better readability. 
+
+- DataLoader:
+    1. `__init__`:
+        1. Reads in `.zarr` files for raw nuclear images (`X`), labels (`y`), and lineage information
+        2. Corrects lineage information
+            - Relabels data to ensure labels are sequential
+            - Adjusts labels in lineage information to make sure they match.
+        3. Extracts appearance information, morphology, centroids, and adjacency matrices.
+        4. Loader builds sample indices for the `__getitem__` function. Since the training data is longer than 8 frames, the sample indices create samples for `batch`, `start_frame` and `end_frame`, which generates ~4000 samples for training.
+        5. If the augmentation option is selected, it generates the augmentation pipeline using the built-in `Transforms` function in PyTorch.
+    1. `__getitem__`:
+        1. Using an `idx`, get the sample indices from the generated samples previously.
+        2. Selects item from complied dataset
+        3. Transforms it if augmentation pipeline is selected, then converts it to a PyTorch tensor.

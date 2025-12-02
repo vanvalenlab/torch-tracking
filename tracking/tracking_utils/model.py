@@ -60,7 +60,7 @@ class GNNTrackingModel(nn.Module):
         n_classes=3,
         crop_size=32,
         data_format='channels_first',
-        attention=False
+        attention=False,
     ):
         super().__init__()
         
@@ -215,7 +215,7 @@ class GNNTrackingModel(nn.Module):
                 n_filters=self.n_filters,
                 n_classes=self.n_classes,
                 norm_layer=self.norm_layer
-            )            
+            )
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
                         return_logits=True):
@@ -308,8 +308,6 @@ class GNNTrackingModel(nn.Module):
         batch_size = appearances.shape[0]
         time_steps = appearances.shape[1]
         n_cells = appearances.shape[2]
-
-        print(batch_size, time_steps, n_cells)
         
         # Reshape to merge batch and time
         app_reshaped = appearances.view(batch_size * time_steps * n_cells, *appearances.shape[3:])
