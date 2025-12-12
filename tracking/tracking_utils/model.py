@@ -61,6 +61,7 @@ class GNNTrackingModel(nn.Module):
         crop_size=32,
         data_format='channels_first',
         attention=False,
+        dropout = 0.1
     ):
         super().__init__()
         
@@ -76,6 +77,7 @@ class GNNTrackingModel(nn.Module):
         self.n_classes = n_classes
         self.data_format = data_format
         self.attention = attention
+        self.dropout = dropout
         
         # Validate inputs
         self._validate_config()
@@ -123,28 +125,35 @@ class GNNTrackingModel(nn.Module):
             encoder_dim=self.encoder_dim,
             norm_layer=self.norm_layer,
             appearance_norm=self.appearance_norm,
-            data_format=self.data_format
+            data_format=self.data_format,
+            dropout=self.dropout
         )
         
         # Morphology encoder
         self.morphology_encoder = MorphologyEncoder(
             input_dim=3,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer
+            norm_layer=self.norm_layer,
+            dropout=self.dropout
+
         )
         
         # Centroid encoder
         self.centroid_encoder = CentroidEncoder(
             input_dim=2,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer
+            norm_layer=self.norm_layer,
+            dropout=self.dropout
+
         )
         
         # Delta encoders (shared weights for both types)
         self.delta_encoder = DeltaEncoder(
             input_dim=2,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer
+            norm_layer=self.norm_layer,
+            dropout=self.dropout
+
         )
         
         self.delta_across_frames_encoder = DeltaEncoder(
@@ -162,7 +171,9 @@ class GNNTrackingModel(nn.Module):
             embedding_dim=self.encoder_dim,
             n_layers=self.n_layers,
             graph_layer=self.graph_layer,
-            norm_layer=self.norm_layer
+            norm_layer=self.norm_layer,
+            dropout=self.dropout
+
         )
     
     def _build_temporal_modules(self):
@@ -214,7 +225,8 @@ class GNNTrackingModel(nn.Module):
                 embedding_dim=self.encoder_dim,
                 n_filters=self.n_filters,
                 n_classes=self.n_classes,
-                norm_layer=self.norm_layer
+                norm_layer=self.norm_layer,
+                dropout=self.dropout
             )
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,

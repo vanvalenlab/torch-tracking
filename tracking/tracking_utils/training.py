@@ -10,11 +10,51 @@ import time
 import datetime
 from model import GNNTrackingModel
 from loader import create_trk_dataloaders
-from utils import weighted_categorical_crossentropy
+from utils import weighted_categorical_crossentropy_v2
 import torch.nn.functional as F
 
 from typing import Optional
 from torch import Tensor
+
+def compute_global_class_weights(dataloader, n_classes=3, device='cuda'):
+    """
+    Compute class weights from entire dataset (run once before training).
+    
+    Args:
+        dataloader: Training dataloader
+        n_classes: Number of classes
+        device: Device for computation
+    
+    Returns:
+        torch.Tensor: Class weights of shape (n_classes,)
+    """
+    print("Computing global class weights from training data...")
+    class_counts = torch.zeros(n_classes, dtype=torch.float64)
+    
+    for batch in tqdm(dataloader, desc="Computing class weights"):
+        labels = batch['labels']
+        
+        # Count samples per class
+        for class_idx in range(n_classes):
+            # Labels are one-hot: (B, T, N, M, 3)
+            class_mask = labels[..., class_idx] == 1
+            # Only count non-padded values (where any class is 1)
+            valid_mask = labels.max(dim=-1).values >= 0
+            class_counts[class_idx] += (class_mask & valid_mask).sum().item()
+    
+    total_samples = class_counts.sum()
+    
+    # Inverse frequency weighting
+    class_weights = total_samples / (n_classes * class_counts)
+    
+    # Normalize so average weight is 1.0 (optional but recommended)
+    class_weights = class_weights / class_weights.mean()
+    
+    print(f"\nClass counts: {class_counts.numpy()}")
+    print(f"Class weights: {class_weights.numpy()}")
+    print(f"Weight ratios: {(class_weights / class_weights.min()).numpy()}")
+    
+    return class_weights.to(device)
 
 class FocalLoss(nn.Module):
     def __init__(self,
@@ -67,15 +107,14 @@ class FocalLoss(nn.Module):
 
 class TrackingLoss(nn.Module):
     
-    def __init__(self, gamma=2.0, loss='wcce'):
+    def __init__(self, gamma=2.0, loss='wcce', label_smoothing=False, class_weights='batch'):
         super().__init__()
-
-        weights = torch.tensor([100.0, 1.0, 26000.0])  # [same_cell, no_link, mitosis]
         
-        self.weights = weights
+        self.weights = class_weights
         self.gamma = gamma
         self.loss = loss
         self.pad_value = -1
+        self.label_smoothing = label_smoothing
 
         if self.loss == 'focal':
             self.criterion = FocalLoss(alpha=self.weights, gamma=self.gamma)
@@ -85,7 +124,7 @@ class TrackingLoss(nn.Module):
                                                  ignore_index=self.pad_value)
 
     
-    def forward(self, predictions, targets):
+    def forward(self, predictions, targets, mask):
         
         """
         Args:
@@ -99,20 +138,24 @@ class TrackingLoss(nn.Module):
         # # Reshape for CrossEntropyLoss
         predictions_flat = predictions.view(-1, predictions.shape[-1])  # (B*T*N*M, 3)
         targets_flat = targets.view(-1, targets.shape[-1])
-        # class_weights = self._get_class_weights(targets_flat)
-
-        valid_mask = targets_flat >= 0
-
-        # targets_flat = targets_flat.argmax(dim=-1).long()  # (B*T*N*M)
+        valid_mask = mask.view(-1)
 
         # Compute weighted cross-entropy
         if self.loss == 'wcce':
-            loss = weighted_categorical_crossentropy(targets_flat, predictions_flat, 3)
-            return loss[valid_mask].mean()
+
+            loss = weighted_categorical_crossentropy_v2(
+                targets_flat, 
+                predictions_flat, 
+                n_classes=3, 
+                label_smoothing=self.label_smoothing, 
+                class_weights=self.weights
+            )
+
+            return loss[valid_mask,:].mean()
 
         else:
             loss = self.criterion(predictions_flat, targets_flat.argmax(dim=-1))
-            return loss.mean()
+            return loss[valid_mask].mean()
             
 class MetricsTracker:
     
@@ -131,7 +174,7 @@ class MetricsTracker:
         self.class_total = {0: 0, 1: 0, 2: 0}
         self.class_predicted = {0: 0, 1: 0, 2: 0}
     
-    def update(self, loss, predictions, targets):
+    def update(self, loss, predictions, targets, valid_mask):
         """
         Args:
             loss: scalar loss value
@@ -142,12 +185,12 @@ class MetricsTracker:
         batch_size = predictions.shape[0]
         self.total_loss += loss.item() * batch_size
         self.total_samples += batch_size
-        
+
+
         # Get predicted classes
         pred_classes = predictions.argmax(dim=-1)  # (B*T*N*M)
         target_classes = targets.argmax(dim=-1)
-
-        valid_mask = targets.min(dim=-1).values >= 0   
+    
 
         # Overall accuracy
         correct = (pred_classes == target_classes) & valid_mask
@@ -173,6 +216,8 @@ class MetricsTracker:
             'loss': avg_loss,
             'accuracy': accuracy
         }
+
+        running_f1 = 0
         
         # Add per-class metrics
         for class_idx in range(3):
@@ -190,6 +235,9 @@ class MetricsTracker:
             metrics[f'recall_class_{class_idx}'] = recall
             metrics[f'precision_class_{class_idx}'] = precision
             metrics[f'f1_class_{class_idx}'] = f1
+            running_f1 *= f1
+        
+        metrics['geom_f1'] = f1 ** (1/3)
         
         return metrics
 
@@ -266,7 +314,9 @@ class Trainer:
         enable_early_stopping=True,
         log_and_save=True,
         config=None,
-        loss='wcce'
+        loss='wcce',
+        label_smoothing=False,
+        class_weights='batch'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -280,6 +330,8 @@ class Trainer:
         self.log_and_save = log_and_save
         self.config=config
         self.loss=loss
+        self.label_smoothing = label_smoothing
+        self.class_weights = class_weights
 
         if loss=='wcce':
             self.return_logits = False
@@ -292,7 +344,7 @@ class Trainer:
         self.log_dir = Path(log_dir +  self.log_suffix)
         self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
 
-        self.loss_fn = TrackingLoss(loss=loss)
+        self.loss_fn = TrackingLoss(loss=loss, label_smoothing=self.label_smoothing, class_weights=self.class_weights)
         
         # Move to device
         self.model = self.model.to(device)
@@ -313,7 +365,7 @@ class Trainer:
         # Early stopping
         self.early_stopping = EarlyStopping(
             patience=early_stopping_patience,
-            mode='min'
+            mode='max'
         )
         
         # Tracking
@@ -337,9 +389,9 @@ class Trainer:
             morphologies = batch['morphologies'].to(self.device)
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
-            # adj_matrices = normalize_adjacency_symmetric(adj_matrices)
             labels = batch['labels'].to(self.device)
-            
+            mask = batch['mask'].to(self.device)
+
             # Forward pass
             self.optimizer.zero_grad()
             
@@ -349,7 +401,7 @@ class Trainer:
             )
             
             # Compute loss
-            loss = self.loss_fn(predictions, labels)
+            loss = self.loss_fn(predictions, labels, mask)
             
             # Backward pass
             loss.backward()
@@ -365,7 +417,7 @@ class Trainer:
             
             # Update metrics
             with torch.no_grad():
-                metrics_tracker.update(loss, predictions, labels)
+                metrics_tracker.update(loss, predictions, labels, mask)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
@@ -388,14 +440,15 @@ class Trainer:
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch} [Val]')
         
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+
             # Move batch to device
             appearances = batch['appearances'].to(self.device)
             morphologies = batch['morphologies'].to(self.device)
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
             labels = batch['labels'].to(self.device)
-            # mask = batch['mask'].to(self.device)
+            mask = batch['mask'].to(self.device)
 
             # Forward pass
             predictions = self.model.training_forward(
@@ -404,10 +457,10 @@ class Trainer:
             )
             
             # Compute loss
-            loss = self.loss_fn(predictions, labels)
+            loss = self.loss_fn(predictions, labels, mask)
 
             # Update metrics
-            metrics_tracker.update(loss, predictions, labels)
+            metrics_tracker.update(loss, predictions, labels, mask)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
@@ -438,7 +491,6 @@ class Trainer:
         
         # Save regular checkpoint
         checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{self.current_epoch}.pt'
-        torch.save(checkpoint, checkpoint_path)
         
         # Save best checkpoint
         if is_best:
@@ -446,12 +498,14 @@ class Trainer:
             torch.save(checkpoint, best_path)
             print()
             print(f"    Saved best model (val_loss: {self.best_val_loss:.4f})")
-        
-        # Keep only last 3 checkpoints to save space
-        checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
-        if len(checkpoints) > 3:
-            for old_checkpoint in checkpoints[:-3]:
-                old_checkpoint.unlink()
+        else:
+            torch.save(checkpoint, checkpoint_path)
+
+        # # Keep only last 3 checkpoints to save space
+        # checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
+        # if len(checkpoints) > 3:
+        #     for old_checkpoint in checkpoints[:-3]:
+        #         old_checkpoint.unlink()
     
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint."""
@@ -507,10 +561,10 @@ class Trainer:
             current_lr = self.optimizer.param_groups[0]['lr']
 
             # Save checkpoint
-            is_best = val_metrics['loss'] < self.best_val_loss
+            is_best = val_metrics['geom_f1'] < self.best_val_loss
             
             if is_best:
-                self.best_val_loss = val_metrics['loss']
+                self.best_val_loss = val_metrics['geom_f1']
 
             if self.writer is not None:
             # Log to tensorboard
@@ -519,6 +573,8 @@ class Trainer:
                 self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
                 self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
                 self.writer.add_scalar('Learning_rate', current_lr, epoch)
+                self.writer.add_scalar('Accuracy/train_geom', train_metrics['geom_f1'], epoch)
+                self.writer.add_scalar('Accuracy/val_geom', val_metrics['geom_f1'], epoch)
 
                 for i in range(3):
                     self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
@@ -537,11 +593,9 @@ class Trainer:
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
             print(f"  LR: {current_lr:.6f}")
             
-
-
             if self.enable_early_stopping:
                 # Early stopping
-                if self.early_stopping(val_metrics['loss']):
+                if self.early_stopping(val_metrics['geom_f1']):
                     print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
                     break
             
@@ -617,7 +671,7 @@ def create_scheduler(optimizer, config):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.1,
+            factor=0.3,
             patience=patience
             )
         
@@ -671,25 +725,30 @@ if __name__ == "__main__":
     # Make config dictionary
 
     config = {
-        'optimizer': 'radam',
-        'learning_rate': 5e-4,
-        'weight_decay': 0,
-        'decay': 0.99,
-        'scheduler': 'reduce_on_plateau',
-        'max_epochs': 50,
-        'batch_size': 6,
-        'n_layers': 1,
-        'num_workers': 8,
-        'clipnorm': 1e-3,
-        'step_size': 5,
-        'crop_mode': 'fixed',
-        'patience': 5,
-        'log_and_save': True,
-        'enable_early_stopping': True,
-        'crop_size': 16,
-        'attention': False,
-        'truncate_dataset': None,
-        'loss': 'wcce'
+        "optimizer": "adamw",
+        "learning_rate": 0.0001,
+        "weight_decay": 0,
+        "decay": 0.99,
+        "scheduler": "reduce_on_plateau",
+        "max_epochs": 50,
+        "batch_size": 8,
+        "n_layers": 1,
+        "num_workers": 16,
+        "clipnorm": 0.001,
+        "step_size": 5,
+        "crop_mode": "fixed",
+        "patience": 5,
+        "log_and_save": True,
+        "enable_early_stopping": True,
+        "crop_size": 16,
+        "attention": False,
+        "truncate_dataset": None,
+        "loss": "wcce",
+        "t_direction": "backward",
+        "processed": True,
+        "dropout": 0,
+        "device": "cuda:2",
+        "label_smoothing": False
     }
 
     # Initialize model
@@ -700,7 +759,8 @@ if __name__ == "__main__":
                              encoder_dim=64,
                              n_layers=config['n_layers'],
                              crop_size=config['crop_size'],
-                             attention=config['attention']
+                             attention=config['attention'],
+                             dropout=config['dropout']
                              )
     
 
@@ -710,31 +770,37 @@ if __name__ == "__main__":
     scheduler = create_scheduler(optimizer, config)
     
     train_loader, val_loader, _ = create_trk_dataloaders(
-        train_path='data/DynamicNuclearNet-tracking-v1_0/train.zarr',
-        val_path='data/DynamicNuclearNet-tracking-v1_0/val.zarr',
+        train_path='data/DynamicNuclearNet-tracking-v1_0/train_proc.zarr',
+        val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
         batch_size=config['batch_size'],
         distance_threshold=64,
-        augment=True,
+        augment=False,
         crop_mode=config['crop_mode'],
         num_workers=config['num_workers'],
         crop_size=config['crop_size'],
-        truncate_dataset = config['truncate_dataset']
+        truncate_dataset = config['truncate_dataset'],
+        t_direction=config['t_direction'],
+        processed=config['processed']
         )
 
+    
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
         scheduler=scheduler,
-        device='cuda:6',
+        device=config['device'],
         checkpoint_dir='./checkpoints/',
         max_epochs=config['max_epochs'],
         gradient_clip=config['clipnorm'],
         enable_early_stopping=config['enable_early_stopping'],
         log_and_save = True if config['truncate_dataset'] is None else False,
         config=config,
-        loss=config['loss']
+        loss=config['loss'],
+        label_smoothing = config['label_smoothing'],
+        class_weights='batch'
     )   
+    # torch.tensor([2.177e-2, 6.713e-5, 2.97815741]).float()
 
     trainer.train()

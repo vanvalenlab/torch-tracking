@@ -8,19 +8,17 @@ from __future__ import absolute_import, division, print_function
 
 import copy
 import logging
-import pathlib
 import timeit
-from typing import Dict, Optional, Tuple
-
+from tqdm import tqdm
 import numpy as np
 import torch
+import pandas as pd
+
+from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
-import pandas as pd
 from skimage.segmentation import relabel_sequential
-
-from utils import clean_up_annotations, get_max_cells, get_image_features
-from utils import normalize_adjacency_symmetric
+from utils import get_max_cells, get_image_features
 
 
 class CellTracker:
@@ -87,7 +85,6 @@ class CellTracker:
         
         # Store data
         self.X = copy.copy(movie)
-        self.y = copy.copy(annotation)
         self.tracks = {}
         
         # Store model and config
@@ -120,8 +117,7 @@ class CellTracker:
         self.logger = logging.getLogger(self.__class__.__name__)
         
         # Clean up annotations
-        self._clean_labels()
-        
+        self._clean_labels(annotation)        
         # ID mappings (accounting for 0-indexing vs 1-based labels)
         self.id_to_idx = {}  # cell_id -> index in feature arrays
         self.idx_to_id = {}  # (frame, idx) -> cell_id
@@ -138,15 +134,14 @@ class CellTracker:
         # Store features (immutable after initialization)
         self.features = {
             'embedding': embeddings,
-            'centroid': centroids,
+            'centroid': centroids.squeeze(0),
         }
         
         self.logger.info('Tracker initialized successfully')
 
     """Ensure valid lineages and sequential labels for all batches"""
-    def _clean_labels(self):
-
-        self.y, _, _ = relabel_sequential(self.y)
+    def _clean_labels(self, annotation):
+        self.y, _, _ = relabel_sequential(annotation)
     
     def _get_frame(self, tensor: np.ndarray, frame: int) -> np.ndarray:
         """Helper to fetch a frame from tensor based on data_format."""
@@ -158,7 +153,7 @@ class CellTracker:
         """Get all cell labels in the given frame."""
         cells = np.unique(self._get_frame(self.y, frame))
         cells = np.delete(cells, np.where(cells == 0))  # remove background
-        return list(cells)
+        return cells.tolist()
     
     def _extract_features(self) -> Tuple[np.ndarray, ...]:
         """Extract appearance, morphology, centroid, and adjacency features.
@@ -186,8 +181,8 @@ class CellTracker:
         for batch in range(self.n_batch):
             for frame in range(n_frames):
                 frame_features = get_image_features(
-                    self.X[:, frame],
-                    self.y[:, frame],
+                    self.X[frame],
+                    self.y[frame],
                     appearance_dim=self.appearance_dim,
                     crop_mode=self.crop_mode,
                     norm=self.norm
@@ -195,19 +190,19 @@ class CellTracker:
                 
                 # Build ID mappings
                 for cell_idx, cell_id in enumerate(frame_features['labels']):
-                    self.id_to_idx[cell_id] = cell_idx
-                    self.idx_to_id[(frame, cell_idx)] = cell_id
-                
+                    self.id_to_idx[(frame, int(cell_id))] = cell_idx 
+                    self.idx_to_id[(frame, cell_idx)] = int(cell_id)
+
                 # Store features
-                num_cells = len(frame_features['labels'])                
-                centroids[batch, frame, :num_cells] = frame_features['centroids']
-                morphologies[batch, frame, :num_cells] = frame_features['morphologies']
-                appearances[batch, frame, :num_cells] = frame_features['appearances']
+                num_tracks = len(frame_features['labels'])
+                centroids[batch, frame, :num_tracks] = frame_features['centroids']
+                morphologies[batch, frame, :num_tracks] = frame_features['morphologies']
+                appearances[batch, frame, :num_tracks] = frame_features['appearances']
                 
                 # Compute adjacency based on distance threshold
                 cent = centroids[batch, frame]
-                distance = cdist(cent, cent, metric='euclidean')
-                adj = (distance < self.distance_threshold).astype(np.float32)
+                distance = cdist(cent, cent, metric='euclidean') < self.distance_threshold
+                adj = distance.astype(np.float32)
                 
                 # Disconnect padded nodes
                 morph = morphologies[batch, frame]
@@ -216,8 +211,6 @@ class CellTracker:
                 
                 adj_matrices[batch, frame] = adj
 
-        # Return adj matrices unchanged since we're doing the computation on GPU    
-        
         return adj_matrices, appearances, morphologies, centroids
 
     def _to_tensors(
@@ -270,7 +263,7 @@ class CellTracker:
         )
         
         # Remove batch dimension and convert back to numpy
-        embeddings = embeddings_t[0].cpu().numpy()
+        embeddings = embeddings_t.squeeze(0).cpu().numpy()
         
         return embeddings
     
@@ -284,7 +277,7 @@ class CellTracker:
     def _get_feature(self, frame: int, cell_id: int, feature_name: str = 'embedding') -> np.ndarray:
         """Get feature for a specific cell in a frame."""
         self._validate_feature_name(feature_name)
-        cell_idx = self.id_to_idx[cell_id]
+        cell_idx = self.id_to_idx[(frame, cell_id)]
         return self.features[feature_name][frame, cell_idx, :]
     
     def _get_frame_features(self, frame: int, feature_name: str = 'embedding') -> Dict[int, np.ndarray]:
@@ -301,6 +294,7 @@ class CellTracker:
     
     def _create_new_track(self, frame: int, old_label: int):
         """Create a new track for a cell."""
+
         track_id = len(self.tracks)
         new_label = track_id + 1
         
@@ -326,10 +320,10 @@ class CellTracker:
         }
         
         # Sanity check
-        if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
-            raise Exception(
-                f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
-            )
+        # if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
+        #     raise Exception(
+        #         f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
+        #     )
         
         # Update labels
         if self.data_format == 'channels_first':
@@ -708,7 +702,8 @@ class CellTracker:
         
         # Track remaining frames
         num_frames = self.X.shape[self.time_axis]
-        for frame in range(1, num_frames):
+
+        for frame in tqdm(range(1, num_frames)):
             self._track_frame(frame)
         
         elapsed = timeit.default_timer() - start

@@ -29,7 +29,8 @@ class TrackingDecoder(nn.Module):
         embedding_dim=64,
         n_filters=64,
         n_classes=3,
-        norm_layer='batch'
+        norm_layer='batch',
+        dropout=0.1
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -51,6 +52,7 @@ class TrackingDecoder(nn.Module):
         # Softmax is typically applied in loss function for numerical stability
         # but we include it here for inference
         self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, embedding_comparison, deltas, apply_softmax=True):
         """
@@ -88,6 +90,8 @@ class TrackingDecoder(nn.Module):
             x = self.norm1(x)
         
         x = self.activation1(x)
+
+        x = self.dropout(x)
         
         # Output layer
         x = self.dense_out(x)

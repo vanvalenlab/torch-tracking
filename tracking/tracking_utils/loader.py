@@ -2,20 +2,21 @@
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-from typing import Dict, List, Tuple, Optional, Union
-from pathlib import Path
 import zarr
-import torchvision.transforms.v2 as transforms
-import torchvision.transforms.v2.functional as TF
-from scipy.spatial.distance import cdist
+
 import tqdm
 import os
 import warnings
 import json
+
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Tuple, Optional, Union
+from pathlib import Path
+import torchvision.transforms.v2.functional as TF
+from scipy.spatial.distance import cdist
 warnings.filterwarnings("ignore") 
 
-from utils import relabel_sequential_lineage, get_image_features, resize
+from utils import relabel_sequential_lineage, get_image_features, is_valid_lineage
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -51,7 +52,9 @@ class TrkDataset(Dataset):
         rotation_range: int = 180,
         translation_range: float = 0.1,  # As fraction of image size
         crop_mode: str = 'resize',
-        truncate_dataset=None
+        truncate_dataset=None,
+        t_direction='forward',
+        processed=False
     ):
         super().__init__()
         self.trk_path = Path(trk_path)
@@ -68,46 +71,58 @@ class TrkDataset(Dataset):
         self.translation_range = translation_range
         self.crop_mode = crop_mode
         self.truncate_dataset = truncate_dataset
-        
-        # Load .trk file
-        print(f"Loading {self.trk_path}...")
-        self.basename = os.path.splitext(os.path.basename(self.trk_path))[0]
-        self.data_path = os.path.dirname(self.trk_path)
+        self.t_direction = t_direction
+        self.processed=processed
 
-        self.zarr_path = os.path.join(self.data_path, self.basename)+'.zarr'
-        self.json_path = os.path.join(self.data_path, self.basename)+'.json'
-        self.trk_data = zarr.open(self.zarr_path, mode='r')
-        with open(self.json_path) as f:
-            self.lineages = json.load(f)
-        
-        if self.truncate_dataset is not None:
-            self.X = self.trk_data['X'][:self.truncate_dataset] # Raw images (B, T, Y, X, C)
-            self.y = self.trk_data['y'][:self.truncate_dataset] # Segmentation masks (B, T, Y, X, C)
-            self.lineages = self.lineages[:self.truncate_dataset] # Lineage information
+        if self.processed:
+
+            features = zarr.open(self.trk_path)
+            extracted_features = {}
+            for k in tqdm.tqdm(features.keys()):
+                extracted_features[k] = features[k][:]
+            self.features = extracted_features
 
         else:
-            self.X = self.trk_data['X'][:] # Raw images (B, T, Y, X, C)
-            self.y = self.trk_data['y'][:] # Segmentation masks (B, T, Y, X, C)
-
-        if not len(self.X) == len(self.y) == len(self.lineages):
-            raise ValueError(
-                'The data do not share the same batch size. '
-                'Please make sure you are using a valid .trks file')
-
-        self._correct_lineages()
-    
-        m_cells = 0
-        for i in self.lineages:
-            curr_m = len(i.keys())
-            if curr_m > m_cells:
-                m_cells = curr_m
-        self.max_cells = m_cells
-
-        self.features = self._get_features()
         
-        print(f"  X shape: {self.X.shape}")
-        print(f"  y shape: {self.y.shape}")
-        print(f"  Lineages: {len(self.lineages)}")
+            # Load .trk file
+            print(f"Loading {self.trk_path}...")
+            self.basename = os.path.splitext(os.path.basename(self.trk_path))[0]
+            self.data_path = os.path.dirname(self.trk_path)
+
+            self.zarr_path = os.path.join(self.data_path, self.basename)+'.zarr'
+            self.json_path = os.path.join(self.data_path, self.basename)+'.json'
+            self.trk_data = zarr.open(self.zarr_path, mode='r')
+            with open(self.json_path) as f:
+                self.lineages = json.load(f)
+            
+            if self.truncate_dataset is not None:
+                self.X = self.trk_data['X'][:self.truncate_dataset] # Raw images (B, T, Y, X, C)
+                self.y = self.trk_data['y'][:self.truncate_dataset] # Segmentation masks (B, T, Y, X, C)
+                self.lineages = self.lineages[:self.truncate_dataset] # Lineage information
+
+            else:
+                self.X = self.trk_data['X'][:] # Raw images (B, T, Y, X, C)
+                self.y = self.trk_data['y'][:] # Segmentation masks (B, T, Y, X, C)
+
+            if not len(self.X) == len(self.y) == len(self.lineages):
+                raise ValueError(
+                    'The data do not share the same batch size. '
+                    'Please make sure you are using a valid .trks file')
+
+            self._correct_lineages()
+        
+            m_cells = 0
+            for i in self.lineages:
+                curr_m = len(i.keys())
+                if curr_m > m_cells:
+                    m_cells = curr_m
+            self.max_cells = m_cells
+
+            self.features = self._get_features()
+        
+            print(f"  X shape: {self.X.shape}")
+            print(f"  y shape: {self.y.shape}")
+            print(f"  Lineages: {len(self.lineages)}")
         
         # Build sample indices
         self.samples = self._build_sample_indices()
@@ -122,16 +137,16 @@ class TrkDataset(Dataset):
         new_y = []
         new_lineages = []
         for batch in tqdm.tqdm(range(self.y.shape[0])):
-            # if is_valid_lineage(self.y[batch], self.lineages[batch]):
+            if is_valid_lineage(self.y[batch], self.lineages[batch]):
 
-            y_relabel, new_lineage = relabel_sequential_lineage(
-                self.y[batch], self.lineages[batch])
+                y_relabel, new_lineage = relabel_sequential_lineage(
+                    self.y[batch], self.lineages[batch])
 
-            new_X.append(self.X[batch])
-            new_y.append(y_relabel)
-            new_lineages.append(new_lineage)
-            # else:
-            #     print('Invalid lineage detected.')
+                new_X.append(self.X[batch])
+                new_y.append(y_relabel)
+                new_lineages.append(new_lineage)
+            else:
+                print('Invalid lineage detected.')
 
         self.X = np.stack(new_X, axis=0)
         self.y = np.stack(new_y, axis=0)
@@ -169,15 +184,18 @@ class TrkDataset(Dataset):
         """
 
         samples = []
-        B, T, Y, X, C = self.X.shape
+        B, T, N, Y, X, C = self.features['appearances'].shape
         
         for batch_idx in range(B):
             # Slide window across time dimension
+            max_frames = np.sum(np.sum(self.features['appearances'][batch_idx], axis=(1, 2, 3)) != 0).item() - 1
+
+
             for start_frame in range(0, T - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
 
-                if self.X[batch_idx, end_frame-1].sum() == 0:
-                    continue
+                if end_frame == max_frames:
+                    break
 
 
                 samples.append({
@@ -191,56 +209,117 @@ class TrkDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Load a single sample.
-        
-        Returns:
-            Dictionary containing:
-            - appearances: (track_length, max_cells, H, W, C) or channels_first
-            - morphologies: (track_length, max_cells, 3)
-            - centroids: (track_length, max_cells, 2)
-            - adj_matrices: (track_length, max_cells, max_cells)
-            - labels (optional): (track_length-1, max_cells, max_cells)
-        """
 
-        sample_info = self.samples[idx]
-        
-        batch_idx = sample_info['batch_idx']
-        start_frame = sample_info['start_frame']
-        end_frame = sample_info['end_frame']
-        
-        # Extract features from masks
-
-        items = {
-            'appearances': self.features['appearances'][batch_idx, start_frame:end_frame],
-            'centroids': self.features['centroids'][batch_idx, start_frame:end_frame],
-            'morphologies': self.features['morphologies'][batch_idx, start_frame:end_frame],
-            'adj_matrices': self.features['adj_matrix'][batch_idx, start_frame:end_frame]
-        }
-        
-        # Generate labels if in training mode
-        if self.mode == 'training':
-            items['mask'] = self.features['mask'][batch_idx, start_frame:end_frame-1]
-            items['labels'] = self.features['labels'][batch_idx, start_frame:end_frame-1]
-
-        
-        # Convert to tensors
-        tensor_data = self._to_tensors(items)
-        
-        return tensor_data
     
     def _build_augmentation_pipeline(self):
-        """Build torchvision v2 augmentation pipeline."""
-        self.transform_both = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=self.rotation_range),
-        ])
+        """Build augmentation pipeline for coordinated appearance + centroid transforms."""
+        # Store probabilities for sampling
+        self.hflip_prob = 0.5
+        self.vflip_prob = 0.5
+        self.rotation_range = self.rotation_range
+        
+        # Global augmentation mode: transforms relative to frame center
+        # Local augmentation mode: transforms relative to each crop center
+        self.global_augmentation = True  # Set to False for local augmentation
 
-        self.transform_centroid = transforms.Compose([
-            transforms.RandomAffine(degrees = 0, translate=(self.translation_range, self.translation_range))
-        ])
-    
+    def _apply_augmentation(self, appearances, centroids):
+        """Apply coordinated augmentations to appearances and centroids.
+        
+        Supports two modes:
+        - GLOBAL: All cells transformed relative to frame center (preserves spatial relationships)
+        - LOCAL: Each cell transformed relative to its crop center (current behavior)
+        
+        Args:
+            appearances: (T, N, H, W, C) tensor - cell crops
+            centroids: (T, N, 2) tensor in pixel coordinates
+                For GLOBAL mode: must be global frame coordinates (from regionprops)
+                For LOCAL mode: can be either global or local crop coordinates
+            
+        Returns:
+            Augmented appearances and centroids
+        """
+        T, N, H, W, C = appearances.shape
+        
+        # Sample random augmentation parameters (same for all T, N)
+        do_hflip = torch.rand(1).item() < self.hflip_prob
+        do_vflip = torch.rand(1).item() < self.vflip_prob
+        rotation_angle = (torch.rand(1).item() * 2 - 1) * self.rotation_range
+        
+        # Determine transformation center
+        if self.global_augmentation:
+            # Use frame center for global transformations
+            center_x = self.frame_width / 2
+            center_y = self.frame_height / 2
+            flip_x_max = self.frame_width
+            flip_y_max = self.frame_height
+        else:
+            # Use crop center for local transformations
+            center_x = W / 2
+            center_y = H / 2
+            flip_x_max = W
+            flip_y_max = H
+        
+        # Process each cell's appearance and centroid
+        for t in range(T):
+            for n in range(N):
+                appearance = appearances[t, n]
+                centroid = centroids[t, n]
+                
+                # Skip if this is padding (zero appearance)
+                if appearance.abs().sum() < 1e-6:
+                    continue
+                
+                # Convert to (C, H, W) for torchvision
+                appearance = appearance.permute(2, 0, 1)
+                
+                # Apply horizontal flip
+                if do_hflip:
+                    appearance = TF.hflip(appearance)
+                    # Flip centroid x-coordinate
+                    if self.global_augmentation:
+                        centroid[0] = flip_x_max - centroid[0]
+                    else:
+                        centroid[0] = flip_x_max - 1 - centroid[0]
+                
+                # Apply vertical flip
+                if do_vflip:
+                    appearance = TF.vflip(appearance)
+                    # Flip centroid y-coordinate
+                    if self.global_augmentation:
+                        centroid[1] = flip_y_max - centroid[1]
+                    else:
+                        centroid[1] = flip_y_max - 1 - centroid[1]
+                
+                # Apply rotation
+                if abs(rotation_angle) > 0:
+                    appearance = TF.rotate(appearance, rotation_angle, 
+                                         interpolation=TF.InterpolationMode.BILINEAR)
+                    
+                    # Rotate centroid around appropriate center
+                    x, y = centroid[0].item(), centroid[1].item()
+                    
+                    # Translate to origin
+                    x -= center_x
+                    y -= center_y
+                    
+                    # Apply rotation matrix
+                    angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
+                    cos_a = torch.cos(angle_rad)
+                    sin_a = torch.sin(angle_rad)
+                    
+                    x_new = x * cos_a - y * sin_a
+                    y_new = x * sin_a + y * cos_a
+                    
+                    # Translate back
+                    centroid[0] = x_new + center_x
+                    centroid[1] = y_new + center_y
+                
+                # Convert back to (H, W, C)
+                appearance = appearance.permute(1, 2, 0)
+                appearances[t, n] = appearance
+                centroids[t, n] = centroid
+        
+        return appearances, centroids
     
     def _get_features(self):
         """
@@ -253,25 +332,17 @@ class TrkDataset(Dataset):
         n_channels = self.X.shape[-1]
 
         batch_shape = (n_batches, n_frames, max_tracks)
-
         appearance_shape = self.appearance_shape
 
         appearances = np.zeros(batch_shape + appearance_shape, dtype='float32')
-
         morphologies = np.zeros(batch_shape + (3,), dtype='float32')
-
         centroids = np.zeros(batch_shape + (2,), dtype='float32')
-
         adj_matrix = np.zeros(batch_shape + (max_tracks,), dtype='float32')
-
-        temporal_adj_matrix = np.zeros((n_batches,
-                                        n_frames - 1,
-                                        max_tracks,
-                                        max_tracks,
-                                        3), dtype='float32')
-
-        mask = np.zeros(batch_shape, dtype='float32')
-
+        temporal_adj_matrix = np.zeros(
+                        (n_batches, n_frames - 1, max_tracks, max_tracks, 3), 
+                        dtype='float32'
+                    )
+        mask = np.zeros(batch_shape + (max_tracks,), dtype='bool')
         track_length = np.zeros((n_batches, max_tracks, 2), dtype='int32')
 
         for batch in tqdm.tqdm(range(n_batches)):
@@ -286,7 +357,7 @@ class TrkDataset(Dataset):
                 centroids[batch, frame, track_ids] = frame_features['centroids']
                 morphologies[batch, frame, track_ids] = frame_features['morphologies']
                 appearances[batch, frame, track_ids] = frame_features['appearances']
-                mask[batch, frame, track_ids] = 1
+                mask[batch, frame, track_ids, track_ids] = 1
 
                 # Get adjacency matrix, cannot filter on track ids.
                 cent = centroids[batch, frame]
@@ -376,26 +447,86 @@ class TrkDataset(Dataset):
         tensors['morphologies'] = torch.from_numpy(data['morphologies']).float()
         tensors['adj_matrices'] = torch.from_numpy(data['adj_matrices']).float()
         
+        if self.t_direction == 'backward':
+            tensors['morphologies'] = tensors['morphologies'].flip(0)
+            tensors['adj_matrices'] = tensors['adj_matrices'].flip(0)
+
         if self.augment:
 
             centroids = torch.from_numpy(data['centroids']).float()
-            appearances = torch.from_numpy(data['appearances']).float().permute(0, 4, 1, 2, 3)
+            appearances = torch.from_numpy(data['appearances']).float()
 
-            appearances, centroids = self.transform_both(appearances, centroids)
-            centroids = self.transform_centroid(centroids)
+            if self.t_direction == 'backward':
+                tensors['centroids'] = tensors['centroids'].flip(0)
+                tensors['appearances'] = tensors['appearances'].flip(0)
 
-            tensors['appearances'] = appearances.permute(0, 2, 3, 4, 1)
+            appearances, centroids = self._apply_augmentation(appearances, centroids)
+
+            tensors['appearances'] = appearances
             tensors['centroids'] = centroids
+
+            if self.t_direction == 'backward':
+                tensors['centroids'] = tensors['centroids'].flip(0)
+                tensors['appearances'] = tensors['appearances'].flip(0)
 
         else:
 
             tensors['appearances'] = torch.from_numpy(data['appearances']).float()
             tensors['centroids'] = torch.from_numpy(data['centroids']).float()
 
+            if self.t_direction == 'backward':
+                tensors['centroids'] = torch.from_numpy(data['centroids']).flip(0)
+                tensors['appearances'] = torch.from_numpy(data['appearances']).flip(0)
+
         if 'labels' in data:
-            tensors['labels'] = data['labels']
+            tensors['labels'] = torch.from_numpy(data['labels']).float()
+            tensors['mask'] = torch.from_numpy(data['mask'])
+
+            if self.t_direction == 'backward':
+                tensors['labels'] = torch.transpose(tensors['labels'].flip(0), 1, 2)
+
+                tensors['mask'] = tensors['mask'].flip(0)
         
         return tensors
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Load a single sample.
+        
+        Returns:
+            Dictionary containing:
+            - appearances: (track_length, max_cells, H, W, C) or channels_first
+            - morphologies: (track_length, max_cells, 3)
+            - centroids: (track_length, max_cells, 2)
+            - adj_matrices: (track_length, max_cells, max_cells)
+            - labels (optional): (track_length-1, max_cells, max_cells)
+        """
+
+        sample_info = self.samples[idx]
+        
+        batch_idx = sample_info['batch_idx']
+        start_frame = sample_info['start_frame']
+        end_frame = sample_info['end_frame']
+
+        time_slice = slice(start_frame, end_frame)
+        time_slice_label = slice(start_frame, end_frame-1)
+
+        items = {
+            'appearances': self.features['appearances'][batch_idx, time_slice],
+            'centroids': self.features['centroids'][batch_idx, time_slice],
+            'morphologies': self.features['morphologies'][batch_idx, time_slice],
+            'adj_matrices': self.features['adj_matrix'][batch_idx, time_slice]
+        }
+        
+        # Generate labels if in training mode
+        if self.mode == 'training':
+
+            items['labels'] = self.features['labels'][batch_idx, time_slice_label]
+            items['mask'] = self.features['mask'][batch_idx, time_slice_label]
+
+        # Convert to tensors
+        tensor_data = self._to_tensors(items)
+        
+        return tensor_data
 
 def create_trk_dataloaders(
     train_path: Optional[Union[str, Path]] = None,
@@ -406,7 +537,6 @@ def create_trk_dataloaders(
     track_length: int = 8,
     crop_size: int = 32,
     stride: int = 1,
-    collate_fn = None,
     **dataset_kwargs
 ) -> Tuple[DataLoader, ...]:
     """Create dataloaders for .trk format data.
@@ -446,7 +576,6 @@ def create_trk_dataloaders(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
             )
         loaders.append(train_loader)
     else:
@@ -466,10 +595,9 @@ def create_trk_dataloaders(
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
         )
         loaders.append(val_loader)
     else:
@@ -492,7 +620,6 @@ def create_trk_dataloaders(
             shuffle=True,            
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
         )
 
         loaders.append(test_loader)

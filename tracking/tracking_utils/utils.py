@@ -5,6 +5,8 @@ from skimage.measure import regionprops
 import torch
 import cv2
 from skimage import transform
+import pandas as pd
+import networkx as nx
 
 def weighted_categorical_crossentropy(y_true, y_pred,
                                       n_classes=3, axis=None,
@@ -24,22 +26,83 @@ def weighted_categorical_crossentropy(y_true, y_pred,
     Returns:
         tensor: Output tensor.
     """
+    
     if from_logits:
         raise Exception('weighted_categorical_crossentropy cannot take logits')
+    
     if axis is None:
         axis = -1 # if K.image_data_format() == 'channels_first' else K.ndim(y_pred) - 1
+
     reduce_axis = [x for x in list(range(torch.Tensor.dim(y_pred))) if x != axis]
+
     # scale preds so that the class probas of each sample sum to 1
     y_pred = y_pred / torch.sum(y_pred, dim=axis, keepdims=True)
+
     # manual computation of crossentropy
     eps=1e-10
     _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
+
     y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
+
     total_sum = torch.sum(y_true)
     class_sum = torch.sum(y_true, dim=reduce_axis, keepdims=True)
     class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
+
     return - (y_true * torch.log(y_pred) * class_weights)
 
+
+def weighted_categorical_crossentropy_v2(
+        y_true, 
+        y_pred, 
+        n_classes=3, 
+        from_logits=False, 
+        alpha=0.01, 
+        label_smoothing=False,
+        class_weights='batch'
+    ):
+
+    """
+    Weighted categorical cross-entropy with masking for padded values.
+    
+    Args:
+        y_pred: Tensor of shape (N, C) - predictions for each sample and class
+        y_true: Tensor of shape (N, C) - one-hot encoded targets
+        mask: Tensor of shape (N, C) - 1 where included, 0 where excluded (padded)
+        n_classes: Number of classes
+        from_logits: Whether y_pred contains logits (True) or probabilities (False)
+    
+    Returns:
+        Scalar loss value
+    """
+    eps = 1e-10
+    _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
+    _alpha = torch.tensor(alpha).type(y_pred.dtype).to(y_pred.device)
+    
+
+    y_pred = y_pred / torch.sum(y_pred, dim=-1, keepdims=True)
+    
+    # Clamp predictions to avoid log(0)
+    y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
+        
+    # Total number of valid (non-masked) samples across all classes
+    total_sum = torch.sum(y_true)
+    
+    # Sum per class across all samples (N dimension)
+    class_sum = torch.sum(y_true, dim=0, keepdims=True)
+    
+    # Compute weights: inverse frequency normalized by n_classes
+    if class_weights == 'batch':
+        class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
+    
+    class_weights = class_weights.to(y_pred.device)
+    
+    if label_smoothing:
+        # Compute element-wise cross-entropy
+        y_ls = ((1-_alpha) * y_true) + (_alpha/n_classes)
+        return - (y_ls * torch.log(y_pred) * class_weights)
+    
+    else:
+        return - (y_true * torch.log(y_pred) * class_weights)
 
 def normalize_adjacency_symmetric(
     adj: torch.Tensor,
@@ -493,3 +556,66 @@ def clean_up_annotations(y, uid=None, data_format='channels_last'):
         else:
             y[frame] = y_frame_new
     return y
+
+def trk_to_graph(lineage, node_key=None):
+    """Converts a lineage dictionary into a graph representation of the lineages
+
+    Args:
+        lineage (dict): Dictionary of lineage data
+        node_key (dict): Map between gt nodes and result nodes
+
+    Returns:
+        networkx.Graph: Graph representation of the lineage data.
+    """
+    edges = []
+
+    all_ids = set()
+    single_nodes = set()
+    attributes = {}
+
+    for i, lin in lineage.items():
+        # Update cell id if node_key is available
+        if node_key and (i in node_key):
+            idx = node_key[i]
+        else:
+            idx = i
+
+        cellids = ['{}_{}'.format(idx, t) for t in lin['frames']]
+
+        if len(cellids) == 1:
+            single_nodes.add(cellids[0])
+
+        all_ids.update(cellids)
+        edges.append(pd.DataFrame({
+            'source': cellids[0:-1],
+            'target': cellids[1:]
+        }))
+
+        # Add connections to any daughters
+        source = '{}_{}'.format(idx, max(lin['frames']))
+        for d in lin['daughters']:
+            # Update cell id if node_key is available
+            if node_key and (i in node_key):
+                d_idx = node_key[d]
+            else:
+                d_idx = d
+
+            # Assume daughter appears in next frame
+            target = '{}_{}'.format(d_idx, max(lin['frames']) + 1)
+            edges.append(pd.DataFrame({
+                'source': [source],
+                'target': [target]
+            }))
+
+            attributes[source] = {'division': True}
+
+    # Create graph
+    edges = pd.concat(edges)
+    G = nx.from_pandas_edgelist(edges, source='source', target='target', create_using=nx.DiGraph)
+    nx.set_node_attributes(G, attributes)
+
+    # Add all isolates to graph
+    for cell_id in single_nodes:
+        G.add_node(cell_id)
+
+    return G

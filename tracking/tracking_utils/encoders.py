@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATv2Conv
+from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data, Batch
 from utils import normalize_adjacency_symmetric
 
@@ -33,7 +33,8 @@ class AppearanceEncoder(nn.Module):
         encoder_dim=64,
         norm_layer='batch',
         appearance_norm=True,
-        data_format='channels_first'
+        data_format='channels_first',
+        dropout=0.1
     ):
         super().__init__()
         self.appearance_shape = appearance_shape
@@ -78,6 +79,7 @@ class AppearanceEncoder(nn.Module):
         self.dense = nn.Linear(n_filters, encoder_dim)
         self.final_norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.final_activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
@@ -112,6 +114,7 @@ class AppearanceEncoder(nn.Module):
         x = x.squeeze(-1).squeeze(-1).squeeze(-1)
         x = self.dense(x)
         x = self.final_norm(x)
+        x = self.dropout(x)
         x = self.final_activation(x)
         
         return x
@@ -127,12 +130,13 @@ class MorphologyEncoder(nn.Module):
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch', dropout=0.1):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.encoder_dim = encoder_dim
         self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
@@ -153,8 +157,10 @@ class MorphologyEncoder(nn.Module):
             # x = x.permute(0, 2, 1)
         else:
             x = self.norm(x)
-        
+
+        x = self.dropout(x)
         x = self.activation(x)
+
         return x
 
 
@@ -168,12 +174,13 @@ class CentroidEncoder(nn.Module):
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.encoder_dim = encoder_dim
         self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
@@ -209,11 +216,12 @@ class DeltaEncoder(nn.Module):
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
         self.norm_layer_type = norm_layer
+        self.dropout = nn.Dropout(dropout)
 
 
     def forward(self, x):
@@ -242,6 +250,7 @@ class DeltaEncoder(nn.Module):
         else:
             x = F.layer_norm(x, [x.shape[-1]])
         
+        x = self.dropout(x)
         x = self.activation(x)
         return x
 
@@ -271,7 +280,8 @@ class NeighborhoodEncoder(nn.Module):
         embedding_dim=64,
         n_layers=3,
         graph_layer='gcn',
-        norm_layer='batch'
+        norm_layer='batch',
+        dropout=0.1
     ):
         super().__init__()
         self.appearance_encoder = appearance_encoder
@@ -301,7 +311,7 @@ class NeighborhoodEncoder(nn.Module):
             if graph_layer_name == 'gcn':
                 layer = GCNConv(n_filters, n_filters)
             elif graph_layer_name == 'gat':
-                layer = GATv2Conv(n_filters, n_filters, heads=1)
+                layer = GATConv(n_filters, n_filters, heads=1)
             else:
                 raise ValueError(f'Unsupported graph layer: {graph_layer_name}')
             
@@ -315,6 +325,7 @@ class NeighborhoodEncoder(nn.Module):
         self.final_dense = nn.Linear(final_input_dim, embedding_dim)
         self.final_norm = nn.BatchNorm1d(embedding_dim) if norm_layer == 'batch' else nn.LayerNorm(embedding_dim)
         self.final_activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
 
     def _apply_batched_gnn(self, gnn_layer, node_features, adj_matrices):
             
@@ -412,8 +423,8 @@ class NeighborhoodEncoder(nn.Module):
             node_features = node_features.permute(0,2,1)
             node_features = norm(node_features)
             node_features = node_features.permute(0,2,1)
-
             node_features = activation(node_features)
+            node_features = self.dropout(node_features)
 
         
         # Final concatenation and dense layer
