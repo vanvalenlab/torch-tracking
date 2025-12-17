@@ -50,7 +50,7 @@ class TrkDataset(Dataset):
         distance_threshold: float = 100.0,
         augment: bool = True,
         rotation_range: int = 180,
-        translation_range: float = 0.1,  # As fraction of image size
+        translation_range: float = 512,
         crop_mode: str = 'resize',
         truncate_dataset=None,
         t_direction='forward',
@@ -130,7 +130,10 @@ class TrkDataset(Dataset):
 
         if self.augment:
             self._build_augmentation_pipeline()
-    
+
+        self.frame_height = 584  # Y/H dimension
+        self.frame_width = 600   # X/W dimension
+
     def _correct_lineages(self):
         """Ensure valid lineages and sequential labels for all batches"""
         new_X = []
@@ -218,107 +221,50 @@ class TrkDataset(Dataset):
         self.vflip_prob = 0.5
         self.rotation_range = self.rotation_range
         
-        # Global augmentation mode: transforms relative to frame center
-        # Local augmentation mode: transforms relative to each crop center
-        self.global_augmentation = True  # Set to False for local augmentation
 
     def _apply_augmentation(self, appearances, centroids):
-        """Apply coordinated augmentations to appearances and centroids.
-        
-        Supports two modes:
-        - GLOBAL: All cells transformed relative to frame center (preserves spatial relationships)
-        - LOCAL: Each cell transformed relative to its crop center (current behavior)
-        
-        Args:
-            appearances: (T, N, H, W, C) tensor - cell crops
-            centroids: (T, N, 2) tensor in pixel coordinates
-                For GLOBAL mode: must be global frame coordinates (from regionprops)
-                For LOCAL mode: can be either global or local crop coordinates
-            
-        Returns:
-            Augmented appearances and centroids
-        """
+        """Apply coordinated augmentations - NO TRANSLATION."""
         T, N, H, W, C = appearances.shape
         
-        # Sample random augmentation parameters (same for all T, N)
         do_hflip = torch.rand(1).item() < self.hflip_prob
         do_vflip = torch.rand(1).item() < self.vflip_prob
-        rotation_angle = (torch.rand(1).item() * 2 - 1) * self.rotation_range
+        rotation_angle = torch.rand(1).item() * self.rotation_range
+
+        self.rotation_angle = rotation_angle
+                
+        # Apply appearance transformations
         
-        # Determine transformation center
-        if self.global_augmentation:
-            # Use frame center for global transformations
-            center_x = self.frame_width / 2
-            center_y = self.frame_height / 2
-            flip_x_max = self.frame_width
-            flip_y_max = self.frame_height
-        else:
-            # Use crop center for local transformations
-            center_x = W / 2
-            center_y = H / 2
-            flip_x_max = W
-            flip_y_max = H
+        appearances = appearances.permute(0, 1, 4, 2, 3)
         
-        # Process each cell's appearance and centroid
-        for t in range(T):
-            for n in range(N):
-                appearance = appearances[t, n]
-                centroid = centroids[t, n]
-                
-                # Skip if this is padding (zero appearance)
-                if appearance.abs().sum() < 1e-6:
-                    continue
-                
-                # Convert to (C, H, W) for torchvision
-                appearance = appearance.permute(2, 0, 1)
-                
-                # Apply horizontal flip
-                if do_hflip:
-                    appearance = TF.hflip(appearance)
-                    # Flip centroid x-coordinate
-                    if self.global_augmentation:
-                        centroid[0] = flip_x_max - centroid[0]
-                    else:
-                        centroid[0] = flip_x_max - 1 - centroid[0]
-                
-                # Apply vertical flip
-                if do_vflip:
-                    appearance = TF.vflip(appearance)
-                    # Flip centroid y-coordinate
-                    if self.global_augmentation:
-                        centroid[1] = flip_y_max - centroid[1]
-                    else:
-                        centroid[1] = flip_y_max - 1 - centroid[1]
-                
-                # Apply rotation
-                if abs(rotation_angle) > 0:
-                    appearance = TF.rotate(appearance, rotation_angle, 
-                                         interpolation=TF.InterpolationMode.BILINEAR)
-                    
-                    # Rotate centroid around appropriate center
-                    x, y = centroid[0].item(), centroid[1].item()
-                    
-                    # Translate to origin
-                    x -= center_x
-                    y -= center_y
-                    
-                    # Apply rotation matrix
-                    angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
-                    cos_a = torch.cos(angle_rad)
-                    sin_a = torch.sin(angle_rad)
-                    
-                    x_new = x * cos_a - y * sin_a
-                    y_new = x * sin_a + y * cos_a
-                    
-                    # Translate back
-                    centroid[0] = x_new + center_x
-                    centroid[1] = y_new + center_y
-                
-                # Convert back to (H, W, C)
-                appearance = appearance.permute(1, 2, 0)
-                appearances[t, n] = appearance
-                centroids[t, n] = centroid
-        
+        if do_hflip:
+            appearances = TF.hflip(appearances)
+            centroids[...,1] = -centroids[...,1]
+
+        if do_vflip:
+            appearances = TF.vflip(appearances)
+            centroids[...,0] = -centroids[...,0]
+
+        if abs(rotation_angle) > 0:
+
+            angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
+
+            rotation_mat =  torch.tensor([
+            [torch.cos(angle_rad), -torch.sin(angle_rad)],
+            [torch.sin(angle_rad), torch.cos(angle_rad)],
+            ])
+
+            appearances = TF.rotate(appearances, rotation_angle,
+                                interpolation=TF.InterpolationMode.BILINEAR)
+            
+            centroids = torch.matmul(centroids, rotation_mat)
+            
+        appearances = appearances.permute(0, 1, 3, 4, 2)
+
+        random_translate = torch.rand(2) * self.translation_range
+        random_translate = random_translate.unsqueeze(0).unsqueeze(0)
+
+        centroids = centroids + random_translate
+
         return appearances, centroids
     
     def _get_features(self):
@@ -457,17 +403,13 @@ class TrkDataset(Dataset):
             appearances = torch.from_numpy(data['appearances']).float()
 
             if self.t_direction == 'backward':
-                tensors['centroids'] = tensors['centroids'].flip(0)
-                tensors['appearances'] = tensors['appearances'].flip(0)
+                centroids = centroids.flip(0)
+                appearances = appearances.flip(0)
 
             appearances, centroids = self._apply_augmentation(appearances, centroids)
 
             tensors['appearances'] = appearances
             tensors['centroids'] = centroids
-
-            if self.t_direction == 'backward':
-                tensors['centroids'] = tensors['centroids'].flip(0)
-                tensors['appearances'] = tensors['appearances'].flip(0)
 
         else:
 
@@ -513,9 +455,10 @@ class TrkDataset(Dataset):
         items = {
             'appearances': self.features['appearances'][batch_idx, time_slice],
             'centroids': self.features['centroids'][batch_idx, time_slice],
-            'morphologies': self.features['morphologies'][batch_idx, time_slice],
-            'adj_matrices': self.features['adj_matrix'][batch_idx, time_slice]
+            'morphologies': self.features['morphologies'][batch_idx, time_slice]
         }
+
+        items['adj_matrices'] = self._get_adj_matrix(items['centroids'])
         
         # Generate labels if in training mode
         if self.mode == 'training':
@@ -527,7 +470,19 @@ class TrkDataset(Dataset):
         tensor_data = self._to_tensors(items)
         
         return tensor_data
+    
+    def _get_adj_matrix(self, centroids):
 
+        T, N, _ = centroids.shape
+        adj_matrix = np.zeros((T, N, N))
+
+        for time in range(T):
+            adj_matrix[time] = cdist(centroids[time], centroids[time], metric='euclidean')
+
+        adj_matrix = (adj_matrix > 0) & (adj_matrix < self.distance_threshold)
+
+        return adj_matrix
+    
 def create_trk_dataloaders(
     train_path: Optional[Union[str, Path]] = None,
     val_path: Optional[Union[str, Path]] = None,

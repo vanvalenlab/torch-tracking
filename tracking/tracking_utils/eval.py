@@ -12,6 +12,74 @@ from tracker import CellTracker
 import zarr
 import pprint
 
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+from matplotlib.colors import ListedColormap
+
+from metrics import TrackingEvaluator
+
+def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
+                         titles=('Channel 1', 'Channel 2'), 
+                         cmap='gray', vmin=None, vmax=None):
+    """
+    Create a GIF from a time lapse image with two channels.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Time lapse image of shape (T, H, W, 2)
+    output_path : str
+        Path to save the output GIF
+    fps : int
+        Frames per second for the GIF
+    titles : tuple
+        Titles for the two subplots
+    cmap : str
+        Colormap to use for display
+    vmin, vmax : float, optional
+        Min/max values for intensity scaling. If None, uses data min/max
+    """
+    T, H, W, C = im1.shape
+    
+    # Set up the figure and subplots
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    
+    
+    im1_plot = axes[0].imshow(im1[0], cmap=cmap)
+    im2_plot = axes[1].imshow(im2[0], cmap=cmap)
+    
+    axes[0].set_title(titles[0])
+    axes[1].set_title(titles[1])
+    axes[0].axis('off')
+    axes[1].axis('off')
+    
+    # Add colorbars
+    plt.colorbar(im1_plot, ax=axes[0], fraction=0.046, pad=0.04)
+    plt.colorbar(im2_plot, ax=axes[1], fraction=0.046, pad=0.04)
+    
+    # Add frame counter
+    frame_text = fig.text(0.5, 0.02, f'Frame: 0/{T-1}', 
+                          ha='center', fontsize=12)
+    
+    plt.tight_layout()
+    
+    def update(frame):
+        """Update function for animation"""
+        im1_plot.set_data(im1[frame])
+        im2_plot.set_data(im2[frame])
+        frame_text.set_text(f'Frame: {frame}/{T-1}')
+        return im1_plot, im2_plot, frame_text
+    
+    # Create animation
+    anim = animation.FuncAnimation(fig, update, frames=T, 
+                                   interval=1000/fps, blit=True)
+    
+    # Save as GIF
+    anim.save(output_path, writer='pillow', fps=fps)
+    plt.close()
+    
+    print(f"GIF saved to {output_path}")
 
 
 class ModelEvaluator:
@@ -65,7 +133,8 @@ class ModelEvaluator:
     def _compute_metrics(
         self,
         predictions: torch.Tensor,
-        labels: torch.Tensor
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
     ) -> Dict[str, float]:
         """Compute various metrics.
         
@@ -76,7 +145,6 @@ class ModelEvaluator:
         pred_classes = predictions.argmax(dim=-1)
         
         # Valid mask (ignore padding)
-        valid_mask = labels >= 0
         
         # Overall accuracy
         correct = (pred_classes == labels) & valid_mask
@@ -108,33 +176,6 @@ class ModelEvaluator:
         metrics['link_f1'] = metrics['f1_class_2']
         
         return metrics
-    
-    def evaluate_dataloader(self, dataloader) -> Dict[str, float]:
-        """Evaluate on entire dataloader.
-        
-        Returns aggregated metrics.
-        """
-        all_metrics = defaultdict(list)
-        
-        for batch in tqdm(dataloader, desc='Evaluating'):
-            batch_metrics = self.evaluate_batch(
-                batch['appearances'],
-                batch['morphologies'],
-                batch['centroids'],
-                batch['adj_matrices'],
-                batch['labels']
-            )
-            
-            for key, value in batch_metrics.items():
-                all_metrics[key].append(value)
-        
-        # Aggregate
-        aggregated = {}
-        for key, values in all_metrics.items():
-            aggregated[key] = np.mean(values)
-            aggregated[f'{key}_std'] = np.std(values)
-        
-        return aggregated
     
     def print_evaluation(self, metrics: Dict[str, float]):
         """Print evaluation results in a nice format."""
@@ -168,101 +209,13 @@ def build_indices(X):
     
     return samples
 
-def run_online_tracking(
-    model,
-    raw_images: np.ndarray,
-    masks: np.ndarray,
-    device='cuda',
-    track_length=8,
-    max_cells=39
-) -> List[Dict]:
-    """Run online tracking on a video sequence.
-    
-    Args:
-        model: Trained GNNTrackingModel
-        raw_images: (T, Y, X, C) raw fluorescent images
-        masks: (T, Y, X, C) segmentation masks
-        device: Device for inference
-        track_length: History length for tracking
-        max_cells: Maximum cells per frame
-    
-    Returns:
-        tracks: List of track dictionaries
-    """
-    
-    tracker = CellTracker(
-        model=model,
-        device=device,
-        max_history_length=track_length,
-        link_threshold=0.5,
-        max_gap=3
-    )
-    
-    print("Running online tracking...")
-    print(f"Total frames: {len(raw_images)}")
-    
-    # For each frame, extract features and update tracker
-    for frame_idx in tqdm(range(len(raw_images))):
-
-
-        # Extract cell features from mask (simplified - use your actual extraction)
-        # This would use the same logic as in TrkDataset._extract_features_from_masks
-        
-        # For now, placeholder:
-        # embeddings, centroids = extract_features(raw_images[frame_idx], masks[frame_idx])
-        
-        # Update tracker
-        # assignments = tracker.update(embeddings, centroids, frame_idx)
-        
-        pass  # Implement feature extraction here
-    
-    # Export results
-    tracks = tracker.export_tracks()
-    
-    print(f"\nTracking complete!")
-    print(f"Total tracks created: {len(tracks)}")
-    print(f"Average track length: {np.mean([t['length'] for t in tracks]):.1f} frames")
-    
-    return tracks
-
-
-def save_evaluation_results(
-    metrics: Dict[str, float],
-    output_path: Path
-):
-    """Save evaluation results to JSON."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-    
-    print(f"Results saved to {output_path}")
-
-
 # Example usage
 if __name__ == "__main__":
 
     config = {
-        'optimizer': 'radam',
-        'learning_rate': 5e-4,
-        'weight_decay': 0,
-        'decay': 0.99,
-        'scheduler': 'reduce_on_plateau',
-        'max_epochs': 50,
         'batch_size': 6,
         'n_layers': 1,
-        'num_workers': 8,
-        'clipnorm': 1e-3,
-        'step_size': 5,
-        'crop_mode': 'fixed',
-        'patience': 5,
-        'log_and_save': True,
-        'enable_early_stopping': True,
-        'crop_size': 16,
-        'attention': False,
-        'truncate_dataset': None,
-        'loss': 'wcce'
+        'crop_size': 16
     }
 
     # Initialize model
@@ -273,113 +226,66 @@ if __name__ == "__main__":
                              encoder_dim=64,
                              n_layers=config['n_layers'],
                              crop_size=config['crop_size'],
-                             attention=config['attention']
                              )
 
-    checkpoint_dir = 'checkpoints/20251211-141526/best_model.pt'
+    checkpoint_dir = 'checkpoints/20251215-164022/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
     
     z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
+    z2 = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test_proc.zarr')
+    batch = 9
 
     X = z['X'][:]
     y = z['y'][:]
+    gt = z2['labels'][:][batch]
+    gt_mask = z2['mask'][:][batch]
 
     samples = build_indices(X)
-    print(samples)
-    batch = 1
     end_frame = samples[batch]
 
     tracker = CellTracker(
         movie=X[batch, :end_frame],  # (T, Y, X, C)
         annotation=y[batch, :end_frame],  # (T, Y, X, C)
         tracking_model=model,
-        device='cuda:4',
+        device='cuda:0',
         appearance_dim=16,
-        division=0.99  # Threshold for detecting mitosis
+        division=0.99,  # Threshold for detecting mitosis,
+        track_length=8
     )
+
+
 
     tracker.track_cells()
 
-    lineage = tracker.get_lineage_dict()
+    track_review = tracker._track_review_dict()
+    y_tracked = track_review['y_tracked']
+    gt_movie = y[batch, :end_frame]
 
-    pprint.pprint(lineage)
+    frame_max = np.max(y_tracked, axis=(1,2,3))
+    print(frame_max[-1] + 1)
 
-    # print("Inference & Evaluation Example")
-    # print("="*70)
-    # print()
+    the_rest = [np.random.rand((3)) for _ in range(frame_max[-1] + 1)]
+    the_rest[0] = np.array([0.,0.,0.])
+
+    rand_cmap = ListedColormap(the_rest, N=frame_max[-1]+1)
+
+    create_timelapse_gif(y_tracked, gt_movie, cmap='viridis')
+
+    # predictions = tracker._get_assignment_matrix()
+
+    # pt, ph, pw, pc = predictions.shape
+
+    # gt_cropped = gt[:pt, :ph, :pw, :pc]
+
+    # metrics = TrackingEvaluator()
+    # all_metrics = metrics.evaluate_all(predictions, gt_cropped)
+
+    # pprint.pprint(all_metrics)
+
     
-    # print("1. Evaluation on test set:")
-    # print("```python")
-    # print("from gnn_tracking_model import GNNTrackingModel")
-    # print("from trk_data_loader import create_trk_dataloaders")
-    # print("from inference_eval import ModelEvaluator")
-    # print()
-    # print("# Load model")
-    # print("model = GNNTrackingModel(...)")
-    # print("checkpoint = torch.load('checkpoints/best_model.pt')")
-    # print("model.load_state_dict(checkpoint['model_state_dict'])")
-    # print()
-    # print("# Load test data")
-    # print("_, _, test_loader = create_trk_dataloaders(")
-    # print("    train_path='train.trk',")
-    # print("    val_path='val.trk',")
-    # print("    test_path='test.trk',")
-    # print("    batch_size=4")
-    # print(")")
-    # print()
-    # print("# Evaluate")
-    # print("evaluator = ModelEvaluator(model, device='cuda')")
-    # print("metrics = evaluator.evaluate_dataloader(test_loader)")
-    # print("evaluator.print_evaluation(metrics)")
-    # print("```")
-    # print()
+
+
+
+
     
-    # print("2. Online tracking on new video:")
-    # print("```python")
-    # print("from inference_eval import CellTracker")
-    # print()
-    # print("# Create tracker")
-    # print("tracker = CellTracker(")
-    # print("    model=model,")
-    # print("    device='cuda',")
-    # print("    max_history_length=8,")
-    # print("    link_threshold=0.5")
-    # print(")")
-    # print()
-    # print("# Process each frame")
-    # print("for frame_idx in range(num_frames):")
-    # print("    # Extract embeddings for cells in this frame")
-    # print("    embeddings, centroids = extract_cell_features(frame)")
-    # print("    ")
-    # print("    # Update tracks")
-    # print("    assignments = tracker.update(embeddings, centroids, frame_idx)")
-    # print("    ")
-    # print("    # assignments maps detection_idx -> track_id")
-    # print()
-    # print("# Export results")
-    # print("tracks = tracker.export_tracks()")
-    # print("```")
-    # print()
-    
-    # print("Key Features:")
-    # print("  ✓ Online tracking with track history")
-    # print("  ✓ Hungarian algorithm for optimal assignment")
-    # print("  ✓ Comprehensive evaluation metrics")
-    # print("  ✓ Per-class precision/recall/F1")
-    # print("  ✓ Easy export to standard formats")
-    # print("  ✓ Track management (creation, termination)")
-    # print()
-    
-    # print("Metrics Computed:")
-    # print("  - Overall accuracy")
-    # print("  - Link precision/recall/F1 (class 2)")
-    # print("  - Per-class metrics (all 3 classes)")
-    # print("  - Track statistics (length, count)")
-    # print()
-    
-    # print("Next Steps:")
-    # print("  1. Test evaluation on your val/test sets")
-    # print("  2. Tune link_threshold based on precision/recall trade-off")
-    # print("  3. Try online tracking on new videos")
-    # print("  4. Visualize tracks with your favorite viz tool")

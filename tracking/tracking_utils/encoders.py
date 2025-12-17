@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv
+from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
 from torch_geometric.data import Data, Batch
 from utils import normalize_adjacency_symmetric
 
@@ -311,7 +311,7 @@ class NeighborhoodEncoder(nn.Module):
             if graph_layer_name == 'gcn':
                 layer = GCNConv(n_filters, n_filters)
             elif graph_layer_name == 'gat':
-                layer = GATConv(n_filters, n_filters, heads=1)
+                layer = GATv2Conv(n_filters, n_filters, dropout=0.5, heads=1)
             else:
                 raise ValueError(f'Unsupported graph layer: {graph_layer_name}')
             

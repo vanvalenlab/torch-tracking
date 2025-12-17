@@ -316,7 +316,8 @@ class Trainer:
         config=None,
         loss='wcce',
         label_smoothing=False,
-        class_weights='batch'
+        class_weights='batch',
+        stopping_metric = 'loss'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -332,6 +333,7 @@ class Trainer:
         self.loss=loss
         self.label_smoothing = label_smoothing
         self.class_weights = class_weights
+        self.stopping_metric = stopping_metric
 
         if loss=='wcce':
             self.return_logits = False
@@ -365,7 +367,7 @@ class Trainer:
         # Early stopping
         self.early_stopping = EarlyStopping(
             patience=early_stopping_patience,
-            mode='max'
+            mode='min'
         )
         
         # Tracking
@@ -501,11 +503,11 @@ class Trainer:
         else:
             torch.save(checkpoint, checkpoint_path)
 
-        # # Keep only last 3 checkpoints to save space
-        # checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
-        # if len(checkpoints) > 3:
-        #     for old_checkpoint in checkpoints[:-3]:
-        #         old_checkpoint.unlink()
+        # Keep only last 3 checkpoints to save space
+        checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
+        if len(checkpoints) > 3:
+            for old_checkpoint in checkpoints[:-3]:
+                old_checkpoint.unlink()
     
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint."""
@@ -554,17 +556,17 @@ class Trainer:
             # Update learning rate
             if self.scheduler is not None:
                 if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_metrics['loss'])
+                    self.scheduler.step(val_metrics[self.stopping_metric])
                 else:
                     self.scheduler.step()
             
             current_lr = self.optimizer.param_groups[0]['lr']
 
             # Save checkpoint
-            is_best = val_metrics['geom_f1'] < self.best_val_loss
+            is_best = val_metrics[self.stopping_metric] < self.best_val_loss
             
             if is_best:
-                self.best_val_loss = val_metrics['geom_f1']
+                self.best_val_loss = val_metrics[self.stopping_metric]
 
             if self.writer is not None:
             # Log to tensorboard
@@ -595,7 +597,7 @@ class Trainer:
             
             if self.enable_early_stopping:
                 # Early stopping
-                if self.early_stopping(val_metrics['geom_f1']):
+                if self.early_stopping(val_metrics[self.stopping_metric]):
                     print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
                     break
             
@@ -643,7 +645,6 @@ def create_optimizer(model, config):
         optimizer = optim.AdamW(
             model.parameters(),
             lr=lr,
-            weight_decay=weight_decay
         )
 
     elif optimizer_name == 'sgd':
@@ -671,7 +672,7 @@ def create_scheduler(optimizer, config):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.3,
+            factor=0.1,
             patience=patience
             )
         
@@ -726,12 +727,12 @@ if __name__ == "__main__":
 
     config = {
         "optimizer": "adamw",
-        "learning_rate": 0.0001,
+        "learning_rate": 0.001,
         "weight_decay": 0,
         "decay": 0.99,
         "scheduler": "reduce_on_plateau",
         "max_epochs": 50,
-        "batch_size": 8,
+        "batch_size": 4,
         "n_layers": 1,
         "num_workers": 16,
         "clipnorm": 0.001,
@@ -739,16 +740,17 @@ if __name__ == "__main__":
         "crop_mode": "fixed",
         "patience": 5,
         "log_and_save": True,
-        "enable_early_stopping": True,
-        "crop_size": 16,
+        "enable_early_stopping": False,
+        "crop_size": 32,
         "attention": False,
         "truncate_dataset": None,
         "loss": "wcce",
-        "t_direction": "backward",
+        "t_direction": "forward",
         "processed": True,
-        "dropout": 0,
-        "device": "cuda:2",
-        "label_smoothing": False
+        "dropout": 0.2,
+        "device": "cuda:0",
+        "label_smoothing": False,
+        "stopping_metric": 'loss'
     }
 
     # Initialize model
@@ -774,7 +776,7 @@ if __name__ == "__main__":
         val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
         batch_size=config['batch_size'],
         distance_threshold=64,
-        augment=False,
+        augment=True,
         crop_mode=config['crop_mode'],
         num_workers=config['num_workers'],
         crop_size=config['crop_size'],
@@ -799,8 +801,10 @@ if __name__ == "__main__":
         config=config,
         loss=config['loss'],
         label_smoothing = config['label_smoothing'],
-        class_weights='batch'
+        class_weights='batch',
+        stopping_metric = config['stopping_metric']
     )   
+
     # torch.tensor([2.177e-2, 6.713e-5, 2.97815741]).float()
 
     trainer.train()
