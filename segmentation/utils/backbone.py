@@ -4,20 +4,6 @@ from torchvision.models import resnet50, efficientnet_v2_l
 from torchvision.models.resnet import ResNet50_Weights
 from torchvision.models.efficientnet import EfficientNet_V2_L_Weights
 
-def get_specific_children(l, prefix, want_li, curr_li):
-    for layer_name, layer in l.named_children():
-        if prefix:
-            curr_name = prefix+"_"+layer_name
-        else:
-            curr_name = layer_name
-        if curr_name in want_li:
-            curr_li.append(layer)
-        try:
-            curr_li = get_specific_children(layer, curr_name+"\t", want_li, curr_li)
-        except:
-            pass
-    return curr_li
-
 def get_all_children(l, layer_li):
     start = None
     out = []
@@ -30,9 +16,7 @@ def get_all_children(l, layer_li):
             out.append(start)
     return out
 
-def get_backbone(backbone, input_tensor=None, input_shape=None,
-                 use_imagenet=False, return_dict=True,
-                 frames_per_batch=1, **kwargs):
+def get_backbone(backbone, use_imagenet=False):
     """Retrieve backbones for the construction of feature pyramid networks.
 
     Args:
@@ -67,18 +51,10 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
     resnet_backbones = {
         'resnet50': resnet50
     }
+
     efficientnet_v2_backbones = {
         'efficientnetv2bl': torchvision.models.efficientnet_v2_l
     }
-
-    if frames_per_batch == 1:
-        if input_tensor is not None:
-            img_input = input_tensor
-        else:
-            raise Exception("Unexpected")
-
-    else:
-        raise Exception("Unexpected")
 
     if _backbone in resnet_backbones:
         model_cls = resnet_backbones[_backbone]
@@ -88,9 +64,6 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
             model_cls=resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
         else:
             model_cls = resnet50()
-
-        model = nn.Sequential(img_input, model_cls)
-                
 
         all_layers = get_all_children(model_cls, ["relu", "layer1", "layer2", "layer3", "layer4"])
 
@@ -103,13 +76,10 @@ def get_backbone(backbone, input_tensor=None, input_shape=None,
         else:
             model_cls = efficientnet_v2_l()
 
-        model = nn.Sequential(img_input, model_cls)
         all_layers = get_all_children(model_cls.features, ['0','2','3','4','6'])
 
-    else:
-        raise ValueError(f"Unknown backbone: {_backbone}")
     
     output_dict = {f'C{i + 1}': j for i, j in enumerate(all_layers)}
     
-    return (model, output_dict) if return_dict else model
+    return output_dict
 

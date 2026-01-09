@@ -1,42 +1,17 @@
 import torch
-torch.set_num_threads(4)
+import os
+torch.set_num_threads(24)
 import datetime
-import pathlib
 
 from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 
-from utils.model import create_model
-from utils.loaders import create_data_loaders
+from model import PanopticNet
+from loss import SemanticLoss
+from loaders import create_data_loaders
 
 import zarr
-
-def train_one_epoch(model, dataloader, optimizer, losses, device):
-    running_loss_avg = 0.
-    count = 0
-
-    for batch in tqdm(dataloader):
-
-        li_inputs, li_labels = batch
-        count += 1
-        inputs = li_inputs.to(device)
-        labels = [l.to(device) for l in li_labels]
-
-        optimizer.zero_grad()
-
-        outputs = model(inputs)
-
-        loss = sum([losses[j](outputs[j], labels[j]) for j in range(len(losses))])            
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.001, error_if_nonfinite=True)
-    
-        optimizer.step()
-
-        running_loss_avg += loss.item()
-    return running_loss_avg/count
-
 
 def train_torch(
         dataloader,
@@ -45,36 +20,40 @@ def train_torch(
         backbone="resnet50",
         lr=1e-4,
         epochs=8,
-        pyramid_levels=("P1", "P2", "P3", "P4", "P5", "P6", "P7"),
+        pyramid_levels=['P3','P4','P5'],
+        backbone_levels=['C1','C2','C3', 'C4','C5'],
         save_path_prefix = "data/saved_model",
-        writer=None
+        writer=None,
+        n_semantic_classes = [1,1,2]
     ):
 
-    # torch.cuda.empty_cache()
+    model = PanopticNet(
+        crop_size=crop_size,
+        backbone=backbone,
+        pyramid_levels=pyramid_levels,
+        backbone_levels=backbone_levels,
+        n_semantic_classes=n_semantic_classes,
+    )
+
+    # TODO: make embedded in dataloader instead of hard-coding it in here
+    semantic_type = ['cont','cont','disc','disc']
+
+    loss = SemanticLoss(n_semantic_classes=n_semantic_classes, semantic_type=semantic_type)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(device)
-
-    model, losses, optimizer = create_model(
-        input_shape=(crop_size, crop_size, 1),
-        backbone=backbone,
-        lr=lr,
-        device=device,
-        pyramid_levels=pyramid_levels
-    )
 
     decay_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.33, patience=5,)
 
     epoch_number = 0
-    start_epoch = 0
 
-    best_vloss = 1_000_000.
+    best_vloss = 1000000
     patience_count = 0
 
     model = model.to(device)
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
 
         print('EPOCH {}:'.format(epoch_number + 1))
         print("TRAIN")
@@ -86,24 +65,26 @@ def train_torch(
 
         for batch_idx, batch in enumerate(tqdm(dataloader)):
 
-            li_inputs, li_labels = batch
+            image, labels = batch
             count += 1
-            inputs = li_inputs.to(device)
-
-            labels = [l.to(device) for l in li_labels]
+            
+            image = image.to(device)
+            labels = labels.to(device)
 
             optimizer.zero_grad()
 
-            outputs = model(inputs)
+            outputs = model(image)
+            curr_loss = loss(outputs, labels)   
 
-            loss = sum([losses[j](outputs[j], labels[j]) for j in range(len(losses))])            
-            loss.backward()
+            count += 1
+
+            curr_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.001, error_if_nonfinite=True)
         
             optimizer.step()
 
-            running_loss_avg += loss.item()
+            running_loss_avg += curr_loss.item()
 
 
         avg_loss = running_loss_avg/count
@@ -120,16 +101,16 @@ def train_torch(
             
             for batch_idx, batch in enumerate(tqdm(valloader)):
 
+                image, labels = batch
                 vcount += 1
+                
+                image = image.to(device)
+                labels = labels.to(device)
 
-                li_inputs, li_labels = batch
-                vinputs = li_inputs.to(device)
-                vlabels = [l.to(device) for l in li_labels]
-
-                voutputs = model(vinputs)
-                vloss = sum([losses[j](voutputs[j], vlabels[j]) for j in range(len(losses))])
+                voutputs = model(image)
+                curr_vloss = loss(voutputs, labels)
                     
-                running_vloss_avg += vloss
+                running_vloss_avg += curr_vloss
 
         avg_vloss = running_vloss_avg/vcount
         writer.add_scalar('avg_loss/val', avg_vloss, epoch)
@@ -140,16 +121,17 @@ def train_torch(
         
         # Save model periodically
         if (epoch+1)%10==0:
-            epoch_path_prefix = save_path_prefix / "_epoch" + str(epoch+1) + "_dict.pth"
+            epoch_path_prefix = save_path_prefix + "/model_epoch" + str(epoch+1) + "_dict.pth"
             
             torch.save(model.state_dict(), epoch_path_prefix)
         
         if avg_vloss<best_vloss:
             best_vloss = avg_vloss
-            dict_save_path = save_path_prefix / "saved_model_best_dict.pth"
+            dict_save_path = save_path_prefix + "/saved_model_best_dict.pth"
             
             torch.save(model.state_dict(), dict_save_path)
             patience_count = 0
+            print("Saved new best model.")
         else:
             patience_count += 1
             
@@ -172,7 +154,7 @@ def main():
         'seed': 0,
         'min_objects': 1,
         'zoom_min': 0.75,
-        'batch_size': 12,
+        'batch_size': 24,
         'backbone': 'efficientnetv2bl',
         'crop_size': 256,
         'lr': 1e-4,
@@ -180,24 +162,25 @@ def main():
         'inner_distance_alpha': 'auto',
         'inner_distance_beta': 1,
         'inner_erosion_width': 0,
-        'pyramid_levels': "P3-P4-P5-P6-P7",
-        'num_workers': 16
+        'pyramid_levels': ['P3','P4','P5'],
+        'backbone_levels': ['C1','C2','C3', 'C4','C5'],
+        'num_workers': 24
     }
 
     curr_time = f"{datetime.datetime.now():%Y%m%d%H%M%S}"
 
-    run_info = pathlib.Path(config['run_info'] + curr_time)
-    model_path = pathlib.Path(config['model_path'] + curr_time)
-    
-    if not run_info.exists():
-        run_info.mkdir(parents=True, exist_ok=True)
-    if not model_path.exists():
-        model_path.mkdir(parents=True, exist_ok=True)
-
-    writer = SummaryWriter(run_info)
-
     z_train = zarr.open(f"{config['data_path']}/train.zarr")
     z_val = zarr.open(f"{config['data_path']}/val.zarr")
+
+    run_info = config['run_info'] + '/' + curr_time
+    model_path = config['model_path'] + '/' + curr_time
+    
+    if not os.path.isdir(run_info):
+        os.makedirs(run_info, exist_ok=True)
+    if not os.path.isdir(model_path):
+        os.makedirs(model_path, exist_ok=True)
+
+    writer = SummaryWriter(run_info)
 
     # Set up data generators with updated data
     train_data, val_data = create_data_loaders(
@@ -206,10 +189,13 @@ def main():
         crop_size=config['crop_size'],
         zoom_min=config['zoom_min'],
         batch_size=config['batch_size'],
+        data_format='channels_last',
         outer_erosion_width=config['outer_erosion_width'],
         inner_distance_alpha=config['inner_distance_alpha'],
         inner_distance_beta=config['inner_distance_beta'],
         inner_erosion_width=config['inner_erosion_width'],
+        preprocess=False,
+        num_workers=config['num_workers']
     )
 
     # train the model
@@ -220,7 +206,7 @@ def main():
         backbone=config['backbone'],
         lr=config['lr'],
         epochs=config['epochs'],
-        pyramid_levels=config['pyramid_levels'].split("-"),
+        pyramid_levels=config['pyramid_levels'],
         save_path_prefix=model_path,
         writer=writer
     )

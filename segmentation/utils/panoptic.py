@@ -4,7 +4,7 @@ import re
 
 import torch
 import torch.nn as nn
-from torch.nn import LazyConv2d, LazyConv3d
+from torch.nn import LazyConv2d
 
 from utils.fpn import __create_pyramid_features
 from utils.fpn import __create_semantic_head
@@ -13,11 +13,9 @@ from utils.backbone import get_backbone
 
 
 class PanopticModel(nn.Module):
-    """Wrapper that applies preprocessing once, then extracts features."""
     
     def __init__(self, preprocessing, semantic_heads):
         super().__init__()
-        self.input_shape = (None, 256, 256, 2)
         self.preprocessing = preprocessing
         self.semantic_heads = nn.ModuleList(semantic_heads)
     
@@ -123,26 +121,9 @@ def PanopticNet(backbone,
     
     # Using channels first as that's the default for torch
     input_shape = (1, 256, 256)
-    channel_axis = 1
 
-    conv = LazyConv3d if frames_per_batch > 1 else LazyConv2d
-    conv_kernel = (1, 1, 1) if frames_per_batch > 1 else (1, 1)
-
-    # TODO: only works for 2D: do we check for 3D as well?
-    # What are the requirements for 3D data?
-    img_shape = input_shape[1:] if channel_axis == 1 else input_shape[:-1]
-    if img_shape[0] != img_shape[1]:
-        raise ValueError(f'Input data must be square, got dimensions {img_shape}')
-
-    if not math.log(img_shape[0], 2).is_integer():
-        raise ValueError('Input data dimensions must be a power of 2, '
-                         f'got {img_shape[0]}')
-
-    # Check input to interpolation
-    acceptable_interpolation = {'bilinear', 'nearest'}
-    if interpolation not in acceptable_interpolation:
-        raise ValueError(f'Interpolation mode "{interpolation}" not supported. '
-                         f'Choose from {list(acceptable_interpolation)}.')
+    conv = LazyConv2d
+    conv_kernel = (1, 1)
 
     if inputs is None:
         temp_input_shape = [1] + list(input_shape)
@@ -156,24 +137,10 @@ def PanopticNet(backbone,
     # Force the channel size for backbone input to be `required_channels`
     preprocessing = nn.Sequential(concat, conv(required_channels, conv_kernel, stride=1, padding='same'))
 
-    # Set axis as 0 for pytorch's channels_first approach
-    axis = 0
-    
-    fixed_input_shape = list(input_shape)
-    fixed_input_shape[axis] = required_channels
-    fixed_input_shape = tuple(fixed_input_shape)
+    # Set axis as 0 for pytorch's channels_first approach    
 
-    model_kwargs = {
-        'include_top': True,
-        'weights': None,
-        'input_shape': fixed_input_shape,
-        'pooling': pooling
-    }
-    _, backbone_dict = get_backbone(backbone, preprocessing,
-                                    use_imagenet=use_imagenet,
-                                    frames_per_batch=frames_per_batch,
-                                    return_dict=True,
-                                    **model_kwargs)
+    backbone_dict = get_backbone(backbone, use_imagenet=use_imagenet)
+                                    
 
     backbone_dict_reduced = {k: backbone_dict[k] for k in backbone_dict
                              if k in backbone_levels}

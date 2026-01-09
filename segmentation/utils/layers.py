@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 import warnings
 
-import torch
-import torch.nn as nn
-import warnings
-
 class Location2D(torch.nn.Module):
     """Location Layer for 2D cartesian coordinate locations.
 

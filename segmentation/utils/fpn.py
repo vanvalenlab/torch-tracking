@@ -63,15 +63,6 @@ def create_pyramid_level(backbone_input,
         ValueError: ``upsample_type`` not in
             ``['upsamplelike','upsampling2d', 'upsampling3d']``
     """
-    # Check input to ndims
-    acceptable_ndims = {2, 3}
-    if ndim not in acceptable_ndims:
-        raise ValueError('Only 2 and 3 dimensional networks are supported')
-
-    # Check if inputs to ndim and lite are compatible
-    if ndim == 3 and lite:
-        raise ValueError('lite models are not compatible with 3 dimensional '
-                         'networks')
 
     # Check input to interpolation
     acceptable_interpolation = {'bilinear', 'nearest'}
@@ -79,22 +70,13 @@ def create_pyramid_level(backbone_input,
         raise ValueError(f'Interpolation mode "{interpolation}" not supported. '
                          f'Choose from {list(acceptable_interpolation)}.')
 
-    # Check input to upsample_type
-    acceptable_upsample = {'upsamplelike', 'upsampling2d', 'upsampling3d'}
-    if upsample_type not in acceptable_upsample:
-        raise ValueError(f'Upsample method "{upsample_type}" not supported. '
-                         f'Choose from {list(acceptable_upsample)}.')
-
-    upsample_name = f'P{level}_upsampled'
-
     backbone_input = [backbone_input]
     
     # Apply 1x1 conv to backbone layer
-    if ndim == 2:
-        backbone_input.append(LazyConv2d(feature_size, (1, 1), stride=(1, 1),
-                         padding='same'))
-        pyramid = backbone_input
-        pyramid = nn.Sequential(*pyramid)
+    backbone_input.append(LazyConv2d(feature_size, (1, 1), stride=(1, 1),
+                        padding='same'))
+    pyramid = backbone_input
+    pyramid = nn.Sequential(*pyramid)
 
     
     # Add and then 3x3 conv
@@ -104,34 +86,23 @@ def create_pyramid_level(backbone_input,
         pyramid = [add_components(temp_pyramid, addition_input)]
         pyramid = nn.Sequential(*pyramid)
 
-    # Upsample pyramid input
-    if upsamplelike_input is not None and upsample_type == 'upsamplelike':
-        assert(False)
-        pyramid_upsample = UpsampleLike(name=upsample_name)(
-            [pyramid, upsamplelike_input])
-    elif upsample_type == 'upsamplelike':
-        assert(False)
-        pyramid_upsample = None
-    else:
 
-        upsampling = Upsample
-        size = (2, 2) if ndim == 2 else (1, 2, 2)
-        upsampling_kwargs = {
-            'scale_factor': size,
-            'mode': interpolation
-        }
-        if ndim > 2:
-            del upsampling_kwargs['interpolation']
+    upsampling = Upsample
+    size = (2, 2)
+    upsampling_kwargs = {
+        'scale_factor': size,
+        'mode': interpolation
+    }
 
-        temp_li = [pyramid]
-        temp_li.append(upsampling(**upsampling_kwargs))
-        pyramid_upsample = nn.Sequential(*temp_li)
+
+    temp_li = [pyramid]
+    temp_li.append(upsampling(**upsampling_kwargs))
+    pyramid_upsample = nn.Sequential(*temp_li)
     
-    if ndim == 2:
-        temp_li = [pyramid]
-        temp_li.append(LazyConv2d(feature_size, (3, 3), stride=(1, 1),
-                                padding='same'))
-        pyramid_final = nn.Sequential(*temp_li)
+    temp_li = [pyramid]
+    temp_li.append(LazyConv2d(feature_size, (3, 3), stride=(1, 1),
+                            padding='same'))
+    pyramid_final = nn.Sequential(*temp_li)
     
     return pyramid_final, pyramid_upsample
 
@@ -171,27 +142,6 @@ def __create_pyramid_features(backbone_dict,
         ValueError: ``upsample_type`` not in
             ``['upsamplelike','upsampling2d', 'upsampling3d']``
     """
-    # Check input to ndims
-    acceptable_ndims = [2, 3]
-    if ndim not in acceptable_ndims:
-        raise ValueError('Only 2 and 3 dimensional networks are supported')
-    
-    # Check if inputs to ndim and lite are compatible
-    if ndim == 3 and lite:
-        raise ValueError('lite models are not compatible with 3 dimensional '
-                         'networks')
-
-    # Check input to interpolation
-    acceptable_interpolation = {'bilinear', 'nearest'}
-    if interpolation not in acceptable_interpolation:
-        raise ValueError(f'Interpolation mode "{interpolation}" not supported. '
-                         f'Choose from {list(acceptable_interpolation)}.')
-
-    # Check input to upsample_type
-    acceptable_upsample = {'upsamplelike', 'upsampling2d', 'upsampling3d'}
-    if upsample_type not in acceptable_upsample:
-        raise ValueError(f'Upsample method "{upsample_type}" not supported. '
-                         f'Choose from {list(acceptable_upsample)}.')
 
     # Get names of the backbone levels and place in ascending order
     backbone_names = get_sorted_keys(backbone_dict)
@@ -201,7 +151,7 @@ def __create_pyramid_features(backbone_dict,
     pyramid_finals = []
     pyramid_upsamples = []
 
-    # Reverse lists
+    # Reverse lists to put them in descending order
     backbone_names.reverse()
     backbone_features.reverse()
 
@@ -249,11 +199,10 @@ def __create_pyramid_features(backbone_dict,
         level = int(re.findall(r'\d+', N)[0]) + 1
         P_minus_2_name = f'P{level}'
 
-        if ndim == 2:
-            temp_F = [F]
-            temp_F.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
-                               stride=(2, 2)))
-            P_minus_2 = nn.Sequential(*temp_F)
+        temp_F = [F]
+        temp_F.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
+                            stride=(2, 2)))
+        P_minus_2 = nn.Sequential(*temp_F)
 
 
         pyramid_names.insert(0, P_minus_2_name)
@@ -267,10 +216,9 @@ def __create_pyramid_features(backbone_dict,
         P_minus_1 = [P_minus_2]
         P_minus_1.append(torch.nn.ReLU())
         
-        if ndim == 2:
-            P_minus_1.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
-                               stride=(2, 2)))
-            P_minus_1 = nn.Sequential(*P_minus_1)
+        P_minus_1.append(Conv2dSamePadding(feature_size, kernel_size=(3, 3),
+                            stride=(2, 2)))
+        P_minus_1 = nn.Sequential(*P_minus_1)
 
 
         pyramid_names.insert(0, P_minus_1_name)
@@ -316,32 +264,14 @@ def semantic_upsample(x,
     Returns:
         tensor: The upsampled tensor.
     """
-    # Check input to ndims
-    acceptable_ndims = [2, 3]
-    if ndim not in acceptable_ndims:
-        raise ValueError('Only 2 and 3 dimensional networks are supported')
-
-    # Check input to interpolation
-    acceptable_interpolation = {'bilinear', 'nearest'}
-    if interpolation not in acceptable_interpolation:
-        raise ValueError(f'Interpolation mode "{interpolation}" not supported. '
-                         f'Choose from {list(acceptable_interpolation)}.')
 
     # Check input to upsample_type
-    acceptable_upsample = {'upsamplelike', 'upsampling2d', 'upsampling3d'}
-    if upsample_type not in acceptable_upsample:
-        raise ValueError(f'Upsample method "{upsample_type}" not supported. '
-                         f'Choose from {list(acceptable_upsample)}.')
 
-    # Check that there is a target if upsamplelike is used
-    if upsample_type == 'upsamplelike' and target is None:
-        raise ValueError('upsamplelike requires a target.')
+    conv = LazyConv2d
+    conv_kernel = (3, 3)
 
-    conv = LazyConv2d if ndim == 2 else Conv3d
-    conv_kernel = (3, 3) if ndim == 2 else (1, 3, 3)
-    # upsampling = UpSampling2D if ndim == 2 else UpSampling3D
     upsampling = Upsample
-    size = (2, 2) if ndim == 2 else (1, 2, 2)
+    size = (2, 2)
 
     temp = [x]
     if n_upsample > 0:
@@ -358,13 +288,9 @@ def semantic_upsample(x,
             else:
                 upsampling_kwargs = {
                     'scale_factor': size,
-                    # 'name': upsample_name,
-                    # 'interpolation': interpolation
                     'mode': interpolation
                 }
 
-                if ndim > 2:
-                    del upsampling_kwargs['interpolation']
                 temp.append(upsampling(**upsampling_kwargs))
         x = nn.Sequential(*temp)
 
@@ -411,30 +337,9 @@ def __create_semantic_head(pyramid_dict,
     Returns:
         torch.nn.Sequential: The semantic segmentation head
     """
-    # Check input to ndims
-    if ndim not in {2, 3}:
-        raise ValueError('ndim must be either 2 or 3. '
-                         f'Received ndim = {ndim}')
 
-    # Check input to interpolation
-    acceptable_interpolation = {'bilinear', 'nearest'}
-    if interpolation not in acceptable_interpolation:
-        raise ValueError(f'Interpolation mode "{interpolation}" not supported. '
-                         f'Choose from {list(acceptable_interpolation)}.')
-
-    # Check input to upsample_type
-    acceptable_upsample = {'upsamplelike', 'upsampling2d', 'upsampling3d'}
-    if upsample_type not in acceptable_upsample:
-        raise ValueError(f'Upsample method "{upsample_type}" not supported. '
-                         f'Choose from {list(acceptable_upsample)}.')
-
-    # Check that there is an input_target if upsamplelike is used
-    if upsample_type == 'upsamplelike' and input_target is None:
-        raise ValueError('upsamplelike requires an input_target.')
-
-    conv = LazyConv2d if ndim == 2 else Conv3d
-    conv_kernel = (1,) * ndim
-
+    conv = LazyConv2d
+    conv_kernel = (1,1)
     channel_axis = 1
 
     if n_classes == 1:
@@ -448,34 +353,8 @@ def __create_semantic_head(pyramid_dict,
     pyramid_names.reverse()
     pyramid_features.reverse()
 
-    # Previous method of building feature pyramids
-    # semantic_features, semantic_names = [], []
-    # for N, P in zip(pyramid_names, pyramid_features):
-    #     # Get level and determine how much to upsample
-    #     level = int(re.findall(r'\d+', N)[0])
-    #
-    #     n_upsample = level - target_level
-    #     target = semantic_features[-1] if len(semantic_features) > 0 else None
-    #
-    #     # Use semantic upsample to get semantic map
-    #     semantic_features.append(semantic_upsample(
-    #         P, n_upsample, n_filters=n_filters, target=target, ndim=ndim,
-    #         upsample_type=upsample_type, interpolation=interpolation,
-    #         semantic_id=semantic_id))
-    #     semantic_names.append('Q{}'.format(level))
-
-    # Add all the semantic features
-    # semantic_sum = semantic_features[0]
-    # for semantic_feature in semantic_features[1:]:
-    #     semantic_sum = Add()([semantic_sum, semantic_feature])
-
-    # TODO: bad name but using the same name more clearly indicates
-    # how to integrate the previous version
     semantic_sum = pyramid_features[-1]
 
-    # Final upsampling
-    # min_level = int(re.findall(r'\d+', pyramid_names[-1])[0])
-    # n_upsample = min_level - target_level
     n_upsample = target_level
     x = semantic_upsample(semantic_sum, n_upsample,
                           # n_filters=n_filters,  # TODO: uncomment and retrain
