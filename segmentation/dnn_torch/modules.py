@@ -3,8 +3,6 @@ import torch.nn as nn
 from torchvision.models import efficientnet_v2_l
 from torchvision.models.efficientnet import EfficientNet_V2_L_Weights
 
-from collections import OrderedDict
-
 class BackboneNetwork(nn.Module):
 
     def __init__(self, backbone='efficientnetv2bl', use_imagenet=True):
@@ -38,7 +36,7 @@ class BackboneNetwork(nn.Module):
             raise ValueError("Unrecognized backbone.")
         
         
-    def forward(self, x):
+    def forward(self, x) -> dict:
         """Extract backbone features sequentially through stages."""
         backbone_features = {}
         
@@ -71,7 +69,7 @@ class FeaturePyramidNetwork(nn.Module):
             
             self.levels[curr_level] = level
 
-    def forward(self, backbone_features):
+    def forward(self, backbone_features) -> dict:
 
         # backbone features have five elements, but we only care about
         # the top 3 (C5, C4, and C3 in that order)

@@ -1,13 +1,8 @@
 import numpy as np
 
 import scipy.ndimage as nd
+import skimage
 
-from skimage.measure import regionprops, label
-from skimage.segmentation import find_boundaries
-
-from skimage.morphology import (disk, 
-                                ball, 
-                                binary_dilation)
 eps = 1e-7
 
 def erode_edges(mask, erosion_width):
@@ -30,7 +25,7 @@ def erode_edges(mask, erosion_width):
     if erosion_width:
         new_mask = np.copy(mask)
         for _ in range(erosion_width):
-            boundaries = find_boundaries(new_mask, mode='inner')
+            boundaries = skimage.segmentation.find_boundaries(new_mask, mode='inner')
             new_mask[boundaries > 0] = 0
         return new_mask
 
@@ -72,15 +67,15 @@ def pixelwise_transform(mask, dilation_radius=None, data_format=None,
         channel_axis = -1
 
     # Detect the edges and interiors
-    edge = find_boundaries(mask, mode='inner').astype('int')
+    edge = skimage.segmentation.find_boundaries(mask, mode='inner').astype('int')
     interior = np.logical_and(edge == 0, mask > 0).astype('int')
 
-    strel = ball(1) if mask.ndim > 2 else disk(1)
+    strel = skimage.morphology.ball(1) if mask.ndim > 2 else skimage.morphology.disk(1)
     if not separate_edge_classes:
         if dilation_radius:
-            dil_strel = ball(dilation_radius) if mask.ndim > 2 else disk(dilation_radius)
+            dil_strel = skimage.morphology.ball(dilation_radius) if mask.ndim > 2 else skimage.morphology.disk(dilation_radius)
             # Thicken cell edges to be more pronounced
-            edge = binary_dilation(edge, footprint=dil_strel)
+            edge = skimage.morphology.binary_dilation(edge, footprint=dil_strel)
 
             # Thin the augmented edges by subtracting the interior features.
             edge = (edge - interior > 0).astype('int')
@@ -98,7 +93,7 @@ def pixelwise_transform(mask, dilation_radius=None, data_format=None,
 
     # dilate the background masks and subtract from all edges for background-edges
     background = (mask == 0).astype('int')
-    dilated_background = binary_dilation(background, strel)
+    dilated_background = skimage.morphology.binary_dilation(background, strel)
 
     background_edge = (edge - dilated_background > 0).astype('int')
 
@@ -106,10 +101,10 @@ def pixelwise_transform(mask, dilation_radius=None, data_format=None,
     interior_edge = (edge - background_edge > 0).astype('int')
 
     if dilation_radius:
-        dil_strel = ball(dilation_radius) if mask.ndim > 2 else disk(dilation_radius)
+        dil_strel = skimage.morphology.ball(dilation_radius) if mask.ndim > 2 else skimage.morphology.disk(dilation_radius)
         # Thicken cell edges to be more pronounced
-        interior_edge = binary_dilation(interior_edge, footprint=dil_strel)
-        background_edge = binary_dilation(background_edge, footprint=dil_strel)
+        interior_edge = skimage.morphology.binary_dilation(interior_edge, footprint=dil_strel)
+        background_edge = skimage.morphology.binary_dilation(background_edge, footprint=dil_strel)
 
         # Thin the augmented edges by subtracting the interior features.
         interior_edge = (interior_edge - interior > 0).astype('int')
@@ -153,8 +148,8 @@ def outer_distance_transform_2d(mask, bins=None, erosion_width=None,
     if normalize:
         # uniquely label each cell and normalize the distance values
         # by that cells maximum distance value
-        label_matrix = label(mask)
-        for prop in regionprops(label_matrix):
+        label_matrix = skimage.measure.label(mask)
+        for prop in skimage.measure.regionprops(label_matrix):
             labeled_distance = distance[label_matrix == prop.label]
             normalized_distance = 1 - labeled_distance / np.amax(labeled_distance)
             distance[label_matrix == prop.label] = normalized_distance
@@ -281,10 +276,10 @@ def inner_distance_transform_2d(mask, bins=None, erosion_width=None,
     distance = nd.distance_transform_edt(mask)
     distance = distance.astype(np.float32)
 
-    label_matrix = label(mask)
+    label_matrix = skimage.measure.label(mask)
 
     inner_distance = np.zeros(distance.shape, dtype=np.float32)
-    for prop in regionprops(label_matrix, distance):
+    for prop in skimage.measure.regionprops(label_matrix, distance):
         coords = prop.coords
         center = prop.weighted_centroid
         distance_to_center = np.sum((coords - center) ** 2, axis=1)
@@ -351,10 +346,10 @@ def inner_distance_transform_3d(mask, bins=None,
     distance = nd.distance_transform_edt(mask, sampling=sampling)
     distance = distance.astype(np.float32)
 
-    label_matrix = label(mask)
+    label_matrix = skimage.measure.label(mask)
 
     inner_distance = np.zeros(distance.shape, dtype=np.float32)
-    for prop in regionprops(label_matrix, distance):
+    for prop in skimage.measure.regionprops(label_matrix, distance):
         coords = prop.coords
         center = prop.weighted_centroid
         distance_to_center = (coords - center) * np.array(sampling)
