@@ -215,7 +215,7 @@ if __name__ == "__main__":
     config = {
         'batch_size': 6,
         'n_layers': 1,
-        'crop_size': 16
+        'crop_size': 32
     }
 
     # Initialize model
@@ -228,7 +228,7 @@ if __name__ == "__main__":
                              crop_size=config['crop_size'],
                              )
 
-    checkpoint_dir = 'checkpoints/20251215-164022/best_model.pt'
+    checkpoint_dir = 'checkpoints/20251218-141611/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
     
@@ -249,7 +249,7 @@ if __name__ == "__main__":
         annotation=y[batch, :end_frame],  # (T, Y, X, C)
         tracking_model=model,
         device='cuda:0',
-        appearance_dim=16,
+        appearance_dim=32,
         division=0.99,  # Threshold for detecting mitosis,
         track_length=8
     )
@@ -270,10 +270,10 @@ if __name__ == "__main__":
 
     rand_cmap = ListedColormap(the_rest, N=frame_max[-1]+1)
 
-    create_timelapse_gif(y_tracked, gt_movie, cmap='viridis')
+    # create_timelapse_gif(y_tracked, gt_movie, cmap='viridis')
 
-    # predictions = tracker._get_assignment_matrix()
-
+    predictions = tracker._get_assignment_matrix()
+    print(predictions.shape)
     # pt, ph, pw, pc = predictions.shape
 
     # gt_cropped = gt[:pt, :ph, :pw, :pc]

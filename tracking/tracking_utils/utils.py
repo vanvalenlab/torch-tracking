@@ -332,7 +332,7 @@ def get_max_cells(y):
             max_cells = n_cells
     return max_cells
 
-def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
+def get_image_features(X, y, appearance_dim=16, crop_mode='fixed', norm=True):
     """Return features for every object in the array.
 
     Args:
@@ -403,8 +403,11 @@ def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
             minr, minc, maxr, maxc = prop.bbox
             appearance = np.copy(X[minr:maxr, minc:maxc, :])
             resize_shape = (appearance_dim, appearance_dim)
-            appearance = resize(appearance, resize_shape)
-            appearances[i] = appearance
+
+            label = np.copy(y[minr:maxr, minc:maxc])
+
+            appearance = appearance * (label == prop.label)
+            appearances[i] = resize(appearance, resize_shape)
 
         if crop_mode == 'fixed':
             cent = np.array(prop.centroid)

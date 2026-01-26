@@ -5,7 +5,7 @@ from torchvision.transforms import v2 as transforms
 import zarr
 from transforms import transform_masks
 from utils import histogram_normalization
-from torchvision.transforms import functional as F
+from torchvision.transforms.v2 import functional as F
 import random
 
 class SegmentationDataset(Dataset):
@@ -20,7 +20,8 @@ class SegmentationDataset(Dataset):
                  crop_size = 256,
                  rotation_range=180,
                  zoom=0.75,
-                 preprocess=True
+                 preprocess=False,
+                 poisson_rate = 0.2,
                  ):
         
         self.X = X[:]
@@ -34,6 +35,7 @@ class SegmentationDataset(Dataset):
         self.rotation_range = rotation_range
         self.zoom = zoom
         self.preprocess = preprocess
+        self.poisson_rate = poisson_rate
 
         # Convert to channels first format if necessary
         if self.data_format == 'channels_last':
@@ -44,6 +46,18 @@ class SegmentationDataset(Dataset):
         if self.preprocess:
             print("Preprocessing...")
             self._preprocess()
+
+    def _normalize(self, X):
+
+        X = np.expand_dims(X, 0)
+
+        assert len(X.shape) == 4, 'add batch dimension'
+
+        X_norm = histogram_normalization(X, data_format=self.data_format)
+
+        X_norm = X_norm.squeeze(axis=0)
+
+        return X_norm
 
     def _preprocess(self):
 
@@ -95,22 +109,22 @@ class SegmentationDataset(Dataset):
         do_hflip = random.random() > 0.5
         do_vflip = random.random() > 0.5
         
-
         ### Apply to image (bilinear interpolation)
-        image = F.rotate(image, angle, interpolation=F.InterpolationMode.BILINEAR)
         image = F.crop(image, i, j, h, w)
+        image = F.rotate(image, angle, interpolation=F.InterpolationMode.BILINEAR)
         image = F.resize(image, (self.crop_size, self.crop_size), 
                         interpolation=F.InterpolationMode.BILINEAR)
         if do_hflip:
             image = F.hflip(image)
         if do_vflip:
             image = F.vflip(image)
-        
 
+        
         ### Apply to continuous masks (bilinear interpolation)
+
+        mask_continuous = F.crop(mask_continuous, i, j, h, w)
         mask_continuous = F.rotate(mask_continuous, angle, 
                                     interpolation=F.InterpolationMode.BILINEAR)
-        mask_continuous = F.crop(mask_continuous, i, j, h, w)
         mask_continuous = F.resize(mask_continuous, (self.crop_size, self.crop_size),
                                     interpolation=F.InterpolationMode.BILINEAR)
         if do_hflip:
@@ -120,15 +134,21 @@ class SegmentationDataset(Dataset):
         
 
         ### Apply to discrete masks (nearest-neighbor interpolation)
+
+        mask_discrete = F.crop(mask_discrete, i, j, h, w)
         mask_discrete = F.rotate(mask_discrete, angle, 
                                 interpolation=F.InterpolationMode.NEAREST)
-        mask_discrete = F.crop(mask_discrete, i, j, h, w)
         mask_discrete = F.resize(mask_discrete, (self.crop_size, self.crop_size),
                                 interpolation=F.InterpolationMode.NEAREST)
         if do_hflip:
             mask_discrete = F.hflip(mask_discrete)
         if do_vflip:
             mask_discrete = F.vflip(mask_discrete)
+
+        mask_discrete = torch.cat([
+            torch.logical_not(mask_discrete.clone()),
+            mask_discrete
+        ], axis=0)
         
         return image, mask_continuous, mask_discrete
 
@@ -143,44 +163,58 @@ class SegmentationDataset(Dataset):
             semantic_discrete = self.semantic_discrete[idx]
         
         else:
+
+            replace_poisson = self.poisson_rate > random.random()
+
+            if replace_poisson:
+                C, H, W = self.X[idx].shape
+                
+                x = np.random.poisson(100, (C, H, W)) + 1
+                x = self._normalize(x)
+
+                semantic_continuous = np.zeros((C, 2, H, W))
+                semantic_discrete = np.zeros((C, 1, H, W))
+
+            else:
             # Indexing for histogram normalization allows for no batches
-            x = histogram_normalization(self.X[idx], data_format=self.data_format)
+                x = self._normalize(self.X[idx])
 
-            # Indexing for transformations requires batches -- use slicing
-            semantic_continuous, semantic_discrete = self._transform_labels(self.y[slice(idx, idx+1)])
+                # Indexing for transformations requires batches -- use slicing
+                semantic_continuous, semantic_discrete = self._transform_labels(self.y[slice(idx, idx+1)])
 
-            # Unsqueeze to match dimensions
-            semantic_continuous = semantic_continuous.squeeze()
-            semantic_discrete = semantic_discrete.squeeze()
 
         # Convert to tensors
-        x = torch.from_numpy(x)
-        semantic_continuous = torch.from_numpy(semantic_continuous)
-        semantic_discrete = torch.from_numpy(semantic_discrete)
+        x = torch.from_numpy(x).float()
+        semantic_continuous = torch.from_numpy(semantic_continuous).float()
+        semantic_discrete = torch.from_numpy(semantic_discrete).float()
 
         if self.augment:
             # crop and also augment
             x, semantic_continuous, semantic_discrete = self._augment(x, semantic_continuous, semantic_discrete)
             
             y = torch.cat([
-                semantic_continuous,
-                semantic_discrete
+                semantic_continuous.squeeze(),
+                semantic_discrete.squeeze()
             ], axis=0)
-            
+        
         else:
 
-            # only crop to keep shapes the same
             i, j, h, w = transforms.RandomCrop.get_params(
                 x, output_size=(self.crop_size, self.crop_size))
-            
-            y = torch.cat([
-                semantic_continuous,
+                        
+            semantic_discrete = torch.cat([
+                torch.logical_not(semantic_discrete.clone()),
                 semantic_discrete
             ], axis=0)
+
+            y = torch.cat([
+                semantic_continuous.squeeze(),
+                semantic_discrete.squeeze()
+            ], axis = 0)
 
             x = F.crop(x, i, j, h, w)
             y = F.crop(y, i, j, h, w)
-        
+
         return (x, y)
     
 def create_data_loaders(
@@ -242,9 +276,10 @@ def create_data_loaders(
             in_transforms=in_transforms, 
             augment=False,
             preprocess=preprocess,
-            transforms_kwargs=transforms_kwargs)  
+            transforms_kwargs=transforms_kwargs,
+            poisson_rate=-1)  
       
-        valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
     return dataloader, valloader
 

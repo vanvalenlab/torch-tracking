@@ -79,7 +79,13 @@ class TrkDataset(Dataset):
             features = zarr.open(self.trk_path)
             extracted_features = {}
             for k in tqdm.tqdm(features.keys()):
-                extracted_features[k] = features[k][:]
+                
+                if self.truncate_dataset is not None:
+                    extracted_features[k] = features[k][:self.truncate_dataset]
+
+                else:
+                    extracted_features[k] = features[k][:]
+
             self.features = extracted_features
 
         else:
@@ -123,7 +129,9 @@ class TrkDataset(Dataset):
             print(f"  X shape: {self.X.shape}")
             print(f"  y shape: {self.y.shape}")
             print(f"  Lineages: {len(self.lineages)}")
-        
+
+        self.class_samples = np.sum(self.features['labels'], axis=(0,1,2,3))
+
         # Build sample indices
         self.samples = self._build_sample_indices()
         print(f"  Created {len(self.samples)} samples")
@@ -213,7 +221,6 @@ class TrkDataset(Dataset):
         return len(self.samples)
     
 
-    
     def _build_augmentation_pipeline(self):
         """Build augmentation pipeline for coordinated appearance + centroid transforms."""
         # Store probabilities for sampling
@@ -224,10 +231,7 @@ class TrkDataset(Dataset):
 
     def _apply_augmentation(self, appearances, centroids):
         """Apply coordinated augmentations - NO TRANSLATION."""
-        T, N, H, W, C = appearances.shape
         
-        do_hflip = torch.rand(1).item() < self.hflip_prob
-        do_vflip = torch.rand(1).item() < self.vflip_prob
         rotation_angle = torch.rand(1).item() * self.rotation_range
 
         self.rotation_angle = rotation_angle
@@ -235,35 +239,26 @@ class TrkDataset(Dataset):
         # Apply appearance transformations
         
         appearances = appearances.permute(0, 1, 4, 2, 3)
+
+        angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
+
+        rotation_mat =  torch.tensor([
+        [torch.cos(angle_rad), -torch.sin(angle_rad)],
+        [torch.sin(angle_rad), torch.cos(angle_rad)],
+        ])
+
+        appearances = TF.rotate(appearances, rotation_angle,
+                            interpolation=TF.InterpolationMode.NEAREST)
         
-        if do_hflip:
-            appearances = TF.hflip(appearances)
-            centroids[...,1] = -centroids[...,1]
-
-        if do_vflip:
-            appearances = TF.vflip(appearances)
-            centroids[...,0] = -centroids[...,0]
-
-        if abs(rotation_angle) > 0:
-
-            angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
-
-            rotation_mat =  torch.tensor([
-            [torch.cos(angle_rad), -torch.sin(angle_rad)],
-            [torch.sin(angle_rad), torch.cos(angle_rad)],
-            ])
-
-            appearances = TF.rotate(appearances, rotation_angle,
-                                interpolation=TF.InterpolationMode.BILINEAR)
-            
-            centroids = torch.matmul(centroids, rotation_mat)
+        centroids = torch.matmul(centroids, rotation_mat)
             
         appearances = appearances.permute(0, 1, 3, 4, 2)
 
-        random_translate = torch.rand(2) * self.translation_range
-        random_translate = random_translate.unsqueeze(0).unsqueeze(0)
+        if self.translation_range > 0:
+            random_translate = torch.rand(2) * self.translation_range
+            random_translate = random_translate.unsqueeze(0).unsqueeze(0)
 
-        centroids = centroids + random_translate
+            centroids = centroids + random_translate
 
         return appearances, centroids
     
@@ -392,19 +387,14 @@ class TrkDataset(Dataset):
 
         tensors['morphologies'] = torch.from_numpy(data['morphologies']).float()
         tensors['adj_matrices'] = torch.from_numpy(data['adj_matrices']).float()
-        
-        if self.t_direction == 'backward':
-            tensors['morphologies'] = tensors['morphologies'].flip(0)
-            tensors['adj_matrices'] = tensors['adj_matrices'].flip(0)
+        tensors['labels'] = torch.from_numpy(data['labels']).float()
+        tensors['mask'] = torch.from_numpy(data['mask'])
+
 
         if self.augment:
 
             centroids = torch.from_numpy(data['centroids']).float()
             appearances = torch.from_numpy(data['appearances']).float()
-
-            if self.t_direction == 'backward':
-                centroids = centroids.flip(0)
-                appearances = appearances.flip(0)
 
             appearances, centroids = self._apply_augmentation(appearances, centroids)
 
@@ -416,18 +406,15 @@ class TrkDataset(Dataset):
             tensors['appearances'] = torch.from_numpy(data['appearances']).float()
             tensors['centroids'] = torch.from_numpy(data['centroids']).float()
 
-            if self.t_direction == 'backward':
-                tensors['centroids'] = torch.from_numpy(data['centroids']).flip(0)
-                tensors['appearances'] = torch.from_numpy(data['appearances']).flip(0)
 
-        if 'labels' in data:
-            tensors['labels'] = torch.from_numpy(data['labels']).float()
-            tensors['mask'] = torch.from_numpy(data['mask'])
+        if self.t_direction == 'backward':
 
-            if self.t_direction == 'backward':
-                tensors['labels'] = torch.transpose(tensors['labels'].flip(0), 1, 2)
-
-                tensors['mask'] = tensors['mask'].flip(0)
+            tensors['morphologies'] = tensors['morphologies'].flip(0)
+            tensors['adj_matrices'] = tensors['adj_matrices'].flip(0)
+            tensors['centroids'] = torch.from_numpy(data['centroids']).flip(0)
+            tensors['appearances'] = torch.from_numpy(data['appearances']).flip(0)
+            tensors['labels'] = torch.transpose(tensors['labels'].flip(0), 1, 2)
+            tensors['mask'] = tensors['mask'].flip(0)
         
         return tensors
 
@@ -543,6 +530,8 @@ def create_trk_dataloaders(
             track_length=track_length,
             crop_size=crop_size,
             stride=stride,
+            rotation_range=0,
+            translation_range=0,
             # mode='training',
             **dataset_kwargs
         )

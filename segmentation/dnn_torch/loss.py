@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 class SemanticLoss(nn.Module):
 
@@ -26,12 +27,17 @@ class SemanticLoss(nn.Module):
 
         loss = 0
 
-        for i, head_type in enumerate(self.semantic_type):
+        for i, n_heads in enumerate(self.n_semantic_classes):
 
-            if head_type == 'disc':
-                head_loss = self.bce(y_pred[:,i], y_true[:,i])
-            elif head_type == 'cont':
-                head_loss = self.mse(y_pred[:,i], y_true[:,i])
+            if n_heads > 1:
+                
+                y_pred = y_pred[:,i:i+n_heads].permute(0,2,3,1).reshape(-1, n_heads)
+                y_true = y_true[:,i:i+n_heads].permute(0,2,3,1).reshape(-1, n_heads)
+
+                head_loss = F.cross_entropy(y_pred, y_true)
+
+            else:
+                head_loss = F.mse_loss(y_pred[:,i], y_true[:,i], reduction='mean') * 0.01
             
             loss += head_loss
 
@@ -82,6 +88,32 @@ class WCCE(nn.Module):
             return full_loss.mean()
         else:
             return full_loss
+        
+class LossTracker:
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.total_loss = 0.0
+        self.total_samples = 0
+
+    def update(self, loss, batch_size):
+        """
+        Args:
+            loss: scalar loss value
+            predictions: (B, T, N, M, 3) logits
+            targets: (B, T, N, M, 3) one hot encoding of labels
+        """
+
+        self.total_loss += loss.item() * batch_size
+        self.total_samples += batch_size
+    
+    def get_loss(self):
+        """Compute and return current metrics."""
+        avg_loss = self.total_loss / max(self.total_samples, 1)
+
+        return avg_loss 
 
 
 if __name__ == '__main__':
@@ -93,9 +125,11 @@ if __name__ == '__main__':
 
     test_pred = torch.rand(8, 4, 256, 256) > 0.5
     test_pred = test_pred.float()
+    
+    test_mask = test_true[:,3].bool()
 
     loss = SemanticLoss(n_semantic_classes=n_semantic_classes)
 
-    loss_out = loss(test_pred, test_true)
+    loss_out = loss(test_pred, test_true, test_mask)
 
     print(loss_out)
