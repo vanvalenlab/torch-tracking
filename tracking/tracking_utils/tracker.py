@@ -772,6 +772,36 @@ class CellTracker:
         
         return df
     
+    def _get_assignment_matrix(self):
+
+        n_frames = len(self.a_matrix)
+        max_cells = max(arr.shape[0] for arr in self.a_matrix)
+        max_tracks = max(arr.shape[1] for arr in self.a_matrix)
+
+        max_dim = max(max_cells, max_tracks)
+
+        assignment_matrix = np.zeros(((n_frames,) + (max_dim, max_dim, 3)))
+
+        for idx, frame in enumerate(self.a_matrix):
+            assignment_matrix[(idx,), :frame.shape[0], :frame.shape[1], :] = frame
+
+        return assignment_matrix
+
+    def _get_assignments(self):
+
+        n_frames = len(self.assignments)
+        max_cells = max(arr.shape[0] for arr in self.assignments)
+        max_tracks = max(arr.shape[1] for arr in self.assignments)
+
+        max_dim = max(max_cells, max_tracks)
+
+        assignment_matrix = np.zeros(((n_frames,) + (max_dim, 2)))
+
+        for idx, frame in enumerate(self.assignments):
+            assignment_matrix[(idx,), :frame.shape[0], :frame.shape[1]] = frame
+
+        return assignment_matrix
+    
     def get_lineage_dict(self) -> Dict:
         """Export lineage in standard format for .trk files."""
         lineage = {}

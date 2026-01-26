@@ -15,11 +15,13 @@ from layers import ImageNormalization2D
 class AppearanceEncoder(nn.Module):
     """Encoder for cell appearance images using 3D convolutions.
     
-    Processes image crops through a series of 3D convolutions with pooling
-    to extract appearance features.
+    CRITICAL: Uses Conv3D with kernel (1, 3, 3) to match TensorFlow architecture.
+    - Input shape is (B*T, N, H, W, C)
+    - Conv3D treats N as "time" dimension but with kernel_size=1 (no mixing between cells)
+    - This is semantically correct: cells are a separate dimension, not part of batch
     
     Args:
-        appearance_shape (tuple): Shape of appearance input (time, height, width, channels)
+        appearance_shape (tuple): Shape of appearance input (H, W, C)
         n_filters (int): Number of convolutional filters
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
@@ -28,13 +30,13 @@ class AppearanceEncoder(nn.Module):
     """
     def __init__(
         self,
-        appearance_shape=(1, 32, 32, 1),
+        appearance_shape=(32, 32, 1),
         n_filters=64,
         encoder_dim=64,
         norm_layer='batch',
         appearance_norm=True,
         data_format='channels_first',
-        dropout=0.1
+        dropout = 0.1
     ):
         super().__init__()
         self.appearance_shape = appearance_shape
@@ -42,36 +44,39 @@ class AppearanceEncoder(nn.Module):
         self.encoder_dim = encoder_dim
         self.appearance_norm = appearance_norm
         self.data_format = data_format
+        self.dropout = dropout
         
         # Calculate number of pooling layers based on spatial dimensions
-        spatial_dim = appearance_shape[1]  # Assuming square images
+        spatial_dim = appearance_shape[0]  # Assuming square images
         self.n_layers = int(math.log2(spatial_dim))
         
-        # Input normalization
+        # Input normalization (applied per-cell if enabled)
         if self.appearance_norm:
             self.img_norm = ImageNormalization2D(
                 norm_method='whole_image',
                 data_format=data_format
             )
         
-        # Build convolutional layers
-        # PyTorch Conv3d expects (batch, channels, depth, height, width)
+        # Determine input channels
         in_channels = appearance_shape[-1] if data_format == 'channels_last' else appearance_shape[0]
         
+        # Build 3D convolutional layers
+        # Conv3D kernel: (depth/time, height, width)
+        # We use (1, 3, 3) - no conv across cell dimension, only spatial
         self.conv_blocks = nn.ModuleList()
         for i in range(self.n_layers):
             block = nn.Sequential(
-                nn.Conv2d(  # Note: Conv2d, not Conv3d!
+                nn.Conv3d(
                     in_channels if i == 0 else n_filters,
                     n_filters,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
+                    kernel_size=(1, 3, 3),  # CRITICAL: (cells=1, height=3, width=3)
+                    stride=(1, 1, 1),
+                    padding=(0, 1, 1),  # No padding on cell dimension
                     bias=False
                 ),
-                nn.BatchNorm2d(n_filters) if norm_layer == 'batch' else nn.GroupNorm(8, n_filters),
+                nn.BatchNorm3d(n_filters) if norm_layer == 'batch' else nn.GroupNorm(8, n_filters),
                 nn.ReLU(),
-                nn.MaxPool2d(kernel_size=2)
+                nn.MaxPool3d(kernel_size=(1, 2, 2))  # Pool only spatial dims
             )
             self.conv_blocks.append(block)
         
@@ -79,43 +84,64 @@ class AppearanceEncoder(nn.Module):
         self.dense = nn.Linear(n_filters, encoder_dim)
         self.final_norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.final_activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch * cells * time, channels, height, width)
-
-        Returns:
-            Tensor of shape (batch, time, cells, encoder_dim)
-        """
+            x: Tensor of shape (B*T, N, H, W, C) for channels_last
+               or (B*T, N, C, H, W) for channels_first
         
+        Returns:
+            Tensor of shape (B*T, N, encoder_dim)
+        """
+        BT, N = x.shape[:2]
+        
+        # Apply normalization if enabled
+        # Normalization operates on 2D images, so we need to flatten cells
         if self.appearance_norm:
-            # For normalization, we need channels_last or channels_first based on config
             if self.data_format == 'channels_last':
-                # (B*T*N, H, W, C) format
+                # (B*T, N, H, W, C) -> (B*T*N, H, W, C)
+                orig_shape = x.shape
+                x = x.reshape(-1, *x.shape[2:])
                 x = self.img_norm(x)
-                # Convert to channels_first for Conv2d: (B*T*N, H, W, C) -> (B*T*N, C, H, W)
-                x = x.permute(0, 3, 1, 2)
+                # Reshape back: (B*T*N, H, W, C) -> (B*T, N, H, W, C)
+                x = x.reshape(orig_shape)
+                # Convert to channels_first for Conv3d
+                x = x.permute(0, 1, 4, 2, 3)  # (B*T, N, C, H, W)
             else:
-                # Already channels_first: (B*T*N, C, H, W)
+                # (B*T, N, C, H, W) -> (B*T*N, C, H, W)
+                orig_shape = x.shape
+                x = x.reshape(-1, *x.shape[2:])
                 x = self.img_norm(x)
+                # Reshape back: (B*T*N, C, H, W) -> (B*T, N, C, H, W)
+                x = x.reshape(orig_shape)
         else:
             if self.data_format == 'channels_last':
-                # Convert to channels_first
-                x = x.permute(0, 3, 1, 2)
+                # Convert to channels_first: (B*T, N, H, W, C) -> (B*T, N, C, H, W)
+                x = x.permute(0, 1, 4, 2, 3)
+
+
+        # We need (B*T, C, N, H, W) - swap channels and cells
+        x = x.permute(0, 2, 1, 3, 4)  # (B*T, C, N, H, W)
 
         # Apply conv blocks
         for block in self.conv_blocks:
             x = block(x)
 
-        # After pooling, spatial dimensions should be 1x1
-        # Squeeze them: (B, C, N, 1, 1) -> (B, C, N)
-        x = x.squeeze(-1).squeeze(-1).squeeze(-1)
+        # Global spatial pooling: (B*T, filters, N, 1, 1) -> (B*T, filters, N)
+        x = x.squeeze(-1).squeeze(-1)
+        
+        # Permute back: (B*T, filters, N) -> (B*T, N, filters)
+        x = x.permute(0, 2, 1)
+
+        # Reshape for dense layer: (B*T, N, filters) -> (B*T*N, filters)
+        x = x.reshape(-1, x.shape[-1])
         x = self.dense(x)
         x = self.final_norm(x)
-        x = self.dropout(x)
         x = self.final_activation(x)
+        
+        # Reshape back: (B*T*N, encoder_dim) -> (B*T, N, encoder_dim)
+        x = x.view(BT, N, self.encoder_dim)
         
         return x
 
@@ -123,85 +149,104 @@ class AppearanceEncoder(nn.Module):
 class MorphologyEncoder(nn.Module):
     """Encoder for cell morphology features.
     
-    Simple MLP to encode morphological measurements.
+    Uses Conv1D with kernel_size=1 to match the architectural pattern:
+    - Preserves cell dimension throughout processing
+    - Consistent with Conv3D in AppearanceEncoder
+    - Semantically correct: applies same transformation to each cell
+    
+    Input shape: (B*T, N, 3) where N is the cell dimension
+    Output shape: (B*T, N, encoder_dim)
     
     Args:
         input_dim (int): Dimension of morphology features (default: 3)
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch', dropout=0.1):
+    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
         super().__init__()
-        self.dense = nn.Linear(input_dim, encoder_dim)
         self.encoder_dim = encoder_dim
+        
+        # Conv1d with kernel_size=1 is equivalent to Dense applied per-cell
+        # Input: (batch, channels, length) = (B*T, input_dim, N)
+        # Output: (batch, out_channels, length) = (B*T, encoder_dim, N)
+        self.conv = nn.Conv1d(input_dim, encoder_dim, kernel_size=1)
         self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch * n_cells, input_dim)
+            x: Tensor of shape (B*T, N, input_dim)
         
         Returns:
-            Tensor of shape (batch * n_cells, encoder_dim)
+            Tensor of shape (B*T, N, encoder_dim)
         """
+        # Conv1d expects (batch, channels, sequence)
+        # Permute: (B*T, N, 3) -> (B*T, 3, N)
+        x = x.permute(0, 2, 1)
         
-        # Reshape for dense layer
-        x = self.dense(x)
+        # Apply conv: (B*T, 3, N) -> (B*T, encoder_dim, N)
+        x = self.conv(x)
         
-        # Apply normalization
-        if isinstance(self.norm, nn.BatchNorm1d):
-            # x = x.permute(0, 2, 1)
-            x = self.norm(x)
-            # x = x.permute(0, 2, 1)
-        else:
-            x = self.norm(x)
-
-        x = self.dropout(x)
+        # BatchNorm1d normalizes across (B*T, N) for each channel
+        x = self.norm(x)
         x = self.activation(x)
-
+        
+        # Permute back: (B*T, encoder_dim, N) -> (B*T, N, encoder_dim)
+        x = x.permute(0, 2, 1)
+        
         return x
 
 
 class CentroidEncoder(nn.Module):
     """Encoder for cell centroid positions.
     
-    Simple MLP to encode centroid coordinates.
+    Uses Conv1D with kernel_size=1 to match the architectural pattern:
+    - Preserves cell dimension throughout processing
+    - Consistent with Conv3D in AppearanceEncoder
+    - Semantically correct: applies same transformation to each cell
+    
+    Input shape: (B*T, N, 2) where N is the cell dimension
+    Output shape: (B*T, N, encoder_dim)
     
     Args:
         input_dim (int): Dimension of centroid features (default: 2 for x,y)
         encoder_dim (int): Output feature dimension
         norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
+    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
         super().__init__()
-        self.dense = nn.Linear(input_dim, encoder_dim)
-        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.encoder_dim = encoder_dim
+        
+        # Conv1d with kernel_size=1 is equivalent to Dense applied per-cell
+        # Input: (batch, channels, length) = (B*T, input_dim, N)
+        # Output: (batch, out_channels, length) = (B*T, encoder_dim, N)
+        self.conv = nn.Conv1d(input_dim, encoder_dim, kernel_size=1)
+        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch * time, input_dim)
+            x: Tensor of shape (B*T, N, input_dim)
         
         Returns:
-            Tensor of shape (batch * time, encoder_dim)
+            Tensor of shape (B*T, N, encoder_dim)
         """
+        # Conv1d expects (batch, channels, sequence)
+        # Permute: (B*T, N, 2) -> (B*T, 2, N)
+        x = x.permute(0, 2, 1)
         
-        # Reshape for dense layer
-        x = self.dense(x)
+        # Apply conv: (B*T, 2, N) -> (B*T, encoder_dim, N)
+        x = self.conv(x)
         
-        # Apply normalization
-        if isinstance(self.norm, nn.BatchNorm1d):
-            x = self.norm(x)
-        else:
-            x = self.norm(x)
-        
+        # BatchNorm1d normalizes across (B*T, N) for each channel
+        x = self.norm(x)
         x = self.activation(x)
-
+        
+        # Permute back: (B*T, encoder_dim, N) -> (B*T, N, encoder_dim)
+        x = x.permute(0, 2, 1)
+        
         return x
 
 

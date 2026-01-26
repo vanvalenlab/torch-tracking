@@ -7,6 +7,9 @@ import scipy.ndimage as nd
 
 import skimage
 import warnings
+import matplotlib.pyplot as plt
+
+
 
 eps = 1e-7
 
@@ -439,7 +442,7 @@ def deep_watershed(outputs,
         elif maxima_algorithm == 'h_maxima':
             # Find peaks and merge equal regions
             fn = skimage.morphology.ball if input_is_3d else skimage.morphology.disk
-            markers = skimage.morphology.h_maxima(maxima, h=maxima_threshold, footprint=disk(radius))
+            markers = skimage.morphology.h_maxima(maxima, h=maxima_threshold, footprint=fn(radius))
 
         else:           
             # Find peaks and merge equal regions
@@ -471,3 +474,29 @@ def deep_watershed(outputs,
     label_images = np.expand_dims(label_images, axis=-1)
 
     return label_images
+
+def create_sample_overlay(labels, transforms):
+
+    transform_names = ['inner', 'outer','bg','fg']
+
+    # 4, H, W
+
+    labels = labels.cpu().numpy()
+    transforms = transforms.cpu().numpy()
+
+    fig, ax = plt.subplots(2, labels.shape[0])
+
+    for i in range(transforms.shape[0]):
+        ax[0, i].imshow(transforms[i], vmin=0, vmax=1)
+        ax[0,i].set_title(f"Predicted {transform_names[i]}")
+        ax[0, i].set_axis_off()
+    
+    for i in range(labels.shape[0]):
+        ax[1, i].imshow(labels[i], vmin=0, vmax=1)
+        ax[1,i].set_title(f"True {transform_names[i]}")
+        ax[1, i].set_axis_off()
+
+    fig.tight_layout()
+
+    return fig
+   

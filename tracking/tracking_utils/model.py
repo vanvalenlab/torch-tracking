@@ -126,7 +126,6 @@ class GNNTrackingModel(nn.Module):
             norm_layer=self.norm_layer,
             appearance_norm=self.appearance_norm,
             data_format=self.data_format,
-            dropout=self.dropout
         )
         
         # Morphology encoder
@@ -134,7 +133,6 @@ class GNNTrackingModel(nn.Module):
             input_dim=3,
             encoder_dim=self.encoder_dim,
             norm_layer=self.norm_layer,
-            dropout=self.dropout
 
         )
         
@@ -143,7 +141,6 @@ class GNNTrackingModel(nn.Module):
             input_dim=2,
             encoder_dim=self.encoder_dim,
             norm_layer=self.norm_layer,
-            dropout=self.dropout
 
         )
         
@@ -152,7 +149,6 @@ class GNNTrackingModel(nn.Module):
             input_dim=2,
             encoder_dim=self.encoder_dim,
             norm_layer=self.norm_layer,
-            dropout=self.dropout
 
         )
         
@@ -172,7 +168,6 @@ class GNNTrackingModel(nn.Module):
             n_layers=self.n_layers,
             graph_layer=self.graph_layer,
             norm_layer=self.norm_layer,
-            dropout=self.dropout
 
         )
     
@@ -308,32 +303,37 @@ class GNNTrackingModel(nn.Module):
         """Extract embeddings for cells (useful for inference setup).
         
         Args:
-            appearances: (batch, time, H, W, C) or channels_first
-            morphologies: (batch, time, 3)
-            centroids: (batch, time, 2)
+            appearances: (batch, time, max_cells, H, W, C) or channels_first
+            morphologies: (batch, time, max_cells, 3)
+            centroids: (batch, time, max_cells, 2)
             adj_matrices: (batch, time, max_cells, max_cells)
         
         Returns:
-            embeddings: (batch, time, embedding_dim)
-            centroids: (batch, time, 2)
+            embeddings: (batch, time, max_cells, embedding_dim)
+            centroids: (batch, time, max_cells, 2)
         """
         batch_size = appearances.shape[0]
         time_steps = appearances.shape[1]
         n_cells = appearances.shape[2]
+
+        print(batch_size, time_steps, n_cells)
         
-        # Reshape to merge batch and time
-        app_reshaped = appearances.view(batch_size * time_steps * n_cells, *appearances.shape[3:])
-        morph_reshaped = morphologies.view(batch_size * time_steps * n_cells, *morphologies.shape[3:])
-        cent_reshaped = centroids.view(batch_size * time_steps * n_cells, *centroids.shape[3:])
+        # CRITICAL FIX: Reshape to merge only batch and time
+        # (B, T, N, ...) -> (B*T, N, ...)
+        # This matches the corrected encoder expectations
+        app_reshaped = appearances.view(batch_size * time_steps, n_cells, *appearances.shape[3:])
+        morph_reshaped = morphologies.view(batch_size * time_steps, n_cells, *morphologies.shape[3:])
+        cent_reshaped = centroids.view(batch_size * time_steps, n_cells, *centroids.shape[3:])
         adj_reshaped = adj_matrices.view(batch_size * time_steps, *adj_matrices.shape[2:])
         
         # Get embeddings
+        # Encoders now return (B*T, N, encoder_dim)
         with torch.no_grad():
             embeddings, centroids_out = self.neighborhood_encoder(
                 app_reshaped, morph_reshaped, cent_reshaped, adj_reshaped
             )
         
-        # Reshape back
+        # Reshape back: (B*T, N, encoder_dim) -> (B, T, N, encoder_dim)
         embeddings = embeddings.view(batch_size, time_steps, n_cells, -1)
         centroids_out = centroids_out.view(batch_size, time_steps, n_cells, -1)
         

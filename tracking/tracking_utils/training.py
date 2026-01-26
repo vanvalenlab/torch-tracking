@@ -11,103 +11,137 @@ import datetime
 from model import GNNTrackingModel
 from loader import create_trk_dataloaders
 from utils import weighted_categorical_crossentropy_v2
+import numpy as np
+
 import torch.nn.functional as F
 
-from typing import Optional
-from torch import Tensor
-
-def compute_global_class_weights(dataloader, n_classes=3, device='cuda'):
-    """
-    Compute class weights from entire dataset (run once before training).
-    
+def focal_loss(logits, labels, alpha=None, gamma=2):
+    """Compute the focal loss between `logits` and the ground truth `labels`.
+    Focal loss = -alpha_t * (1-pt)^gamma * log(pt)
+    where pt is the probability of being classified to the true class.
+    pt = p (if true class), otherwise pt = 1 - p. p = sigmoid(logit).
     Args:
-        dataloader: Training dataloader
-        n_classes: Number of classes
-        device: Device for computation
-    
+      logits: A float tensor of size [batch, num_classes].
+      labels: A float tensor of size [batch, num_classes].
+      alpha: A float tensor of size [batch_size]
+        specifying per-example weight for balanced cross entropy.
+      gamma: A float scalar modulating loss from hard and easy examples.
     Returns:
-        torch.Tensor: Class weights of shape (n_classes,)
+      focal_loss: A float32 scalar representing normalized total loss.
     """
-    print("Computing global class weights from training data...")
-    class_counts = torch.zeros(n_classes, dtype=torch.float64)
-    
-    for batch in tqdm(dataloader, desc="Computing class weights"):
-        labels = batch['labels']
-        
-        # Count samples per class
-        for class_idx in range(n_classes):
-            # Labels are one-hot: (B, T, N, M, 3)
-            class_mask = labels[..., class_idx] == 1
-            # Only count non-padded values (where any class is 1)
-            valid_mask = labels.max(dim=-1).values >= 0
-            class_counts[class_idx] += (class_mask & valid_mask).sum().item()
-    
-    total_samples = class_counts.sum()
-    
-    # Inverse frequency weighting
-    class_weights = total_samples / (n_classes * class_counts)
-    
-    # Normalize so average weight is 1.0 (optional but recommended)
-    class_weights = class_weights / class_weights.mean()
-    
-    print(f"\nClass counts: {class_counts.numpy()}")
-    print(f"Class weights: {class_weights.numpy()}")
-    print(f"Weight ratios: {(class_weights / class_weights.min()).numpy()}")
-    
-    return class_weights.to(device)
+    bc_loss = F.binary_cross_entropy_with_logits(input=logits, target=labels, reduction="none")
 
-class FocalLoss(nn.Module):
-    def __init__(self,
-                 alpha: Optional[Tensor] = None,
-                 gamma: float = 0.,
-                 reduction: str = 'mean',
-                 ignore_index: int = -1):
-        if reduction not in ('mean', 'sum', 'none'):
-            raise ValueError(
-                'Reduction must be one of: "mean", "sum", "none".')
+    if gamma == 0.0:
+        modulator = 1.0
+    else:
+        modulator = torch.exp(-gamma * labels * logits - gamma * torch.log(1 + torch.exp(-1.0 * logits)))
 
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.ignore_index = ignore_index
-        self.reduction = reduction
+    loss = modulator * bc_loss
 
-        self.nll_loss = nn.NLLLoss(
-            weight=alpha, reduction='none', ignore_index=ignore_index)
+    if alpha is not None:
+        weighted_loss = alpha * loss
+        focal_loss = torch.sum(weighted_loss)
+    else:
+        focal_loss = torch.sum(loss)
 
-    def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        if x.ndim > 2:
-            c = x.shape[1]
-            x = x.permute(0, *range(2, x.ndim), 1).reshape(-1, c)
-            y = y.view(-1)
+    focal_loss /= torch.sum(labels)
+    return focal_loss
 
-        unignored_mask = y != self.ignore_index
-        y = y[unignored_mask]
-        if len(y) == 0:
-            return torch.tensor(0.)
-        x = x[unignored_mask]
+class Loss(torch.nn.Module):
+    def __init__(
+        self,
+        loss_type: str = "cross_entropy",
+        beta: float = 0.999,
+        fl_gamma=2,
+        samples_per_class=None,
+        class_balanced=False,
+        safe: bool = False,
+    ):
+        """
+        Compute the Class Balanced Loss between `logits` and the ground truth `labels`.
+        Class Balanced Loss: ((1-beta)/(1-beta^n))*Loss(labels, logits)
+        where Loss is one of the standard losses used for Neural Networks.
 
-        log_p = F.log_softmax(x, dim=-1)
-        ce = self.nll_loss(log_p, y)
+        reference: https://openaccess.thecvf.com/content_CVPR_2019/papers/Cui_Class-Balanced_Loss_Based_on_Effective_Number_of_Samples_CVPR_2019_paper.pdf
 
-        all_rows = torch.arange(len(x))
-        log_pt = log_p[all_rows, y]
+        Args:
+            loss_type: string. One of "focal_loss", "cross_entropy",
+                "binary_cross_entropy", "softmax_binary_cross_entropy".
+            beta: float. Hyperparameter for Class balanced loss.
+            fl_gamma: float. Hyperparameter for Focal loss.
+            samples_per_class: A python list of size [num_classes].
+                Required if class_balance is True.
+            class_balanced: bool. Whether to use class balanced loss.
+            safe: bool. Whether to allow labels with no samples.
+        Returns:
+            Loss instance
+        """
+        super(Loss, self).__init__()
 
-        pt = log_pt.exp()
-        focal_term = (1 - pt)**self.gamma
+        if class_balanced is True and samples_per_class is None:
+            raise ValueError("samples_per_class cannot be None when class_balanced is True")
 
-        loss = focal_term * ce
+        self.loss_type = loss_type
+        self.beta = beta
+        self.fl_gamma = fl_gamma
+        self.samples_per_class = samples_per_class
+        self.class_balanced = class_balanced
+        self.safe = safe
 
-        if self.reduction == 'mean':
-            loss = loss.mean()
-        elif self.reduction == 'sum':
-            loss = loss.sum()
+    def forward(self, logits: torch.tensor, labels: torch.tensor):
+        """
+        Compute the Class Balanced Loss between `logits` and the ground truth `labels`.
+        Class Balanced Loss: ((1-beta)/(1-beta^n))*Loss(labels, logits)
+        where Loss is one of the standard losses used for Neural Networks.
 
-        return loss
+        Args:
+            logits: A float tensor of size [batch, num_classes].
+            labels: An int tensor of size [batch].
+        Returns:
+            cb_loss: A float tensor representing class balanced loss
+        """
+
+        batch_size = logits.size(0)
+        num_classes = logits.size(1)
+        labels_one_hot = F.one_hot(labels, num_classes).float()
+
+        if self.class_balanced:
+            effective_num = 1.0 - np.power(self.beta, self.samples_per_class)
+            # Avoid division by 0 error for test cases without all labels present.
+            if self.safe:
+                effective_num_classes = np.sum(effective_num != 0)
+                effective_num[effective_num == 0] = np.inf
+
+            else:
+                effective_num_classes = num_classes
+
+            weights = (1.0 - self.beta) / np.array(effective_num)
+            weights = weights / np.sum(weights) * effective_num_classes
+            weights = torch.tensor(weights, device=logits.device).float()
+
+            if self.loss_type != "cross_entropy":
+                weights = weights.unsqueeze(0)
+                weights = weights.repeat(batch_size, 1) * labels_one_hot
+                weights = weights.sum(1)
+                weights = weights.unsqueeze(1)
+                weights = weights.repeat(1, num_classes)
+        else:
+            weights = None
+
+        if self.loss_type == "focal_loss":
+            cb_loss = focal_loss(logits, labels_one_hot, alpha=weights, gamma=self.fl_gamma)
+        elif self.loss_type == "cross_entropy":
+            cb_loss = F.cross_entropy(input=logits, target=labels_one_hot, weight=weights, reduction='none')
+        elif self.loss_type == "binary_cross_entropy":
+            cb_loss = F.binary_cross_entropy_with_logits(input=logits, target=labels_one_hot, weight=weights)
+        elif self.loss_type == "softmax_binary_cross_entropy":
+            pred = logits.softmax(dim=1)
+            cb_loss = F.binary_cross_entropy(input=pred, target=labels_one_hot, weight=weights)
+        return cb_loss
 
 class TrackingLoss(nn.Module):
     
-    def __init__(self, gamma=2.0, loss='wcce', label_smoothing=False, class_weights='batch'):
+    def __init__(self, gamma=2.0, loss='wcce', label_smoothing=False, class_weights='batch', class_samples=None):
         super().__init__()
         
         self.weights = class_weights
@@ -115,9 +149,14 @@ class TrackingLoss(nn.Module):
         self.loss = loss
         self.pad_value = -1
         self.label_smoothing = label_smoothing
+        self.class_samples = class_samples
 
-        if self.loss == 'focal':
-            self.criterion = FocalLoss(alpha=self.weights, gamma=self.gamma)
+        if self.loss == 'balanced':
+            self.criterion = Loss(loss_type='cross_entropy', 
+                                  class_balanced=True, 
+                                  samples_per_class=self.class_samples,
+                                  safe=True)
+            
         # Standard CrossEntropyLoss with class weights
         elif self.loss == 'cce':
             self.criterion = nn.CrossEntropyLoss(reduction='none', 
@@ -346,7 +385,10 @@ class Trainer:
         self.log_dir = Path(log_dir +  self.log_suffix)
         self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
 
-        self.loss_fn = TrackingLoss(loss=loss, label_smoothing=self.label_smoothing, class_weights=self.class_weights)
+        self.loss_fn = TrackingLoss(loss=loss, 
+                                    label_smoothing=self.label_smoothing, 
+                                    class_weights=self.class_weights,
+                                    class_samples = train_loader.dataset.class_samples)
         
         # Move to device
         self.model = self.model.to(device)
@@ -382,7 +424,7 @@ class Trainer:
         metrics_tracker = MetricsTracker()
 
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]')
+        pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]', dynamic_ncols=True)
         
         for batch_idx, batch in enumerate(pbar):
 
@@ -416,7 +458,7 @@ class Trainer:
                 )
             
             self.optimizer.step()
-            
+
             # Update metrics
             with torch.no_grad():
                 metrics_tracker.update(loss, predictions, labels, mask)
@@ -440,7 +482,7 @@ class Trainer:
         self.model.eval()
         metrics_tracker = MetricsTracker()
         
-        pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch} [Val]')
+        pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch} [Val]', dynamic_ncols=True)
         
         for batch_idx, batch in enumerate(pbar):
 
@@ -492,7 +534,7 @@ class Trainer:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
         # Save regular checkpoint
-        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{self.current_epoch}.pt'
+        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{self.current_epoch:01d}.pt'
         
         # Save best checkpoint
         if is_best:
@@ -602,7 +644,9 @@ class Trainer:
                     break
             
             print()
-        
+
+        self.save_checkpoint(is_best=is_best)
+
         total_time = time.time() - start_time
         print("="*70)
         print(f"Training completed in {total_time/3600:.2f} hours")
@@ -726,15 +770,15 @@ if __name__ == "__main__":
     # Make config dictionary
 
     config = {
-        "optimizer": "adamw",
-        "learning_rate": 0.001,
+        "optimizer": "radam",
+        "learning_rate": 0.00001,
         "weight_decay": 0,
         "decay": 0.99,
-        "scheduler": "reduce_on_plateau",
-        "max_epochs": 50,
+        "scheduler": "cosine",
+        "max_epochs": 30,
         "batch_size": 4,
         "n_layers": 1,
-        "num_workers": 16,
+        "num_workers": 8,
         "clipnorm": 0.001,
         "step_size": 5,
         "crop_mode": "fixed",
@@ -744,10 +788,10 @@ if __name__ == "__main__":
         "crop_size": 32,
         "attention": False,
         "truncate_dataset": None,
-        "loss": "wcce",
+        "loss": "balanced",
         "t_direction": "forward",
         "processed": True,
-        "dropout": 0.2,
+        "dropout": 0,
         "device": "cuda:0",
         "label_smoothing": False,
         "stopping_metric": 'loss'
@@ -767,9 +811,6 @@ if __name__ == "__main__":
     
 
     # Create optimizer and rate scheduler
-
-    optimizer = create_optimizer(model, config)
-    scheduler = create_scheduler(optimizer, config)
     
     train_loader, val_loader, _ = create_trk_dataloaders(
         train_path='data/DynamicNuclearNet-tracking-v1_0/train_proc.zarr',
@@ -785,6 +826,10 @@ if __name__ == "__main__":
         processed=config['processed']
         )
 
+    val_loader.dataset.augment = False
+
+    optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config)
     
     trainer = Trainer(
         model=model,
@@ -797,12 +842,12 @@ if __name__ == "__main__":
         max_epochs=config['max_epochs'],
         gradient_clip=config['clipnorm'],
         enable_early_stopping=config['enable_early_stopping'],
-        log_and_save = True if config['truncate_dataset'] is None else False,
+        log_and_save = True if config['truncate_dataset'] is None else True,
         config=config,
         loss=config['loss'],
         label_smoothing = config['label_smoothing'],
         class_weights='batch',
-        stopping_metric = config['stopping_metric']
+        stopping_metric = config['stopping_metric'],
     )   
 
     # torch.tensor([2.177e-2, 6.713e-5, 2.97815741]).float()

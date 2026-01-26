@@ -75,11 +75,11 @@ class TrainingBranch(nn.Module):
         # The neighborhood encoder expects (batch*time, ...)
         
         # Reshape inputs: (B, T, N,...) -> (B*T*N, ...)
-        app_newshape = (batch_size * time_steps * max_cells, H, W, C)
+        app_newshape = (batch_size * time_steps, max_cells, H, W, C)
         app_reshaped = appearances.view(app_newshape)
         
-        morph_reshaped = morphologies.view((batch_size * time_steps * max_cells, 3))
-        cent_reshaped = centroids.reshape((batch_size * time_steps * max_cells, 2))
+        morph_reshaped = morphologies.view((batch_size * time_steps, max_cells, 3))
+        cent_reshaped = centroids.reshape((batch_size * time_steps, max_cells, 2))
         adj_reshaped = adj_matrices.view(batch_size*time_steps, max_cells, max_cells)
         
         # Encode features with neighborhood encoder

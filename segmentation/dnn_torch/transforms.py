@@ -154,6 +154,8 @@ def outer_distance_transform_2d(mask, bins=None, erosion_width=None,
             normalized_distance = 1 - labeled_distance / np.amax(labeled_distance)
             distance[label_matrix == prop.label] = normalized_distance
 
+    distance[mask == 0] = 0
+
     if bins is None:
         return distance
 
@@ -294,6 +296,8 @@ def inner_distance_transform_2d(mask, bins=None, erosion_width=None,
         coords_x = coords[:, 0]
         coords_y = coords[:, 1]
         inner_distance[coords_x, coords_y] = center_transform
+        
+    distance[mask == 0] = 0
 
     if bins is None:
         return inner_distance
@@ -587,15 +591,17 @@ def transform_masks(y, transform, data_format=None, mask_dtype=np.float32, **kwa
     elif transform == 'fgbg':
 
         y_transform = np.where(y > 1, 1, y)
-
-        # convert to one hot notation
-        if data_format == 'channels_first':
-            y_transform = np.rollaxis(y_transform, 1, y.ndim)
         
-        # using uint8 since should only be 2 unique values.
-        y_transform = to_categorical(y_transform, dtype=np.uint8)
+        # y_transform = nd.binary_erosion(y_transform, structure=np.ones((1,1,2,2))).astype(y_transform.dtype)
 
-        if data_format == 'channels_first':
-            y_transform = np.rollaxis(y_transform, y.ndim - 1, 1)
+        # # convert to one hot notation
+        # if data_format == 'channels_first':
+        #     y_transform = np.rollaxis(y_transform, 1, y.ndim)
+        
+        # # using uint8 since should only be 2 unique values.
+        # y_transform = to_categorical(y_transform, dtype=np.uint8)
+
+        # if data_format == 'channels_first':
+        #     y_transform = np.rollaxis(y_transform, y.ndim - 1, 1)
 
     return y_transform

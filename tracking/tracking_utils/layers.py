@@ -29,7 +29,7 @@ class ImageNormalization2D(nn.Module):
         
         self.norm_method = norm_method.lower() if isinstance(norm_method, str) else norm_method
         self.filter_size = filter_size
-        self.data_format = data_format
+        self.data_format = 'channels_first'
         
         # Channel axis: 1 for channels_first, -1 for channels_last
         self.channel_axis = 1 if data_format == 'channels_first' else -1
@@ -47,6 +47,7 @@ class ImageNormalization2D(nn.Module):
         if self.norm_method == 'whole_image':
             # Normalize each image independently
             # Keep dims for channel and batch
+
             mean = x.mean(dim=(2, 3), keepdim=True)
             std = x.std(dim=(2, 3), keepdim=True)
             x = (x - mean) / (std + 1e-7)

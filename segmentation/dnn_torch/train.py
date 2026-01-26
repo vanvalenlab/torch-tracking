@@ -4,46 +4,39 @@ torch.set_num_threads(24)
 import datetime
 
 from tqdm import tqdm
-
+import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 
 from model import PanopticNet
-from loss import SemanticLoss
+from loss import SemanticLoss, LossTracker
 from loaders import create_data_loaders
+from utils import create_sample_overlay
 
 import zarr
+
 
 def train_torch(
         dataloader,
         valloader,
-        crop_size=256,
-        backbone="resnet50",
+        model=None,
         lr=1e-4,
         epochs=8,
-        pyramid_levels=['P3','P4','P5'],
-        backbone_levels=['C1','C2','C3', 'C4','C5'],
         save_path_prefix = "data/saved_model",
         writer=None,
-        n_semantic_classes = [1,1,2]
+        write=True,
+        device='cuda:2'
     ):
 
-    model = PanopticNet(
-        crop_size=crop_size,
-        backbone=backbone,
-        pyramid_levels=pyramid_levels,
-        backbone_levels=backbone_levels,
-        n_semantic_classes=n_semantic_classes,
-    )
+    assert model is not None, "Please specify a model"
 
     # TODO: make embedded in dataloader instead of hard-coding it in here
     semantic_type = ['cont','cont','disc','disc']
 
+    n_semantic_classes = model.n_semantic_classes
+
     loss = SemanticLoss(n_semantic_classes=n_semantic_classes, semantic_type=semantic_type)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    decay_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.33, patience=5,)
 
     epoch_number = 0
@@ -51,22 +44,19 @@ def train_torch(
     best_vloss = 1000000
     patience_count = 0
 
-    model = model.to(device)
-
     for epoch in range(epochs):
 
-        print('EPOCH {}:'.format(epoch_number + 1))
-        print("TRAIN")
+        train_loss = LossTracker()
+        val_loss = LossTracker()
+
+        pbar_train = tqdm(dataloader, desc=f'Epoch {epoch} [Train]', dynamic_ncols=True)
 
         model.train()
 
-        running_loss_avg = 0.
-        count = 0
-
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
-
+        for i, batch in enumerate(pbar_train):
+            
             image, labels = batch
-            count += 1
+            batch_size = image.shape[0]
             
             image = image.to(device)
             labels = labels.to(device)
@@ -74,9 +64,13 @@ def train_torch(
             optimizer.zero_grad()
 
             outputs = model(image)
-            curr_loss = loss(outputs, labels)   
+            curr_loss = loss(outputs, labels) 
 
-            count += 1
+            train_loss.update(curr_loss, batch_size=batch_size)  
+
+            pbar_train.set_postfix({
+                'loss': f"{train_loss.get_loss():.4f}"
+            })
 
             curr_loss.backward()
 
@@ -84,58 +78,59 @@ def train_torch(
         
             optimizer.step()
 
-            running_loss_avg += curr_loss.item()
-
-
-        avg_loss = running_loss_avg/count
-        writer.add_scalar('avg_loss/train', avg_loss, epoch)
-
-        print("VAL")
-
-        vcount = 0
-        running_vloss_avg = 0.
+        writer.add_scalar('avg_loss/train', train_loss.get_loss(), epoch)
 
         model.eval()
-        
+        pbar_val = tqdm(valloader, desc=f'Epoch {epoch} [Train]', dynamic_ncols=True)
+
         with torch.no_grad():
             
-            for batch_idx, batch in enumerate(tqdm(valloader)):
-
+            for _, batch in enumerate(pbar_val):
                 image, labels = batch
-                vcount += 1
+
+                batch_size = image.shape[0]
                 
                 image = image.to(device)
                 labels = labels.to(device)
 
                 voutputs = model(image)
                 curr_vloss = loss(voutputs, labels)
-                    
-                running_vloss_avg += curr_vloss
 
-        avg_vloss = running_vloss_avg/vcount
+                val_loss.update(curr_vloss, batch_size=batch_size)  
+
+                pbar_val.set_postfix({
+                    'loss': f"{val_loss.get_loss():.4f}"
+                })
+
+        # Shape 4, H, W
+        sampled_label = labels[0]
+        sampled_transforms = voutputs[0]
+
+        figure = create_sample_overlay(sampled_label, sampled_transforms)
+
+        avg_vloss = val_loss.get_loss()
+        
         writer.add_scalar('avg_loss/val', avg_vloss, epoch)
+        writer.add_figure('sample_image', figure, epoch)
 
-        decay_scheduler.step()
         plateau_scheduler.step(avg_vloss)
-        
-        
-        # Save model periodically
-        if (epoch+1)%10==0:
-            epoch_path_prefix = save_path_prefix + "/model_epoch" + str(epoch+1) + "_dict.pth"
-            
-            torch.save(model.state_dict(), epoch_path_prefix)
-        
+                
         if avg_vloss<best_vloss:
             best_vloss = avg_vloss
-            dict_save_path = save_path_prefix + "/saved_model_best_dict.pth"
             
-            torch.save(model.state_dict(), dict_save_path)
+            if write:
+                dict_save_path = save_path_prefix + "/saved_model_best_dict.pth"
+                torch.save(model.state_dict(), dict_save_path)
+
             patience_count = 0
-            print("Saved new best model.")
+            print()
+            print("New best model.")
+            print()
+
         else:
             patience_count += 1
             
-        print('LOSS train {} valid {}'.format(avg_loss, avg_vloss))
+        print('LOSS train {} valid {}'.format(train_loss.get_loss(), val_loss.get_loss()))
 
         epoch_number += 1
 
@@ -150,21 +145,22 @@ def main():
         'model_path': "data/segmentation/model/",
         'data_path': 'data/DynamicNuclearNet-segmentation-v1_0',
         'run_info': 'data/segmentation/logs/',
-        'epochs': 16,
+        'epochs': 32,
         'seed': 0,
-        'min_objects': 1,
         'zoom_min': 0.75,
-        'batch_size': 24,
+        'batch_size': 16,
         'backbone': 'efficientnetv2bl',
         'crop_size': 256,
-        'lr': 1e-4,
+        'lr': 1e-5,
         'outer_erosion_width': 1,
         'inner_distance_alpha': 'auto',
         'inner_distance_beta': 1,
         'inner_erosion_width': 0,
-        'pyramid_levels': ['P3','P4','P5'],
-        'backbone_levels': ['C1','C2','C3', 'C4','C5'],
-        'num_workers': 24
+        'pyramid_levels': ['P3', 'P4', 'P5'],
+        'backbone_levels': ['C1', 'C2', 'C3', 'C4', 'C5'],
+        'num_workers': 24,
+        'write': True,
+        'device': 'cuda:2'
     }
 
     curr_time = f"{datetime.datetime.now():%Y%m%d%H%M%S}"
@@ -177,10 +173,35 @@ def main():
     
     if not os.path.isdir(run_info):
         os.makedirs(run_info, exist_ok=True)
-    if not os.path.isdir(model_path):
+    if not os.path.isdir(model_path) and config['write']:
         os.makedirs(model_path, exist_ok=True)
 
     writer = SummaryWriter(run_info)
+    
+    print("Initializing model:")
+    print()
+
+    model = PanopticNet(
+        crop_size=config['crop_size'],
+        backbone=config['backbone'],
+        pyramid_levels=config['pyramid_levels'],
+        backbone_levels=config['backbone_levels'],
+        n_semantic_classes = [1,1,2]
+    )
+
+    model = model.to(config['device'])
+
+    # Dummy data for initializing the model weight IDs
+
+    dummy_data = torch.rand(1, 1, config['crop_size'], config['crop_size']).to(config['device'])
+
+    _ = model(dummy_data)
+
+    del dummy_data
+
+    print("Panoptic Model:")
+    print(f"    Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print()
 
     # Set up data generators with updated data
     train_data, val_data = create_data_loaders(
@@ -202,17 +223,15 @@ def main():
     model = train_torch(
         train_data,
         val_data,
-        crop_size=config['crop_size'],
-        backbone=config['backbone'],
+        model=model,
         lr=config['lr'],
         epochs=config['epochs'],
-        pyramid_levels=config['pyramid_levels'],
         save_path_prefix=model_path,
-        writer=writer
+        writer=writer,
+        write=config['write']
     )
 
     writer.close()
-    torch.save(model.state_dict(), config['model_path']+'last_model_dict.pth')
 
 if __name__ == "__main__":
     main()

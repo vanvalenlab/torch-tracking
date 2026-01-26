@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torchvision.models import efficientnet_v2_l
 from torchvision.models.efficientnet import EfficientNet_V2_L_Weights
+import numpy as np
 
 class BackboneNetwork(nn.Module):
 
@@ -48,39 +49,50 @@ class BackboneNetwork(nn.Module):
         return backbone_features
 
 class FeaturePyramidNetwork(nn.Module):
+    """Feature Pyramid Network following standard FPN convention."""
 
-    def __init__(self, levels = ['P3','P4','P5'], feature_size=256, interpolation='bilinear'):
-
-        # n_levels should be the length of the pyramid levels list
-        # or better yet, just put in the levels parameter
-
+    def __init__(self, levels=['P3', 'P4', 'P5'], feature_size=256, interpolation='bilinear'):
         super().__init__()
-        self.levels = nn.ModuleDict()
+        
+        # Validate that levels are in ascending order (P3, P4, P5)
+        if levels:
+            level_nums = [int(level[1:]) for level in levels]
+            assert level_nums == sorted(level_nums), \
+                f"Pyramid levels must be in ascending order (e.g., ['P3', 'P4', 'P5']), got {levels}"
+        
         self.level_list = levels
-
-        for i, curr_level in enumerate(levels):
-            has_addition = (i > 0) # All except deepest levels are added
-
-            level = PyramidLevel(
+        self.feature_size = feature_size
+        self.levels = nn.ModuleDict()
+        
+        # Build levels in reverse order (coarsest first)
+        for i, curr_level in enumerate(reversed(levels)):
+            has_addition = (i > 0)  # All except coarsest receive top-down
+            
+            self.levels[curr_level] = PyramidLevel(
                 feature_size=feature_size, 
                 has_addition=has_addition, 
                 interpolation=interpolation
-                )
-            
-            self.levels[curr_level] = level
+            )
 
     def forward(self, backbone_features) -> dict:
-
-        # backbone features have five elements, but we only care about
-        # the top 3 (C5, C4, and C3 in that order)
-
         pyramid_outputs = {}
         from_above = None
-
+        
+        # Build top-down: P5 → P4 → P3
         for pyr_level in reversed(self.level_list):
-            backbone_level = pyr_level.replace('P','C')
-            output, upsampled = self.levels[pyr_level](backbone_features[backbone_level], from_above)
-
+            backbone_level = pyr_level.replace('P', 'C')
+            
+            if backbone_level not in backbone_features:
+                raise KeyError(
+                    f"Backbone level {backbone_level} not found. "
+                    f"Available: {list(backbone_features.keys())}"
+                )
+            
+            output, upsampled = self.levels[pyr_level](
+                backbone_features[backbone_level], 
+                from_above
+            )
+            
             pyramid_outputs[pyr_level] = output
             from_above = upsampled
         
@@ -120,54 +132,155 @@ class PyramidLevel(nn.Module):
         return output, upsampled
     
 
+# In modules.py - Replace SemanticHead class
+
 class SemanticHead(nn.Module):
-    """Semantic segmentation head that upsamples pyramid features."""
+    """Semantic segmentation head that fuses multi-scale pyramid features.
     
-    def __init__(self, in_channels=256, n_classes=2, 
-                 n_upsample=2, n_dense=128, interpolation='bilinear'):
+    Automatically adapts to actual pyramid feature map sizes.
+    """
+    
+    def __init__(self, 
+                 n_classes=2,
+                 feature_size=256,
+                 pyramid_levels=['P3', 'P4', 'P5'],
+                 crop_size=256,
+                 n_dense=128,
+                 interpolation='bilinear'):
+        """
+        Args:
+            n_classes: Number of output classes
+            feature_size: Number of channels in pyramid features
+            pyramid_levels: List of pyramid level names (e.g., ['P3', 'P4', 'P5'])
+            crop_size: Target output spatial size
+            n_dense: Number of channels in dense layer
+            interpolation: Upsampling interpolation mode
+        
+        Note: Spatial sizes are inferred dynamically during forward pass
+        """
         super().__init__()
         
-        # Upsampling path with conv blocks
-        upsample_blocks = []
-        for i in range(n_upsample):
-            upsample_blocks.extend([
-                nn.Conv2d(in_channels, in_channels, 
-                         kernel_size=3, padding=1),
-                nn.Upsample(scale_factor=2, mode=interpolation)
-            ])
-        self.upsample_path = nn.Sequential(*upsample_blocks)
+        self.pyramid_levels = pyramid_levels
+        self.n_levels = len(pyramid_levels)
+        self.feature_size = feature_size
+        self.crop_size = crop_size
+        self.interpolation = interpolation
+        
+        # We'll build the upsampling paths lazily on first forward pass
+        self.level_processors = None
+        self._initialized = False
+        
+        # Fusion layer: concatenate all levels then reduce to feature_size
+        self.fusion_conv = nn.Conv2d(
+            feature_size * self.n_levels,
+            feature_size,
+            kernel_size=1
+        )
+        self.fusion_bn = nn.BatchNorm2d(feature_size)
+        self.fusion_relu = nn.ReLU(inplace=True)
         
         # Dense processing
-        self.dense_conv = nn.Conv2d(in_channels, n_dense, kernel_size=1)
+        self.dense_conv = nn.Conv2d(feature_size, n_dense, kernel_size=1)
         self.bn = nn.BatchNorm2d(n_dense)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
         
         # Output head
         self.output_conv = nn.Conv2d(n_dense, n_classes, kernel_size=1)
         
-        # Final activation depends on n_classes
+        # Final activation
         if n_classes > 1:
             self.final_activation = nn.Softmax(dim=1)
         else:
             self.final_activation = nn.ReLU()
     
-    def forward(self, pyramid_feature):
+    def _build_upsampling_paths(self, pyramid_features):
+        """Build upsampling paths based on actual pyramid feature sizes."""
+        self.level_processors = nn.ModuleDict()
+        
+        for level in self.pyramid_levels:
+            feat = pyramid_features[level]
+            current_size = feat.shape[-1]  # Assume square feature maps
+            
+            # Calculate number of 2x upsamples needed
+            n_upsample = int(np.log2(self.crop_size / current_size))
+            
+            if n_upsample < 0:
+                raise ValueError(
+                    f"Feature map for {level} is {current_size}×{current_size}, "
+                    f"larger than crop_size {self.crop_size}. Cannot upsample."
+                )
+            
+            # Build upsampling path
+            upsample_blocks = []
+            for _ in range(n_upsample):
+                upsample_blocks.extend([
+                    nn.Conv2d(self.feature_size, self.feature_size, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Upsample(scale_factor=2, mode=self.interpolation)
+                ])
+            
+            if upsample_blocks:
+                self.level_processors[level] = nn.Sequential(*upsample_blocks)
+            else:
+                self.level_processors[level] = nn.Identity()
+        
+        # Move to same device as the pyramid features
+        device = next(iter(pyramid_features.values())).device
+        self.level_processors = self.level_processors.to(device)
+        
+        self._initialized = True
+        
+        # Print info for debugging
+        print(f"    SemanticHead initialized with pyramid feature sizes:")
+        for level in self.pyramid_levels:
+            size = pyramid_features[level].shape[-1]
+            n_up = int(np.log2(self.crop_size / size))
+            print(f"    {level}: {size}x{size} → {self.crop_size}x{self.crop_size} ({n_up} upsamples)")
+        print()
+
+    def forward(self, pyramid_features):
         """
         Args:
-            pyramid_feature: feature from FPN (typically P3)
+            pyramid_features: dict of pyramid features {'P3': tensor, 'P4': tensor, ...}
         
         Returns:
-            segmentation output at input resolution
+            Segmentation output at crop_size resolution
         """
-        # Upsample to input resolution
-        x = self.upsample_path(pyramid_feature)
+        # Initialize upsampling paths on first forward pass
+        if not self._initialized:
+            self._build_upsampling_paths(pyramid_features)
+        
+        # Upsample each pyramid level to output resolution
+        upsampled_features = []
+        for level in self.pyramid_levels:
+            feat = pyramid_features[level]
+            upsampled = self.level_processors[level](feat)
+            
+            # Sanity check
+            expected_size = self.crop_size
+            actual_size = upsampled.shape[-1]
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"Upsampling failed for {level}: expected {expected_size}×{expected_size}, "
+                    f"got {actual_size}×{actual_size}"
+                )
+            
+            upsampled_features.append(upsampled)
+        
+        # Concatenate along channel dimension
+        fused = torch.cat(upsampled_features, dim=1)
+        
+        # Reduce channels back to feature_size
+        x = self.fusion_conv(fused)
+        x = self.fusion_bn(x)
+        x = self.fusion_relu(x)
         
         # Dense processing
         x = self.dense_conv(x)
         x = self.bn(x)
         x = self.relu(x)
         
-        # Output
+        # Output prediction
         x = self.output_conv(x)
         x = self.final_activation(x)
         
@@ -188,7 +301,7 @@ class Location2D(torch.nn.Module):
         super().__init__()
 
     def forward(self, inputs):
-        input_shape = inputs.size()
+        input_shape = inputs.shape
         input_device = inputs.device
         input_dtype = inputs.dtype
         
@@ -217,58 +330,3 @@ class Location2D(torch.nn.Module):
         location = torch.permute(location, dims=[0, 3, 1, 2])
 
         return location
-    
-if __name__ == '__main__':
-    print()
-
-    config = {
-        'model_path': "data/segmentation/model/",
-        'data_path': 'data/DynamicNuclearNet-segmentation-v1_0',
-        'run_info': 'data/segmentation/logs/',
-        'epochs': 16,
-        'seed': 0,
-        'min_objects': 1,
-        'zoom_min': 0.75,
-        'batch_size': 12,
-        'backbone': 'efficientnetv2bl',
-        'crop_size': 256,
-        'lr': 1e-4,
-        'outer_erosion_width': 1,
-        'inner_distance_alpha': 'auto',
-        'inner_distance_beta': 1,
-        'inner_erosion_width': 0,
-        'pyramid_levels': ['P3','P4','P5'],
-        'backbone_levels': ['C1','C2','C3', 'C4','C5'],
-        'num_workers': 16
-    }
-
-    backbone_levels=config['backbone_levels']
-    pyr_levels = config['pyramid_levels']
-
-    ## Test Location 2D 
-    # expecting from an input of shape (B, 1, H, W)
-    # output of (B, 2, H, W)
-
-    location = Location2D()
-    test = torch.rand(8, 1, 256, 256)
-    loc = location(test)
-
-    ## Test Semantic Head
-    # expecting from an input of shape (B, 1, H, W)
-    # output of (B, 2, H, W)
-
-    ## Test BackboneNetwork
-    bbnet = BackboneNetwork()
-    test = torch.rand(8, 3, 256, 256)
-    bb_out = bbnet(test)
-
-    # From outputs of BackboneNetwork, test FPN
-
-    fpn = FeaturePyramidNetwork(levels=pyr_levels)
-    fpn_out = fpn(bb_out)
-
-    head = SemanticHead()
-    test = torch.rand(8, 256, 64, 64)
-    output = head(fpn_out['P3'])
-    print(output.shape)
-    
