@@ -13,6 +13,8 @@ from metrics import Metrics
 from scipy.stats import hmean
 import numpy as np
 
+import pandas as pd
+
 
 def evaluate(y_pred, y_test):
     m = Metrics("DVC Mesmer")
@@ -77,19 +79,19 @@ def main():
     config = {
         'eval_info': 'data/segmentation/eval',
         'data_path': 'data/DynamicNuclearNet-segmentation-v1_0',
-        'model_path': 'data/segmentation/model/20260123191546/saved_model_best_dict.pth'
-
+        'model_path': 'data/segmentation/model/20260126142939/saved_model_best_dict.pth'
     }
 
     postprocess_kwargs = {
                 'radius': 10,
                 'maxima_threshold': 0.05,
-                'reduced_threshold': 0.05,
-                'transform_thresh': 0.9,
+                'reduced_thresh': 0.05,
+                'transform_thresh': 0.0,
                 'n_iter': 100,
                 'step_size': 0.5,
-                'eccentricity': 0.9,
+                'eccentricity': 1.0,
                 'postprocess_method': 'hybrid',
+                'relevant_counts': 100,
                 'small_objects_threshold': 0
             }
         
@@ -97,8 +99,19 @@ def main():
 
     z_test = zarr.open(f"{config['data_path']}/test.zarr")
 
+    meta_test = pd.read_json(f"{config['data_path']}/test.json")
+
+    test_mpps = meta_test['pixel_size'].to_numpy()
+
     X_test = z_test['X'][:]
     y_test = z_test['y'][:]
+
+    if test_mpps is not None:
+        good_mpps = ~np.isnan(test_mpps)
+
+        X_test = X_test[good_mpps]
+        y_test = y_test[good_mpps]
+        test_mpps = test_mpps[good_mpps]
 
     y_test = np.moveaxis(y_test, -1, 1)
 

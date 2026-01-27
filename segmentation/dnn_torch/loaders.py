@@ -12,7 +12,8 @@ class SegmentationDataset(Dataset):
 
     def __init__(self, 
                  X, 
-                 y, 
+                 y,
+                 mpps = None, 
                  in_transforms=['outer-distance'], 
                  transforms_kwargs={}, 
                  augment=True, 
@@ -21,7 +22,7 @@ class SegmentationDataset(Dataset):
                  rotation_range=180,
                  zoom=0.75,
                  preprocess=False,
-                 poisson_rate = 0.2,
+                 target_mpp = 0.65
                  ):
         
         self.X = X[:]
@@ -35,7 +36,18 @@ class SegmentationDataset(Dataset):
         self.rotation_range = rotation_range
         self.zoom = zoom
         self.preprocess = preprocess
-        self.poisson_rate = poisson_rate
+        self.mpps = mpps
+        self.target_mpp = target_mpp
+
+        # Filter out where pixel size is not defined
+        # Need pixel size to be fixed for model
+        if self.mpps is not None:
+
+            good_mpps = ~np.isnan(self.mpps)
+
+            self.X = self.X[good_mpps]
+            self.y = self.y[good_mpps]
+            self.mpps = self.mpps[good_mpps]
 
         # Convert to channels first format if necessary
         if self.data_format == 'channels_last':
@@ -90,15 +102,15 @@ class SegmentationDataset(Dataset):
 
         return semantic_continuous, semantic_discrete
     
-    def _augment(self, image, mask_continuous, mask_discrete):
+    def _augment(self, image, mask_continuous, mask_discrete, scale_factor):
 
         # Generate random parameters once
         angle = random.uniform(-self.rotation_range, self.rotation_range)
 
         # Zoom parameters
         scale = (
-            int(random.uniform(self.zoom * self.crop_size, (1/self.zoom) * self.crop_size)),
-            int(random.uniform(self.zoom * self.crop_size, (1/self.zoom) * self.crop_size))
+            int(random.uniform(self.zoom * self.crop_size, (1/self.zoom) * self.crop_size) * scale_factor),
+            int(random.uniform(self.zoom * self.crop_size, (1/self.zoom) * self.crop_size) * scale_factor)
         )
 
         # Random crop parameters
@@ -153,35 +165,17 @@ class SegmentationDataset(Dataset):
         return image, mask_continuous, mask_discrete
 
     def __len__(self):
-        return self.X.shape[0]
+            return self.X.shape[0]
 
     def __getitem__(self, idx):
 
-        if self.preprocess:
-            x = self.X_norm[idx]
-            semantic_continuous = self.semantic_continuous[idx]
-            semantic_discrete = self.semantic_discrete[idx]
-        
-        else:
+        scale_factor = self.target_mpp / self.mpps[idx]
 
-            replace_poisson = self.poisson_rate > random.random()
+        # Indexing for histogram normalization allows for no batches
+        x = self._normalize(self.X[idx])
 
-            if replace_poisson:
-                C, H, W = self.X[idx].shape
-                
-                x = np.random.poisson(100, (C, H, W)) + 1
-                x = self._normalize(x)
-
-                semantic_continuous = np.zeros((C, 2, H, W))
-                semantic_discrete = np.zeros((C, 1, H, W))
-
-            else:
-            # Indexing for histogram normalization allows for no batches
-                x = self._normalize(self.X[idx])
-
-                # Indexing for transformations requires batches -- use slicing
-                semantic_continuous, semantic_discrete = self._transform_labels(self.y[slice(idx, idx+1)])
-
+        # Indexing for transformations requires batches -- use slicing
+        semantic_continuous, semantic_discrete = self._transform_labels(self.y[slice(idx, idx+1)])
 
         # Convert to tensors
         x = torch.from_numpy(x).float()
@@ -190,7 +184,7 @@ class SegmentationDataset(Dataset):
 
         if self.augment:
             # crop and also augment
-            x, semantic_continuous, semantic_discrete = self._augment(x, semantic_continuous, semantic_discrete)
+            x, semantic_continuous, semantic_discrete = self._augment(x, semantic_continuous, semantic_discrete, scale_factor)
             
             y = torch.cat([
                 semantic_continuous.squeeze(),
@@ -198,9 +192,13 @@ class SegmentationDataset(Dataset):
             ], axis=0)
         
         else:
+            scale = (
+                int(self.crop_size * scale_factor),
+                int(self.crop_size * scale_factor)
+            )
 
             i, j, h, w = transforms.RandomCrop.get_params(
-                x, output_size=(self.crop_size, self.crop_size))
+                x, output_size=scale)
                         
             semantic_discrete = torch.cat([
                 torch.logical_not(semantic_discrete.clone()),
@@ -220,6 +218,8 @@ class SegmentationDataset(Dataset):
 def create_data_loaders(
     train,
     val,
+    train_mpps = None,
+    val_mpps = None,
     crop_size=256,
     zoom_min=0.75,
     batch_size=16,
@@ -256,6 +256,7 @@ def create_data_loaders(
         train_dataset = SegmentationDataset(
             train['X'], 
             train['y'],
+            mpps = train_mpps,
             crop_size=crop_size,
             zoom=zoom_min,
             data_format=data_format,
@@ -269,15 +270,15 @@ def create_data_loaders(
     if val is not None:
         val_dataset = SegmentationDataset(
             val['X'], 
-            val['y'], 
+            val['y'],
+            mpps = val_mpps, 
             crop_size=crop_size,
             zoom=zoom_min,
             data_format=data_format,
             in_transforms=in_transforms, 
-            augment=False,
+            augment=True,
             preprocess=preprocess,
-            transforms_kwargs=transforms_kwargs,
-            poisson_rate=-1)  
+            transforms_kwargs=transforms_kwargs)  
       
         valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 

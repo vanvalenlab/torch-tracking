@@ -12,8 +12,6 @@ from scipy.spatial.distance import cdist
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-import skimage
-
 def get_gradients(transform, foreground_tensor, transform_thresh = 0.99):
     # Move to device and ensure correct dtypes
 
@@ -284,4 +282,4 @@ def merge_nearby_points(points, r):
     
     merged_points = merged_points.astype(int)
     
-    return merged_points, labels
+    return merged_points

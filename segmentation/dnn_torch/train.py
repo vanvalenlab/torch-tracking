@@ -14,6 +14,10 @@ from utils import create_sample_overlay
 
 import zarr
 
+import pandas as pd
+
+import numpy as np
+
 
 def train_torch(
         dataloader,
@@ -38,8 +42,6 @@ def train_torch(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.33, patience=5,)
-
-    epoch_number = 0
 
     best_vloss = 1000000
     patience_count = 0
@@ -130,9 +132,9 @@ def train_torch(
         else:
             patience_count += 1
             
-        print('LOSS train {} valid {}'.format(train_loss.get_loss(), val_loss.get_loss()))
-
-        epoch_number += 1
+        print(f'Training loss: {train_loss.get_loss():.3f}')
+        print(f'Validation loss: {val_loss.get_loss():.3f}')
+        print()
 
         if patience_count >= 10:
             break
@@ -145,8 +147,7 @@ def main():
         'model_path': "data/segmentation/model/",
         'data_path': 'data/DynamicNuclearNet-segmentation-v1_0',
         'run_info': 'data/segmentation/logs/',
-        'epochs': 32,
-        'seed': 0,
+        'epochs': 20,
         'zoom_min': 0.75,
         'batch_size': 16,
         'backbone': 'efficientnetv2bl',
@@ -167,6 +168,12 @@ def main():
 
     z_train = zarr.open(f"{config['data_path']}/train.zarr")
     z_val = zarr.open(f"{config['data_path']}/val.zarr")
+
+    meta_train = pd.read_json(f"{config['data_path']}/train.json")
+    meta_val = pd.read_json(f"{config['data_path']}/val.json")
+
+    train_mpps = meta_train['pixel_size'].to_numpy()
+    val_mpps = meta_val['pixel_size'].to_numpy()
 
     run_info = config['run_info'] + '/' + curr_time
     model_path = config['model_path'] + '/' + curr_time
@@ -207,6 +214,8 @@ def main():
     train_data, val_data = create_data_loaders(
         z_train,
         z_val,
+        train_mpps=train_mpps,
+        val_mpps=val_mpps,
         crop_size=config['crop_size'],
         zoom_min=config['zoom_min'],
         batch_size=config['batch_size'],

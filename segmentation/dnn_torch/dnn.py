@@ -9,7 +9,6 @@ from utils import resize, histogram_normalization
 from model import PanopticNet
 import math
 import skimage
-from sklearn.cluster import DBSCAN
 from postprocess_utils import merge_nearby_points
 from skimage.measure import regionprops
 
@@ -62,13 +61,14 @@ class DNN():
         self.n_iter = self.postprocess_kwargs.get('n_iter', 200)
         self.step_size = self.postprocess_kwargs.get('step_size', 0.1)
         self.postprocess_method = self.postprocess_kwargs.get('postprocess_method','classical')
+        self.transform_thresh = self.postprocess_kwargs.get('transform_thresh', 0.05)
+        self.reduced_thresh = self.postprocess_kwargs.get('reduced_thresh', 0.05)
+        self.relevant_counts = self.postprocess_kwargs.get('relevant_counts', 20)
 
         if self.postprocess_kwargs['small_objects_threshold'] == 'auto':
-            self.small_objects_threshold = np.pi * self.postprocess_kwargs['radius'] ** 2
+            self.small_objects_threshold = np.pi * (self.postprocess_kwargs['radius']/2) ** 2
         else:
             self.small_objects_threshold = self.postprocess_kwargs['small_objects_threshold']
-
-        self.cluster = DBSCAN(eps=postprocess_kwargs['radius'], min_samples = 5)
 
     def _preprocess(self, x):
 
@@ -80,20 +80,11 @@ class DNN():
 
     def _resize_input(self, x):
 
-        # Handle case where image is smaller than the model
-        if self.H < 256:
-            self.n_tiles_h = 1
-        else:
-            self.n_tiles_h = math.ceil(self.H / self.image_shape)
+        upscale_H = self.H * self.resize_factor
+        upscale_W = self.W * self.resize_factor
+        new_size = (int(upscale_H), int(upscale_W))
 
-        if self.W < 256:
-            self.n_tiles_w = 1
-        else:
-            self.n_tiles_w = math.ceil(self.W / self.image_shape)
-        
-        square_size = (self.n_tiles_h * self.image_shape, self.n_tiles_w * self.image_shape)
-
-        x = fvision.resize(x, square_size, interpolation = fvision.InterpolationMode.BILINEAR)
+        x = fvision.resize(x, new_size, interpolation = fvision.InterpolationMode.BILINEAR)
 
         return x
     
@@ -152,18 +143,21 @@ class DNN():
         C = self.out_channels
 
         stride = self.image_shape - overlap
+
+        upscale_H = int(self.H * self.resize_factor)
+        upscale_W = int(self.W * self.resize_factor)
         
         # Calculate number of tiles per dimension (must match tile_with_overlap)
-        nh = int(np.ceil((self.H - self.image_shape) / stride)) + 1
-        nw = int(np.ceil((self.W - self.image_shape) / stride)) + 1
+        nh = int(np.ceil((upscale_H - self.image_shape) / stride)) + 1
+        nw = int(np.ceil((upscale_W - self.image_shape) / stride)) + 1
         tiles_per_frame = nh * nw
         
         # Create blending weight matrix
         weight_tile = self._create_blend_mask(self.image_shape, overlap, tiles.device)
         
         # Create output tensor for all frames
-        output = torch.zeros(T, C, self.H, self.W, device=tiles.device)
-        weights = torch.zeros(T, C, self.H, self.W, device=tiles.device)
+        output = torch.zeros(T, C, upscale_H, upscale_W, device=tiles.device)
+        weights = torch.zeros(T, C, upscale_H, upscale_W, device=tiles.device)
         
         # Process each frame
         for t in range(T):
@@ -176,12 +170,12 @@ class DNN():
                 for j in range(nw):
                     # Match the tiling logic exactly
                     if i == nh - 1:
-                        h_start = self.H - self.image_shape
+                        h_start = upscale_H - self.image_shape
                     else:
                         h_start = i * stride
                         
                     if j == nw - 1:
-                        w_start = self.W - self.image_shape
+                        w_start = upscale_W - self.image_shape
                     else:
                         w_start = j * stride
                     
@@ -237,16 +231,6 @@ class DNN():
 
         return x
     
-    def _minmax(self, x):
-
-        arr_flat = x.reshape(x.shape[0], x.shape[1], -1)
-
-        min_vals = arr_flat.min(axis=2, keepdims=True).reshape(x.shape[0], x.shape[1], 1, 1)
-        max_vals = arr_flat.max(axis=2, keepdims=True).reshape(x.shape[0], x.shape[1], 1, 1)
-
-        x_normalized = (x - min_vals) / (max_vals - min_vals + 1e-8)
-
-        return x_normalized
 
     def _get_gradients(self, transform, foreground_tensor):
         # Move to device and ensure correct dtypes
@@ -321,149 +305,80 @@ class DNN():
 
         label_image = np.zeros((self.curr_batch_size, 1, self.H, self.W), dtype=int)
 
-        if self.postprocess_method == 'classical':
+        pbar = tqdm(range(self.curr_batch_size), desc="Postprocessing", leave=False, colour='#CE2029')
 
-            x = x.cpu().numpy()
+        for t in pbar:
 
-            pbar = tqdm(range(self.curr_batch_size), desc="Postprocessing on batch", leave=False, colour='#CE2029')
+            x_inner = x[t, 0].cpu().numpy()
+            x_outer = x[t, 1].cpu().numpy()
+            x_foreground = x[t, 3].cpu().numpy()
+            x_background = x[t, 2].cpu().numpy()
 
-            for t in pbar:
-
-                x_temp = x[t]
-                
-                inner_transform = np.where(x_temp[3] > self.postprocess_kwargs['transform_thresh'], x_temp[0], 0)
-                outer_transform = np.where(x_temp[3] > self.postprocess_kwargs['transform_thresh'], x_temp[1], 0)
-
-                inner_transform = skimage.filters.gaussian(inner_transform, sigma=1, channel_axis=0)
-                outer_transform = skimage.filters.gaussian(outer_transform, sigma=1, channel_axis=0)
+            if self.postprocess_method == 'classical':
 
                 markers = skimage.morphology.h_maxima(
-                    inner_transform, 
+                    x_inner, 
                     h=self.postprocess_kwargs['maxima_threshold'], 
                     footprint=skimage.morphology.disk(self.postprocess_kwargs['radius'])
                 )
-                
-                markers = skimage.measure.label(markers)
 
-                label_temp = skimage.segmentation.watershed(
-                    -1 * (inner_transform + outer_transform), 
-                    markers, 
-                    mask= (inner_transform + outer_transform) > self.postprocess_kwargs['reduced_threshold'], 
-                    watershed_line=True
-                )
+            if self.postprocess_method == 'hybrid':
 
-                label_image[t], _, _ = skimage.segmentation.relabel_sequential(label_temp)
-                label_image[t] = skimage.morphology.area_closing(label_image[t].squeeze())
-
-                if self.small_objects_threshold > 0.:
-                    large_objects = skimage.morphology.remove_small_objects(label_image[t] > 0, min_size=self.small_objects_threshold)
-                    label_image[t] = label_image[t] * large_objects
-                
-                if self.postprocess_kwargs['eccentricity'] < 1.:
-                    for prop in regionprops(label_image[t].squeeze()):
-                        label_ = prop.label
-                        if prop.eccentricity > self.postprocess_kwargs['eccentricity']:
-                            label_image = np.where(label_image[t] == label_, 0, label_image)
-
-
-            label_image = label_image.astype(int)
-
-        if self.postprocess_method == 'hybrid':
-
-            pbar = tqdm(range(self.curr_batch_size), desc="Postprocessing", leave=False, colour='#CE2029')
-
-            for t in pbar:
-
-                x_temp = x[t].cpu().numpy()
-                
-                inds = torch.argwhere(x[t,3] > self.postprocess_kwargs['transform_thresh']).t().cpu().numpy()
-                positions = self._get_positions(x[t,0])
-                gx, gy = self._get_gradients(x[t,0], x[t,3])
-
+                positions = self._get_positions(x[t, 0])
+                gx, gy = self._get_gradients(x[t, 0], x[t, 3])
                 positions = self._follow_flows(positions, gx, gy, niter=self.n_iter, step_size=self.step_size)
+
+                inds = torch.argwhere(x[t,3] > self.transform_thresh).t().cpu().numpy()
 
                 relevant = positions[inds[0], inds[1]].cpu().numpy().astype(int)
                 relevant, relevant_counts = np.unique(relevant, axis=0, return_counts=True)
 
-                x_temp = x[t].cpu().numpy()
-
-                inner_transform = np.where(x_temp[3] > self.postprocess_kwargs['transform_thresh'], x_temp[0], 0)
-                outer_transform = np.where(x_temp[3] > self.postprocess_kwargs['transform_thresh'], x_temp[1], 0)
-
-                inner_transform = skimage.filters.gaussian(inner_transform, sigma=1, channel_axis=0)
-                outer_transform = skimage.filters.gaussian(outer_transform, sigma=1, channel_axis=0)
+                relevant = relevant[relevant_counts > self.relevant_counts]
+                relevant = merge_nearby_points(relevant, r=self.postprocess_kwargs['radius'])
 
                 markers = np.zeros((self.H, self.W))
-
-                #TODO: Make keyword argument
-                relevant = relevant[relevant_counts > 50]
 
                 for i in range(relevant.shape[0]):
                     curr_point = relevant[i]
                     markers[curr_point[0], curr_point[1]] = 1
 
-                markers = skimage.measure.label(markers)
+            markers = skimage.measure.label(markers)
 
-                label_temp = skimage.segmentation.watershed(
-                    -1 * (inner_transform + outer_transform), 
-                    markers, 
-                    mask= (inner_transform + outer_transform) > self.postprocess_kwargs['reduced_threshold'], 
-                    watershed_line=True
-                )
+            x_inner = skimage.filters.gaussian(x_inner, sigma=1, channel_axis=0)
+            x_outer = skimage.filters.gaussian(x_outer, sigma=1, channel_axis=0)
 
-                label_image[t], _, _ = skimage.segmentation.relabel_sequential(label_temp)
-                label_image[t] = skimage.morphology.area_closing(label_image[t].squeeze())
+            label_temp = skimage.segmentation.watershed(
+                -1 * (x_inner + x_outer), 
+                markers, 
+                mask= x_foreground > self.reduced_thresh, 
+                watershed_line=True
+            )
 
-                if self.small_objects_threshold > 0.:
-                    large_objects = skimage.morphology.remove_small_objects(label_image[t] > 0, min_size=self.small_objects_threshold)
-                    label_image[t] = label_image[t] * large_objects
-                
-                if self.postprocess_kwargs['eccentricity'] < 1.:
-                    for prop in regionprops(label_image[t].squeeze()):
-                        label_ = prop.label
-                        if prop.eccentricity > self.postprocess_kwargs['eccentricity']:
-                            label_image = np.where(label_image[t] == label_, 0, label_image)
+            for prop in regionprops(label_temp.squeeze()):
+                label_ = prop.label
+                if prop.eccentricity > self.postprocess_kwargs['eccentricity']:
+                    label_temp = np.where(label_temp == label_, 0, label_temp)
+                    continue
+                if prop.area < 2.:
+                    label_temp = np.where(label_temp == label_, 0, label_temp)
+                    continue
+                if prop.euler_number < 1:
+                    bbox = prop.bbox
+                    label_temp[bbox[0]:bbox[2], bbox[1]:bbox[3]] = prop.image_filled
 
-                
-            label_image = label_image.astype(int)
+            label_image[t] = skimage.morphology.area_closing(label_temp.squeeze())
+            label_image[t], _, _ = skimage.segmentation.relabel_sequential(label_temp)
+
+            
+        label_image = label_image.astype(int)
 
         return label_image
         
     def segment(self,
                 x,
+                mpps = None,
                 data_format='channels_first',
                 return_transforms = False):
-        
-        """Generates a labeled image of the input running prediction with
-        appropriate pre and post processing functions.
-
-        Input images are required to have 4 dimensions
-        ``[batch, x, y, channel]``.
-        Additional empty dimensions can be added using ``np.expand_dims``.
-
-        Args:
-            image (numpy.array): Input image with shape
-                ``[batch, x, y, channel]``.
-            batch_size (int): Number of images to predict on per batch.
-            image_mpp (float): Microns per pixel for ``image``.
-            compartment (str): Specify type of segmentation to predict.
-                Must be one of ``"whole-cell"``, ``"nuclear"``, ``"both"``.
-            preprocess_kwargs (dict): Keyword arguments to pass to the
-                pre-processing function.
-            postprocess_kwargs (dict): Keyword arguments to pass to the
-                post-processing function.
-
-        Raises:
-            ValueError: Input data must match required rank of the application,
-                calculated as one dimension more (batch dimension) than expected
-                by the model.
-
-            ValueError: Input data must match required number of channels.
-
-        Returns:
-            numpy.array: Instance segmentation mask.
-        """
-
 
         if data_format == 'channels_last':
             x = np.moveaxis(x, -1, 1)
@@ -474,6 +389,11 @@ class DNN():
         self.H = x.shape[-2]
         self.W = x.shape[-1]
         self.n_frames = x.shape[0]
+        
+        if mpps is not None:
+            mpps = self.model_mpp / mpps
+        else:
+            mpps = np.ones((self.n_frames,))
 
         pbar = tqdm(range(0, self.n_frames, self.batch_size), leave=False, colour='#008080')
 
@@ -481,12 +401,14 @@ class DNN():
 
         # Preprocess the images and resize to square if necessary
         for i in pbar:
-            
-            pbar.set_description(f"Log normalizing image")
+            self.resize_factor = mpps[i]
+            pbar.set_description(f"Histogram normalizing")
             x_batch = x[i:i+self.batch_size]
-            x_batch = self._preprocess(x_batch)
+            
+            x_batch = self._preprocess(x_batch)            
 
             x_batch = torch.from_numpy(x_batch).to(self.device)
+            x_batch = self._resize_input(x_batch)
 
             pbar.set_description("Inference on tiles")
 
@@ -499,6 +421,7 @@ class DNN():
 
             # Refold batch * tiles into shape (T, C, H_sq, W_sq)
             output_images = self._refold_with_blend(output_tiles, overlap=32)
+            output_images = self._resize_output(output_images)
 
             # Reshape image back to original size
             pbar.set_description(f"Postprocessing using {self.postprocess_method}")
