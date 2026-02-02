@@ -5,18 +5,15 @@ import torch
 import zarr
 
 import tqdm
-import os
 import warnings
-import json
 
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
-import torchvision.transforms.v2.functional as TF
+import torchvision.transforms.v2.functional as F
 from scipy.spatial.distance import cdist
 warnings.filterwarnings("ignore") 
 
-from utils import relabel_sequential_lineage, get_image_features, is_valid_lineage
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
@@ -42,150 +39,43 @@ class TrkDataset(Dataset):
         self,
         trk_path: Union[str, Path],
         track_length: int = 8,
-        crop_size: int = 32,
         stride: int = 1,
         data_format: str = 'channels_first',
-        mode: str = 'training',
-        normalize_images: bool = True,
-        distance_threshold: float = 100.0,
+        distance_threshold: float = 64,
         augment: bool = True,
         rotation_range: int = 180,
         translation_range: float = 512,
-        crop_mode: str = 'resize',
         truncate_dataset=None,
         t_direction='forward',
-        processed=False
     ):
+        
         super().__init__()
         self.trk_path = Path(trk_path)
         self.track_length = track_length
-        self.crop_size = crop_size
         self.stride = stride
-        self.appearance_shape = (crop_size, crop_size, 1)
         self.data_format = data_format
-        self.mode = mode
-        self.normalize_images = normalize_images
         self.distance_threshold = distance_threshold
         self.augment = augment
         self.rotation_range = rotation_range
         self.translation_range = translation_range
-        self.crop_mode = crop_mode
         self.truncate_dataset = truncate_dataset
         self.t_direction = t_direction
-        self.processed=processed
 
-        if self.processed:
+        features = zarr.open(self.trk_path)
 
-            features = zarr.open(self.trk_path)
-            extracted_features = {}
-            for k in tqdm.tqdm(features.keys()):
-                
-                if self.truncate_dataset is not None:
-                    extracted_features[k] = features[k][:self.truncate_dataset]
-
-                else:
-                    extracted_features[k] = features[k][:]
-
-            self.features = extracted_features
-
-        else:
-        
-            # Load .trk file
-            print(f"Loading {self.trk_path}...")
-            self.basename = os.path.splitext(os.path.basename(self.trk_path))[0]
-            self.data_path = os.path.dirname(self.trk_path)
-
-            self.zarr_path = os.path.join(self.data_path, self.basename)+'.zarr'
-            self.json_path = os.path.join(self.data_path, self.basename)+'.json'
-            self.trk_data = zarr.open(self.zarr_path, mode='r')
-            with open(self.json_path) as f:
-                self.lineages = json.load(f)
+        self.features = {}
+        for k in tqdm.tqdm(features.keys()):
             
             if self.truncate_dataset is not None:
-                self.X = self.trk_data['X'][:self.truncate_dataset] # Raw images (B, T, Y, X, C)
-                self.y = self.trk_data['y'][:self.truncate_dataset] # Segmentation masks (B, T, Y, X, C)
-                self.lineages = self.lineages[:self.truncate_dataset] # Lineage information
+                self.features[k] = features[k][:self.truncate_dataset]
 
             else:
-                self.X = self.trk_data['X'][:] # Raw images (B, T, Y, X, C)
-                self.y = self.trk_data['y'][:] # Segmentation masks (B, T, Y, X, C)
-
-            if not len(self.X) == len(self.y) == len(self.lineages):
-                raise ValueError(
-                    'The data do not share the same batch size. '
-                    'Please make sure you are using a valid .trks file')
-
-            self._correct_lineages()
-        
-            m_cells = 0
-            for i in self.lineages:
-                curr_m = len(i.keys())
-                if curr_m > m_cells:
-                    m_cells = curr_m
-            self.max_cells = m_cells
-
-            self.features = self._get_features()
-        
-            print(f"  X shape: {self.X.shape}")
-            print(f"  y shape: {self.y.shape}")
-            print(f"  Lineages: {len(self.lineages)}")
-
-        self.class_samples = np.sum(self.features['labels'], axis=(0,1,2,3))
+                self.features[k] = features[k][:]
 
         # Build sample indices
         self.samples = self._build_sample_indices()
         print(f"  Created {len(self.samples)} samples")
 
-        if self.augment:
-            self._build_augmentation_pipeline()
-
-        self.frame_height = 584  # Y/H dimension
-        self.frame_width = 600   # X/W dimension
-
-    def _correct_lineages(self):
-        """Ensure valid lineages and sequential labels for all batches"""
-        new_X = []
-        new_y = []
-        new_lineages = []
-        for batch in tqdm.tqdm(range(self.y.shape[0])):
-            if is_valid_lineage(self.y[batch], self.lineages[batch]):
-
-                y_relabel, new_lineage = relabel_sequential_lineage(
-                    self.y[batch], self.lineages[batch])
-
-                new_X.append(self.X[batch])
-                new_y.append(y_relabel)
-                new_lineages.append(new_lineage)
-            else:
-                print('Invalid lineage detected.')
-
-        self.X = np.stack(new_X, axis=0)
-        self.y = np.stack(new_y, axis=0)
-        self.lineages = new_lineages
-    
-    def _get_max_frames(self, curr_lineage):
-        """Helper function for finding the maximum number of cells in a frame of a movie, across
-        all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
-
-        Args:
-            y (np.array): Annotated image data
-
-        Returns:
-            int: The maximum number of cells in any frame
-        """
-        max_frames = 0
-
-        for key, track in curr_lineage.items():
-
-            if track['frames']:
-                max_frame = track['frames'][-1]
-            else:
-                max_frame=0
-
-            if max_frame > max_frames:
-                max_frames = max_frame
-
-        return max_frames
     
     def _build_sample_indices(self) -> List[Dict]:
         """Build list of valid sample indices.
@@ -201,13 +91,11 @@ class TrkDataset(Dataset):
             # Slide window across time dimension
             max_frames = np.sum(np.sum(self.features['appearances'][batch_idx], axis=(1, 2, 3)) != 0).item() - 1
 
-
             for start_frame in range(0, T - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
 
-                if end_frame == max_frames:
+                if end_frame == max_frames-1:
                     break
-
 
                 samples.append({
                     'batch_idx': batch_idx,
@@ -218,157 +106,46 @@ class TrkDataset(Dataset):
         return samples
     
     def __len__(self) -> int:
-        return len(self.samples)
-    
-
-    def _build_augmentation_pipeline(self):
-        """Build augmentation pipeline for coordinated appearance + centroid transforms."""
-        # Store probabilities for sampling
-        self.hflip_prob = 0.5
-        self.vflip_prob = 0.5
-        self.rotation_range = self.rotation_range
-        
+        return len(self.samples)      
 
     def _apply_augmentation(self, appearances, centroids):
-        """Apply coordinated augmentations - NO TRANSLATION."""
         
         rotation_angle = torch.rand(1).item() * self.rotation_range
-
         self.rotation_angle = rotation_angle
-                
-        # Apply appearance transformations
-        
-        appearances = appearances.permute(0, 1, 4, 2, 3)
-
         angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
 
         rotation_mat =  torch.tensor([
-        [torch.cos(angle_rad), -torch.sin(angle_rad)],
-        [torch.sin(angle_rad), torch.cos(angle_rad)],
+            [torch.cos(angle_rad), -torch.sin(angle_rad)],
+            [torch.sin(angle_rad), torch.cos(angle_rad)],
         ])
 
-        appearances = TF.rotate(appearances, rotation_angle,
-                            interpolation=TF.InterpolationMode.NEAREST)
-        
-        centroids = torch.matmul(centroids, rotation_mat)
-            
+        # Apply rotation
+        appearances = appearances.permute(0, 1, 4, 2, 3)
+        appearances = F.rotate(appearances, rotation_angle,
+                            interpolation=F.InterpolationMode.BILINEAR)
         appearances = appearances.permute(0, 1, 3, 4, 2)
 
-        if self.translation_range > 0:
-            random_translate = torch.rand(2) * self.translation_range
-            random_translate = random_translate.unsqueeze(0).unsqueeze(0)
-
-            centroids = centroids + random_translate
+        centroids = torch.matmul(centroids, rotation_mat)
+            
+        # Apply translation
+        random_translate = torch.rand(2) * self.translation_range
+        self.random_translate = random_translate
+        random_translate = random_translate.unsqueeze(0).unsqueeze(0)
+        centroids = centroids + random_translate
 
         return appearances, centroids
     
-    def _get_features(self):
-        """
-        Extract the relevant features from the label movie
-        Appearance, morphologies, centroids, and adjacency matrices
-        """
-        max_tracks = self.max_cells
-        n_batches = self.X.shape[0]
-        n_frames = self.X.shape[1]
-        n_channels = self.X.shape[-1]
+    def _get_adj_matrix(self, centroids):
 
-        batch_shape = (n_batches, n_frames, max_tracks)
-        appearance_shape = self.appearance_shape
+        T, N, _ = centroids.shape
+        adj_matrix = np.zeros((T, N, N))
 
-        appearances = np.zeros(batch_shape + appearance_shape, dtype='float32')
-        morphologies = np.zeros(batch_shape + (3,), dtype='float32')
-        centroids = np.zeros(batch_shape + (2,), dtype='float32')
-        adj_matrix = np.zeros(batch_shape + (max_tracks,), dtype='float32')
-        temporal_adj_matrix = np.zeros(
-                        (n_batches, n_frames - 1, max_tracks, max_tracks, 3), 
-                        dtype='float32'
-                    )
-        mask = np.zeros(batch_shape + (max_tracks,), dtype='bool')
-        track_length = np.zeros((n_batches, max_tracks, 2), dtype='int32')
+        for time in range(T):
+            adj_matrix[time] = cdist(centroids[time], centroids[time], metric='euclidean')
 
-        for batch in tqdm.tqdm(range(n_batches)):
-            for frame in range(n_frames):
+        adj_matrix = (adj_matrix > 0) & (adj_matrix < self.distance_threshold)
 
-                frame_features = get_image_features(
-                    self.X[batch, frame], self.y[batch, frame],
-                    appearance_dim=self.appearance_shape[1],
-                    crop_mode=self.crop_mode)
-
-                track_ids = frame_features['labels'] - 1
-                centroids[batch, frame, track_ids] = frame_features['centroids']
-                morphologies[batch, frame, track_ids] = frame_features['morphologies']
-                appearances[batch, frame, track_ids] = frame_features['appearances']
-                mask[batch, frame, track_ids, track_ids] = 1
-
-                # Get adjacency matrix, cannot filter on track ids.
-                cent = centroids[batch, frame]
-                distance = cdist(cent, cent, metric='euclidean')
-                distance = distance < self.distance_threshold
-
-                # Disconnect the padded nodes
-                morphs = morphologies[batch, frame]
-                is_pad = np.matmul(morphs, morphs.T) == 0
-
-                adj = distance * (1 - is_pad)
-                adj_matrix[batch, frame] = adj.astype(np.float32)
-
-            # Get track length and temporal adjacency matrix
-            for label in self.lineages[batch]:
-
-                # Get track length
-                start_frame = self.lineages[batch][label]['frames'][0]
-                end_frame = self.lineages[batch][label]['frames'][-1]
-
-                track_id = int(label) - 1
-                track_length[batch, track_id, 0] = start_frame
-                track_length[batch, track_id, 1] = end_frame
-
-                # Get temporal adjacency matrix
-                frames = self.lineages[batch][label]['frames']
-
-                # Assign same
-                for f0, f1 in zip(frames[0:-1], frames[1:]):
-                    if f1 - f0 == 1:
-                        temporal_adj_matrix[batch, f0, track_id, track_id, 0] = 1
-
-                # Assign daughter
-                # WARNING: This wont work if there's a time gap between mother
-                # cell disappearing and daughter cells appearing
-                last_frame = frames[-1]
-                daughters = self.lineages[batch][label]['daughters']
-                for daughter in daughters:
-                    daughter_id = daughter - 1
-                    temporal_adj_matrix[batch, last_frame, track_id, daughter_id, 2] = 1
-
-            # Assign different
-            same_prob = temporal_adj_matrix[batch, ..., 0]
-            daughter_prob = temporal_adj_matrix[batch, ..., 2]
-            temporal_adj_matrix[batch, ..., 1] = 1 - same_prob - daughter_prob
-
-            # Identify cell padding
-            for i in range(temporal_adj_matrix.shape[2]):
-                # index + 1 is the cell label
-                if i + 1 not in self.lineages[batch]:
-                    temporal_adj_matrix[batch, :, i] = -1
-                    temporal_adj_matrix[batch, :, :, i] = -1
-
-            # Identify temporal padding
-            for b in range(temporal_adj_matrix.shape[0]):
-                sames = temporal_adj_matrix[b, ..., 0]
-                sames = np.sum(sames, axis=(1, 2))
-                temporal_adj_matrix[b, sames == 0] = -1
-
-        features = {
-            'adj_matrix': adj_matrix,
-            'appearances': appearances,
-            'morphologies': morphologies,
-            'centroids': centroids,
-            'labels': temporal_adj_matrix,
-            'mask': mask,
-            'track_length': track_length
-            }
-
-        return features
+        return adj_matrix
     
     def _to_tensors(self, data: Dict) -> Dict[str, torch.Tensor]:
         """Convert numpy arrays to PyTorch tensors."""
@@ -388,7 +165,6 @@ class TrkDataset(Dataset):
         tensors['morphologies'] = torch.from_numpy(data['morphologies']).float()
         tensors['adj_matrices'] = torch.from_numpy(data['adj_matrices']).float()
         tensors['labels'] = torch.from_numpy(data['labels']).float()
-        tensors['mask'] = torch.from_numpy(data['mask'])
 
 
         if self.augment:
@@ -414,7 +190,6 @@ class TrkDataset(Dataset):
             tensors['centroids'] = torch.from_numpy(data['centroids']).flip(0)
             tensors['appearances'] = torch.from_numpy(data['appearances']).flip(0)
             tensors['labels'] = torch.transpose(tensors['labels'].flip(0), 1, 2)
-            tensors['mask'] = tensors['mask'].flip(0)
         
         return tensors
 
@@ -448,27 +223,15 @@ class TrkDataset(Dataset):
         items['adj_matrices'] = self._get_adj_matrix(items['centroids'])
         
         # Generate labels if in training mode
-        if self.mode == 'training':
 
-            items['labels'] = self.features['labels'][batch_idx, time_slice_label]
-            items['mask'] = self.features['mask'][batch_idx, time_slice_label]
+        items['labels'] = self.features['labels'][batch_idx, time_slice_label]
 
         # Convert to tensors
         tensor_data = self._to_tensors(items)
         
         return tensor_data
     
-    def _get_adj_matrix(self, centroids):
 
-        T, N, _ = centroids.shape
-        adj_matrix = np.zeros((T, N, N))
-
-        for time in range(T):
-            adj_matrix[time] = cdist(centroids[time], centroids[time], metric='euclidean')
-
-        adj_matrix = (adj_matrix > 0) & (adj_matrix < self.distance_threshold)
-
-        return adj_matrix
     
 def create_trk_dataloaders(
     train_path: Optional[Union[str, Path]] = None,
@@ -477,10 +240,10 @@ def create_trk_dataloaders(
     batch_size: int = 4,
     num_workers: int = 4,
     track_length: int = 8,
-    crop_size: int = 32,
     stride: int = 1,
     **dataset_kwargs
 ) -> Tuple[DataLoader, ...]:
+    
     """Create dataloaders for .trk format data.
     
     Args:
@@ -499,6 +262,7 @@ def create_trk_dataloaders(
         Tuple of DataLoaders (train_loader, val_loader, test_loader)
         None for loaders where path not provided
     """
+
     loaders = []
 
     if train_path is not None:
@@ -506,9 +270,7 @@ def create_trk_dataloaders(
         train_dataset = TrkDataset(
             trk_path=train_path,
             track_length=track_length,
-            crop_size=crop_size,
             stride=stride,
-            # mode='training',
             **dataset_kwargs
         )
         
@@ -528,11 +290,8 @@ def create_trk_dataloaders(
         val_dataset = TrkDataset(
             trk_path=val_path,
             track_length=track_length,
-            crop_size=crop_size,
             stride=stride,
-            rotation_range=0,
-            translation_range=0,
-            # mode='training',
+            augment=False,
             **dataset_kwargs
         )
         
@@ -552,9 +311,7 @@ def create_trk_dataloaders(
         test_dataset = TrkDataset(
             trk_path=test_path,
             track_length=track_length,
-            crop_size=crop_size,
             stride=stride,
-            # mode='inference',
             **dataset_kwargs
         )
         
@@ -571,54 +328,3 @@ def create_trk_dataloaders(
         loaders.append(None)
     
     return tuple(loaders)
-
-
-
-# Example usage
-if __name__ == "__main__":
-    print("Testing .trk Data Pipeline")
-    print("=" * 70)
-    print()
-    
-    # Example paths (update with your actual paths)
-    train_path = "data/DynamicNuclearNet-tracking-v1_0/train.zarr"
-    val_path = "data/DynamicNuclearNet-tracking-v1_0/val.zarr"
-    
-    if Path(train_path).exists():
-        print("1. Creating dataloaders...")
-        train_loader, val_loader, test_loader = create_trk_dataloaders(
-            train_path=train_path,
-            val_path=val_path if Path(val_path).exists() else None,
-            test_path=None,
-            batch_size=2,
-            num_workers=4,  # Use 0 for testing
-            track_length=8,
-            crop_size=32,
-            stride=1  # Sample every 4 frames for faster testing
-        )
-        
-        print(f"   Train batches: {len(train_loader)}")
-        if val_loader:
-            print(f"   Val batches: {len(val_loader)}")
-        print()
-        
-        print("2. Testing batch loading...")
-        for i, batch in enumerate(train_loader):
-            print(f"   Batch {i}:")
-            for key, value in batch.items():
-                print(f"     {key}: {value.shape}, dtype: {value.dtype}")
-            
-        print()
-        
-        print("✅ .trk data pipeline working!")
-    else:
-        print("⚠️  train.trk not found. Please update paths in the example.")
-        print()
-        print("To use with your data:")
-        print("  train_loader, val_loader, _ = create_trk_dataloaders(")
-        print("      train_path='path/to/train.trk',")
-        print("      val_path='path/to/val.trk',")
-        print("      batch_size=4,")
-        print("      track_length=8,")
-        print("      max_cells=39")
-        print("  )")

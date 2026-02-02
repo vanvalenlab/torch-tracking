@@ -13,132 +13,6 @@ from loader import create_trk_dataloaders
 from utils import weighted_categorical_crossentropy_v2
 import numpy as np
 
-import torch.nn.functional as F
-
-def focal_loss(logits, labels, alpha=None, gamma=2):
-    """Compute the focal loss between `logits` and the ground truth `labels`.
-    Focal loss = -alpha_t * (1-pt)^gamma * log(pt)
-    where pt is the probability of being classified to the true class.
-    pt = p (if true class), otherwise pt = 1 - p. p = sigmoid(logit).
-    Args:
-      logits: A float tensor of size [batch, num_classes].
-      labels: A float tensor of size [batch, num_classes].
-      alpha: A float tensor of size [batch_size]
-        specifying per-example weight for balanced cross entropy.
-      gamma: A float scalar modulating loss from hard and easy examples.
-    Returns:
-      focal_loss: A float32 scalar representing normalized total loss.
-    """
-    bc_loss = F.binary_cross_entropy_with_logits(input=logits, target=labels, reduction="none")
-
-    if gamma == 0.0:
-        modulator = 1.0
-    else:
-        modulator = torch.exp(-gamma * labels * logits - gamma * torch.log(1 + torch.exp(-1.0 * logits)))
-
-    loss = modulator * bc_loss
-
-    if alpha is not None:
-        weighted_loss = alpha * loss
-        focal_loss = torch.sum(weighted_loss)
-    else:
-        focal_loss = torch.sum(loss)
-
-    focal_loss /= torch.sum(labels)
-    return focal_loss
-
-class Loss(torch.nn.Module):
-    def __init__(
-        self,
-        loss_type: str = "cross_entropy",
-        beta: float = 0.999,
-        fl_gamma=2,
-        samples_per_class=None,
-        class_balanced=False,
-        safe: bool = False,
-    ):
-        """
-        Compute the Class Balanced Loss between `logits` and the ground truth `labels`.
-        Class Balanced Loss: ((1-beta)/(1-beta^n))*Loss(labels, logits)
-        where Loss is one of the standard losses used for Neural Networks.
-
-        reference: https://openaccess.thecvf.com/content_CVPR_2019/papers/Cui_Class-Balanced_Loss_Based_on_Effective_Number_of_Samples_CVPR_2019_paper.pdf
-
-        Args:
-            loss_type: string. One of "focal_loss", "cross_entropy",
-                "binary_cross_entropy", "softmax_binary_cross_entropy".
-            beta: float. Hyperparameter for Class balanced loss.
-            fl_gamma: float. Hyperparameter for Focal loss.
-            samples_per_class: A python list of size [num_classes].
-                Required if class_balance is True.
-            class_balanced: bool. Whether to use class balanced loss.
-            safe: bool. Whether to allow labels with no samples.
-        Returns:
-            Loss instance
-        """
-        super(Loss, self).__init__()
-
-        if class_balanced is True and samples_per_class is None:
-            raise ValueError("samples_per_class cannot be None when class_balanced is True")
-
-        self.loss_type = loss_type
-        self.beta = beta
-        self.fl_gamma = fl_gamma
-        self.samples_per_class = samples_per_class
-        self.class_balanced = class_balanced
-        self.safe = safe
-
-    def forward(self, logits: torch.tensor, labels: torch.tensor):
-        """
-        Compute the Class Balanced Loss between `logits` and the ground truth `labels`.
-        Class Balanced Loss: ((1-beta)/(1-beta^n))*Loss(labels, logits)
-        where Loss is one of the standard losses used for Neural Networks.
-
-        Args:
-            logits: A float tensor of size [batch, num_classes].
-            labels: An int tensor of size [batch].
-        Returns:
-            cb_loss: A float tensor representing class balanced loss
-        """
-
-        batch_size = logits.size(0)
-        num_classes = logits.size(1)
-        labels_one_hot = F.one_hot(labels, num_classes).float()
-
-        if self.class_balanced:
-            effective_num = 1.0 - np.power(self.beta, self.samples_per_class)
-            # Avoid division by 0 error for test cases without all labels present.
-            if self.safe:
-                effective_num_classes = np.sum(effective_num != 0)
-                effective_num[effective_num == 0] = np.inf
-
-            else:
-                effective_num_classes = num_classes
-
-            weights = (1.0 - self.beta) / np.array(effective_num)
-            weights = weights / np.sum(weights) * effective_num_classes
-            weights = torch.tensor(weights, device=logits.device).float()
-
-            if self.loss_type != "cross_entropy":
-                weights = weights.unsqueeze(0)
-                weights = weights.repeat(batch_size, 1) * labels_one_hot
-                weights = weights.sum(1)
-                weights = weights.unsqueeze(1)
-                weights = weights.repeat(1, num_classes)
-        else:
-            weights = None
-
-        if self.loss_type == "focal_loss":
-            cb_loss = focal_loss(logits, labels_one_hot, alpha=weights, gamma=self.fl_gamma)
-        elif self.loss_type == "cross_entropy":
-            cb_loss = F.cross_entropy(input=logits, target=labels_one_hot, weight=weights, reduction='none')
-        elif self.loss_type == "binary_cross_entropy":
-            cb_loss = F.binary_cross_entropy_with_logits(input=logits, target=labels_one_hot, weight=weights)
-        elif self.loss_type == "softmax_binary_cross_entropy":
-            pred = logits.softmax(dim=1)
-            cb_loss = F.binary_cross_entropy(input=pred, target=labels_one_hot, weight=weights)
-        return cb_loss
-
 class TrackingLoss(nn.Module):
     
     def __init__(self, gamma=2.0, loss='wcce', label_smoothing=False, class_weights='batch', class_samples=None):
@@ -150,20 +24,12 @@ class TrackingLoss(nn.Module):
         self.pad_value = -1
         self.label_smoothing = label_smoothing
         self.class_samples = class_samples
-
-        if self.loss == 'balanced':
-            self.criterion = Loss(loss_type='cross_entropy', 
-                                  class_balanced=True, 
-                                  samples_per_class=self.class_samples,
-                                  safe=True)
             
         # Standard CrossEntropyLoss with class weights
-        elif self.loss == 'cce':
-            self.criterion = nn.CrossEntropyLoss(reduction='none', 
-                                                 ignore_index=self.pad_value)
+        self.criterion = nn.CrossEntropyLoss(reduction='none', 
+                                                ignore_index=self.pad_value, weight=self.weights)
 
-    
-    def forward(self, predictions, targets, mask):
+    def forward(self, predictions, targets):
         
         """
         Args:
@@ -175,12 +41,14 @@ class TrackingLoss(nn.Module):
         """
 
         # # Reshape for CrossEntropyLoss
-        predictions_flat = predictions.view(-1, predictions.shape[-1])  # (B*T*N*M, 3)
-        targets_flat = targets.view(-1, targets.shape[-1])
-        valid_mask = mask.view(-1)
+        B, T, N, _, C = predictions.shape
+        predictions_flat = predictions.view(-1, C)  # (B*T*N*M, 3)
 
         # Compute weighted cross-entropy
         if self.loss == 'wcce':
+
+            targets_flat = targets.view(-1, targets.shape[-1])
+            valid_mask = targets_flat >= 0
 
             loss = weighted_categorical_crossentropy_v2(
                 targets_flat, 
@@ -190,11 +58,15 @@ class TrackingLoss(nn.Module):
                 class_weights=self.weights
             )
 
-            return loss[valid_mask,:].mean()
+            return loss[valid_mask].mean()
 
         else:
-            loss = self.criterion(predictions_flat, targets_flat.argmax(dim=-1))
-            return loss[valid_mask].mean()
+
+            targets_flat = targets.flatten()
+            valid_mask = targets_flat >= 0
+
+            loss = self.criterion(predictions_flat, targets_flat.long())
+            return loss.mean()
             
 class MetricsTracker:
     
@@ -212,8 +84,11 @@ class MetricsTracker:
         self.class_correct = {0: 0, 1: 0, 2: 0}
         self.class_total = {0: 0, 1: 0, 2: 0}
         self.class_predicted = {0: 0, 1: 0, 2: 0}
+
+        self.cm = np.zeros((3,3))
+
     
-    def update(self, loss, predictions, targets, valid_mask):
+    def update(self, loss, predictions, targets):
         """
         Args:
             loss: scalar loss value
@@ -225,11 +100,10 @@ class MetricsTracker:
         self.total_loss += loss.item() * batch_size
         self.total_samples += batch_size
 
-
         # Get predicted classes
-        pred_classes = predictions.argmax(dim=-1)  # (B*T*N*M)
-        target_classes = targets.argmax(dim=-1)
-    
+        pred_classes = predictions.argmax(dim=-1).view(-1)  # (B*T*N*M)
+        target_classes = targets.view(-1)
+        valid_mask = target_classes.view(-1) >= 0
 
         # Overall accuracy
         correct = (pred_classes == target_classes) & valid_mask
@@ -387,8 +261,7 @@ class Trainer:
 
         self.loss_fn = TrackingLoss(loss=loss, 
                                     label_smoothing=self.label_smoothing, 
-                                    class_weights=self.class_weights,
-                                    class_samples = train_loader.dataset.class_samples)
+                                    class_weights=self.class_weights)
         
         # Move to device
         self.model = self.model.to(device)
@@ -423,7 +296,6 @@ class Trainer:
         self.model.train()
         metrics_tracker = MetricsTracker()
 
-        
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]', dynamic_ncols=True)
         
         for batch_idx, batch in enumerate(pbar):
@@ -434,7 +306,6 @@ class Trainer:
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
             labels = batch['labels'].to(self.device)
-            mask = batch['mask'].to(self.device)
 
             # Forward pass
             self.optimizer.zero_grad()
@@ -445,7 +316,7 @@ class Trainer:
             )
             
             # Compute loss
-            loss = self.loss_fn(predictions, labels, mask)
+            loss = self.loss_fn(predictions, labels)
             
             # Backward pass
             loss.backward()
@@ -461,15 +332,15 @@ class Trainer:
 
             # Update metrics
             with torch.no_grad():
-                metrics_tracker.update(loss, predictions, labels, mask)
+                metrics_tracker.update(loss, predictions, labels)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
+                'no_f1': f"{current_metrics['f1_class_0']:.4f}",
+                'same_f1': f"{current_metrics['f1_class_1']:.4f}",
                 'mit_f1': f"{current_metrics['f1_class_2']:.4f}",
-                'same_f1': f"{current_metrics['f1_class_0']:.4f}",
-                'no_f1': f"{current_metrics['f1_class_1']:.4f}",
-                'loss': f"{current_metrics['loss']:.4f}",
+                'loss': f"{current_metrics['loss']:.4f}"
             })
 
         metrics = metrics_tracker.get_metrics()
@@ -492,7 +363,6 @@ class Trainer:
             centroids = batch['centroids'].to(self.device)
             adj_matrices = batch['adj_matrices'].to(self.device)
             labels = batch['labels'].to(self.device)
-            mask = batch['mask'].to(self.device)
 
             # Forward pass
             predictions = self.model.training_forward(
@@ -501,17 +371,17 @@ class Trainer:
             )
             
             # Compute loss
-            loss = self.loss_fn(predictions, labels, mask)
+            loss = self.loss_fn(predictions, labels)
 
             # Update metrics
-            metrics_tracker.update(loss, predictions, labels, mask)
+            metrics_tracker.update(loss, predictions, labels)
             
             # Update progress bar
             current_metrics = metrics_tracker.get_metrics()
             pbar.set_postfix({
+                'no_f1': f"{current_metrics['f1_class_0']:.4f}",
+                'same_f1': f"{current_metrics['f1_class_1']:.4f}",
                 'mit_f1': f"{current_metrics['f1_class_2']:.4f}",
-                'same_f1': f"{current_metrics['f1_class_0']:.4f}",
-                'no_f1': f"{current_metrics['f1_class_1']:.4f}",
                 'loss': f"{current_metrics['loss']:.4f}"
             })
 
@@ -612,13 +482,12 @@ class Trainer:
 
             if self.writer is not None:
             # Log to tensorboard
+
                 self.writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
                 self.writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
                 self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
                 self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
                 self.writer.add_scalar('Learning_rate', current_lr, epoch)
-                self.writer.add_scalar('Accuracy/train_geom', train_metrics['geom_f1'], epoch)
-                self.writer.add_scalar('Accuracy/val_geom', val_metrics['geom_f1'], epoch)
 
                 for i in range(3):
                     self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
@@ -668,15 +537,17 @@ class Trainer:
 def create_optimizer(model, config):
     """Create optimizer based on config."""
 
-    optimizer_name = config.get('optimizer', 'adam').lower()
+    optimizer_name = config.get('optimizer', 'radam').lower()
     lr = config.get('learning_rate', 1e-3)
     weight_decay = config.get('weight_decay', 1e-5)
     
     if optimizer_name == 'radam':
+        # Actually using RAdamW
         optimizer = optim.RAdam(
             model.parameters(),
             lr=lr,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
+            decoupled_weight_decay=True,
         )
         
     elif optimizer_name == 'muon':
@@ -771,12 +642,12 @@ if __name__ == "__main__":
 
     config = {
         "optimizer": "radam",
-        "learning_rate": 0.00001,
+        "learning_rate": 1e-4,
         "weight_decay": 0,
         "decay": 0.99,
-        "scheduler": "cosine",
-        "max_epochs": 30,
-        "batch_size": 4,
+        "scheduler": "reduce_on_plateau",
+        "max_epochs": 50,
+        "batch_size": 5,
         "n_layers": 1,
         "num_workers": 8,
         "clipnorm": 0.001,
@@ -788,11 +659,11 @@ if __name__ == "__main__":
         "crop_size": 32,
         "attention": False,
         "truncate_dataset": None,
-        "loss": "balanced",
+        "loss": "cce",
         "t_direction": "forward",
         "processed": True,
         "dropout": 0,
-        "device": "cuda:0",
+        "device": "cuda:1",
         "label_smoothing": False,
         "stopping_metric": 'loss'
     }
@@ -817,13 +688,9 @@ if __name__ == "__main__":
         val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
         batch_size=config['batch_size'],
         distance_threshold=64,
-        augment=True,
-        crop_mode=config['crop_mode'],
         num_workers=config['num_workers'],
-        crop_size=config['crop_size'],
         truncate_dataset = config['truncate_dataset'],
         t_direction=config['t_direction'],
-        processed=config['processed']
         )
 
     val_loader.dataset.augment = False
@@ -842,14 +709,11 @@ if __name__ == "__main__":
         max_epochs=config['max_epochs'],
         gradient_clip=config['clipnorm'],
         enable_early_stopping=config['enable_early_stopping'],
-        log_and_save = True if config['truncate_dataset'] is None else True,
+        log_and_save = True,
         config=config,
         loss=config['loss'],
-        label_smoothing = config['label_smoothing'],
-        class_weights='batch',
+        class_weights=torch.tensor([1, 100, 1000]).float(),
         stopping_metric = config['stopping_metric'],
     )   
-
-    # torch.tensor([2.177e-2, 6.713e-5, 2.97815741]).float()
 
     trainer.train()

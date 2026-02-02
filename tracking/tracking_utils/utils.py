@@ -1,5 +1,6 @@
 import numpy as np
 import warnings
+import skimage
 from skimage.segmentation import relabel_sequential
 from skimage.measure import regionprops
 import torch
@@ -7,6 +8,50 @@ import cv2
 from skimage import transform
 import pandas as pd
 import networkx as nx
+from tqdm import tqdm
+
+def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_format = 'channels_last'):
+    """Pre-process images using Contrast Limited Adaptive
+    Histogram Equalization (CLAHE).
+
+    If one of the inputs is a constant-value array, it will
+    be normalized as an array of all zeros of the same shape.
+
+    Args:
+        image (numpy.array): numpy array of phase image data.
+        kernel_size (integer): Size of kernel for CLAHE,
+            defaults to 1/8 of image size.
+
+    Returns:
+        numpy.array: Pre-processed image data with dtype float32.
+    """
+
+    image = image.astype('float32')
+
+    if data_format == 'channels_first':
+        image = np.moveaxis(image, 1, -1)
+    
+    pbar = tqdm(range(image.shape[0]), leave=False)
+
+    for batch in pbar:
+        for channel in range(image.shape[-1]):
+            X = image[batch, ..., channel]
+            sample_value = X[(0,) * X.ndim]
+            if (X == sample_value).all():
+                # TODO: Deal with constant value arrays
+                # https://github.com/scikit-image/scikit-image/issues/4596
+                image[batch, ..., channel] = np.zeros_like(X)
+                continue
+
+            # X = rescale_intensity(X, out_range='float')
+            X = skimage.exposure.rescale_intensity(X, out_range=(0.0, 1.0))
+            X = skimage.exposure.equalize_adapthist(X, kernel_size=kernel_size)
+            image[batch, ..., channel] = X
+            
+    if data_format == 'channels_first':
+        image = np.moveaxis(image, -1, 1)
+
+    return image
 
 def weighted_categorical_crossentropy(y_true, y_pred,
                                       n_classes=3, axis=None,
@@ -78,7 +123,6 @@ def weighted_categorical_crossentropy_v2(
     _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
     _alpha = torch.tensor(alpha).type(y_pred.dtype).to(y_pred.device)
     
-
     y_pred = y_pred / torch.sum(y_pred, dim=-1, keepdims=True)
     
     # Clamp predictions to avoid log(0)
@@ -380,6 +424,7 @@ def get_image_features(X, y, appearance_dim=16, crop_mode='fixed', norm=True):
     # iterate over all objects in y
     if crop_mode == 'resize':
         props = regionprops(y[..., 0], cache=False)
+        
 
     for i, prop in enumerate(props):
 

@@ -2,26 +2,19 @@
 
 import torch
 import numpy as np
-from pathlib import Path
-from typing import Dict, List
-import tqdm
-from collections import defaultdict
-import json
+from typing import Dict
 from model import GNNTrackingModel
 from tracker import CellTracker
 import zarr
-import pprint
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 from matplotlib.colors import ListedColormap
 
-from metrics import TrackingEvaluator
-
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
-                         titles=('Channel 1', 'Channel 2'), 
-                         cmap='gray', vmin=None, vmax=None):
+                         titles=('Predicted', 'True'), 
+                         cmap='gray'):
     """
     Create a GIF from a time lapse image with two channels.
     
@@ -40,6 +33,7 @@ def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10,
     vmin, vmax : float, optional
         Min/max values for intensity scaling. If None, uses data min/max
     """
+
     T, H, W, C = im1.shape
     
     # Set up the figure and subplots
@@ -213,7 +207,7 @@ def build_indices(X):
 if __name__ == "__main__":
 
     config = {
-        'batch_size': 6,
+        'batch_size': 16,
         'n_layers': 1,
         'crop_size': 32
     }
@@ -228,18 +222,16 @@ if __name__ == "__main__":
                              crop_size=config['crop_size'],
                              )
 
-    checkpoint_dir = 'checkpoints/20251218-141611/best_model.pt'
+    checkpoint_dir = 'checkpoints/20260131-201751/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
     
     z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
     z2 = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test_proc.zarr')
-    batch = 9
+    batch = 10
 
     X = z['X'][:]
     y = z['y'][:]
-    gt = z2['labels'][:][batch]
-    gt_mask = z2['mask'][:][batch]
 
     samples = build_indices(X)
     end_frame = samples[batch]
@@ -251,10 +243,9 @@ if __name__ == "__main__":
         device='cuda:0',
         appearance_dim=32,
         division=0.99,  # Threshold for detecting mitosis,
-        track_length=8
+        track_length=8,
+        crop_mode='fixed'
     )
-
-
 
     tracker.track_cells()
 
@@ -262,27 +253,7 @@ if __name__ == "__main__":
     y_tracked = track_review['y_tracked']
     gt_movie = y[batch, :end_frame]
 
-    frame_max = np.max(y_tracked, axis=(1,2,3))
-    print(frame_max[-1] + 1)
-
-    the_rest = [np.random.rand((3)) for _ in range(frame_max[-1] + 1)]
-    the_rest[0] = np.array([0.,0.,0.])
-
-    rand_cmap = ListedColormap(the_rest, N=frame_max[-1]+1)
-
-    # create_timelapse_gif(y_tracked, gt_movie, cmap='viridis')
-
-    predictions = tracker._get_assignment_matrix()
-    print(predictions.shape)
-    # pt, ph, pw, pc = predictions.shape
-
-    # gt_cropped = gt[:pt, :ph, :pw, :pc]
-
-    # metrics = TrackingEvaluator()
-    # all_metrics = metrics.evaluate_all(predictions, gt_cropped)
-
-    # pprint.pprint(all_metrics)
-
+    create_timelapse_gif(y_tracked, gt_movie, cmap='viridis')
     
 
 

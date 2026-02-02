@@ -266,6 +266,7 @@ class DeltaEncoder(nn.Module):
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
         self.norm_layer_type = norm_layer
+        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
         self.dropout = nn.Dropout(dropout)
 
 
@@ -289,14 +290,18 @@ class DeltaEncoder(nn.Module):
         x = x.view(new_shape)
         
         # Apply normalization - LayerNorm is easier for variable shapes
+
         if self.norm_layer_type == 'batch':
-            # For simplicity with variable shapes, use LayerNorm
-            x = F.layer_norm(x, [x.shape[-1]])
+            # Flatten for BatchNorm1d: needs (N, C) or (N, C, L)
+            x_flat = x.reshape(-1, x.shape[-1])
+            x_flat = self.norm(x_flat)
+            x = x_flat.view(new_shape)
         else:
-            x = F.layer_norm(x, [x.shape[-1]])
-        
+            x = self.norm(x)
+                
         x = self.dropout(x)
         x = self.activation(x)
+
         return x
 
 

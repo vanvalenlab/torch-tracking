@@ -1,593 +1,686 @@
-"""
-Evaluation metrics for cell tracking with GNN models.
+# Copyright 2016-2022 The Van Valen Lab at the California Institute of
+# Technology (Caltech), with support from the Paul Allen Family Foundation,
+# Google, & National Institutes of Health (NIH) under Grant U24CA224309-01.
+# All rights reserved.
+#
+# Licensed under a modified Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.github.com/vanvalenlab/deepcell-tracking/LICENSE
+#
+# The Work provided may be used for non-commercial academic purposes only.
+# For any other use of the Work, including commercial use, please contact:
+# vanvalenlab@gmail.com
+#
+# Neither the name of Caltech nor the names of its contributors may be used
+# to endorse or promote products derived from this software without specific
+# prior written permission.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Functions for evaluating tracking performance"""
 
-Provides multiple evaluation strategies:
-1. Cost-based scoring (as requested)
-2. TRA-style tracking accuracy (recommended)
-3. Per-event metrics (divisions, merges, splits)
-"""
+from collections import Counter
+import itertools
+import functools
+
+from skimage.measure import regionprops
 
 import numpy as np
-from typing import Dict, Tuple, Optional
-from collections import defaultdict
-from scipy.optimize import linear_sum_assignment
 
+from geometry_utils import compute_overlap_vectorized
+import pandas as pd
+import networkx as nx
 
-class TrackingEvaluator:
-    """
-    Comprehensive evaluator for cell tracking results.
-    
-    Takes predicted and ground truth temporal adjacency matrices and computes
-    various tracking quality metrics.
-    
+def match_nodes(gt, res, threshold=1):
+    """Relabel predicted track to match GT track labels.
+
     Args:
-        penalty_weights: Dictionary of penalty weights for different error types.
-            Default weights:
-            - 'fp_track': 1.0 (false positive - track that shouldn't exist)
-            - 'fn_track': 1.0 (false negative - missed track)
-            - 'swap': 0.5 (track ID swap between two tracks)
-            - 'missed_division': 2.0 (failed to detect mitosis)
-            - 'false_division': 2.0 (incorrectly predicted mitosis)
-            - 'wrong_parent': 1.5 (daughter assigned to wrong parent)
+        gt (np arr): label movie (y) from ground truth .trk file.
+        res (np arr): label movie (y) from predicted results .trk file
+        threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
+            If segmentations are identical, 1 works well.
+            For imperfect segmentations try 0.6-0.8 to get better matching
+
+    Returns:
+        gtcells (np arr): Array of overlapping ids in the gt movie.
+        rescells (np arr): Array of overlapping ids in the res movie.
+
+    Raises:
+        ValueError: If .
     """
-    
-    def __init__(self, penalty_weights: Optional[Dict[str, float]] = None):
-        
-        # Default penalty weights
-        default_weights = {
-            'fp_track': 1.0,        # False positive track
-            'fn_track': 1.0,        # False negative track  
-            'swap': 0.5,            # Track ID swap
-            'missed_division': 2.0,  # Missed mitosis
-            'false_division': 2.0,   # False mitosis detection
-            'wrong_parent': 1.5,     # Wrong parent assignment
-            'gap': 0.3,             # Small temporal gap in track
-        }
-        
-        self.weights = penalty_weights if penalty_weights else default_weights
-        
-    def _extract_lineage_from_adjacency(
-        self, 
-        temporal_adj: np.ndarray
-    ) -> Dict[int, Dict]:
-        """
-        Extract lineage structure from temporal adjacency matrix.
-        
-        Args:
-            temporal_adj: (T-1, N, N, 3) adjacency matrix where:
-                [:, :, :, 0] = same cell probability
-                [:, :, :, 1] = different cell probability  
-                [:, :, :, 2] = daughter cell probability
-        
-        Returns:
-            Dictionary mapping track_id -> {
-                'frames': list of frames where track appears,
-                'daughters': list of daughter track IDs,
-                'parent': parent track ID or None
-            }
-        """
-        
-        T_minus_1, N, _, _ = temporal_adj.shape
-        T = T_minus_1 + 1
-        
-        lineage = {}
-        
-        # Initialize all possible tracks
-        for track_id in range(N):
-            lineage[track_id] = {
-                'frames': [],
-                'daughters': [],
-                'parent': None
-            }
-        
-        # Process each frame transition
-        for t in range(T_minus_1):
-            frame_adj = temporal_adj[t]  # (N, N, 3)
-            
-            # Check for same cell links (diagonal should be high)
-            for track_id in range(N):
-                same_prob = frame_adj[track_id, track_id, 0]
-                
-                # If same cell link exists, add frame to track
-                if same_prob > 0.5:  # threshold
-                    if t not in lineage[track_id]['frames']:
-                        lineage[track_id]['frames'].append(t)
-                    if t + 1 not in lineage[track_id]['frames']:
-                        lineage[track_id]['frames'].append(t + 1)
-            
-            # Check for division events
-            for parent_id in range(N):
-                for daughter_id in range(N):
-                    if parent_id == daughter_id:
-                        continue
-                    
-                    division_prob = frame_adj[parent_id, daughter_id, 2]
-                    
-                    if division_prob > 0.5:  # threshold
-                        lineage[parent_id]['daughters'].append(daughter_id)
-                        lineage[daughter_id]['parent'] = parent_id
-        
-        # Clean up - remove tracks with no frames
-        lineage = {k: v for k, v in lineage.items() if len(v['frames']) > 0}
-        
-        return lineage
-    
-    def _match_tracks(
-        self,
-        pred_lineage: Dict[int, Dict],
-        gt_lineage: Dict[int, Dict]
-    ) -> Tuple[Dict[int, int], set, set]:
-        """
-        Match predicted tracks to ground truth tracks using IoU overlap.
-        
-        Args:
-            pred_lineage: Predicted lineage structure
-            gt_lineage: Ground truth lineage structure
-        
-        Returns:
-            - matches: Dict mapping pred_track_id -> gt_track_id
-            - unmatched_pred: Set of unmatched predicted track IDs
-            - unmatched_gt: Set of unmatched ground truth track IDs
-        """
-        
-        pred_ids = list(pred_lineage.keys())
-        gt_ids = list(gt_lineage.keys())
-        
-        if not pred_ids or not gt_ids:
-            return {}, set(pred_ids), set(gt_ids)
-        
-        # Compute IoU matrix
-        iou_matrix = np.zeros((len(pred_ids), len(gt_ids)))
-        
-        for i, pred_id in enumerate(pred_ids):
-            pred_frames = set(pred_lineage[pred_id]['frames'])
-            
-            for j, gt_id in enumerate(gt_ids):
-                gt_frames = set(gt_lineage[gt_id]['frames'])
-                
-                intersection = len(pred_frames & gt_frames)
-                union = len(pred_frames | gt_frames)
-                
-                if union > 0:
-                    iou_matrix[i, j] = intersection / union
-        
-        # Use Hungarian algorithm to find optimal matching
-        # Maximize IoU = minimize negative IoU
-        row_ind, col_ind = linear_sum_assignment(-iou_matrix)
-        
-        matches = {}
-        matched_pred = set()
-        matched_gt = set()
-        
-        for i, j in zip(row_ind, col_ind):
-            if iou_matrix[i, j] > 0.5:  # Threshold for valid match
-                pred_id = pred_ids[i]
-                gt_id = gt_ids[j]
-                matches[pred_id] = gt_id
-                matched_pred.add(pred_id)
-                matched_gt.add(gt_id)
-        
-        unmatched_pred = set(pred_ids) - matched_pred
-        unmatched_gt = set(gt_ids) - matched_gt
-        
-        return matches, unmatched_pred, unmatched_gt
-    
-    def compute_cost_based_score(
-        self,
-        pred_temporal_adj: np.ndarray,
-        gt_temporal_adj: np.ndarray,
-        normalize: bool = True
-    ) -> Dict[str, float]:
-        """
-        Compute cost-based tracking score as requested.
-        
-        This starts from a perfect score and subtracts penalties for each error.
-        
-        Args:
-            pred_temporal_adj: (T-1, N, N, 3) predicted adjacency
-            gt_temporal_adj: (T-1, N, N, 3) ground truth adjacency
-            normalize: If True, normalize score by number of ground truth tracks
-        
-        Returns:
-            Dictionary with:
-                - 'total_score': Final score after penalties
-                - 'max_score': Maximum possible score
-                - 'normalized_score': Score normalized to [0, 1]
-                - 'error_counts': Dictionary of error type counts
-                - 'error_costs': Dictionary of costs per error type
-        """
-        
-        # Extract lineages
-        pred_lineage = self._extract_lineage_from_adjacency(pred_temporal_adj)
-        gt_lineage = self._extract_lineage_from_adjacency(gt_temporal_adj)
-        
-        # Match tracks
-        matches, unmatched_pred, unmatched_gt = self._match_tracks(
-            pred_lineage, gt_lineage
-        )
-        
-        # Initialize error tracking
-        error_counts = defaultdict(int)
-        error_costs = defaultdict(float)
-        
-        # Start with perfect score (1 point per ground truth track)
-        max_score = len(gt_lineage)
-        current_score = float(max_score)
-        
-        # 1. Penalize false positive tracks (predicted but not in GT)
-        error_counts['fp_track'] = len(unmatched_pred)
-        error_costs['fp_track'] = error_counts['fp_track'] * self.weights['fp_track']
-        current_score -= error_costs['fp_track']
-        
-        # 2. Penalize false negative tracks (in GT but not predicted)
-        error_counts['fn_track'] = len(unmatched_gt)
-        error_costs['fn_track'] = error_counts['fn_track'] * self.weights['fn_track']
-        current_score -= error_costs['fn_track']
-        
-        # 3. For matched tracks, check for errors
-        for pred_id, gt_id in matches.items():
-            pred_track = pred_lineage[pred_id]
-            gt_track = gt_lineage[gt_id]
-            
-            # Check for temporal gaps
-            pred_frames = set(pred_track['frames'])
-            gt_frames = set(gt_track['frames'])
-            
-            missed_frames = gt_frames - pred_frames
-            extra_frames = pred_frames - gt_frames
-            
-            gap_penalty = (len(missed_frames) + len(extra_frames)) * self.weights['gap']
-            error_counts['gap'] += len(missed_frames) + len(extra_frames)
-            error_costs['gap'] += gap_penalty
-            current_score -= gap_penalty
-            
-            # Check division events
-            pred_daughters = set(pred_track['daughters'])
-            gt_daughters = set(gt_track['daughters'])
-            
-            # Missed divisions
-            missed_divisions = len(gt_daughters - pred_daughters)
-            error_counts['missed_division'] += missed_divisions
-            error_costs['missed_division'] += missed_divisions * self.weights['missed_division']
-            current_score -= missed_divisions * self.weights['missed_division']
-            
-            # False divisions
-            false_divisions = len(pred_daughters - gt_daughters)
-            error_counts['false_division'] += false_divisions
-            error_costs['false_division'] += false_divisions * self.weights['false_division']
-            current_score -= false_divisions * self.weights['false_division']
-            
-            # Wrong parent assignments for matched daughters
-            for pred_daughter in pred_daughters:
-                if pred_daughter in matches:
-                    gt_daughter = matches[pred_daughter]
-                    if gt_daughter in gt_daughters:
-                        # Correct daughter detection
-                        pass
-                    else:
-                        # Daughter assigned to wrong parent
-                        error_counts['wrong_parent'] += 1
-                        error_costs['wrong_parent'] += self.weights['wrong_parent']
-                        current_score -= self.weights['wrong_parent']
-        
-        # Check for track swaps (more sophisticated)
-        # Two tracks that should be separate but got swapped
-        swap_count = self._detect_swaps(matches, pred_lineage, gt_lineage)
-        error_counts['swap'] = swap_count
-        error_costs['swap'] = swap_count * self.weights['swap']
-        current_score -= error_costs['swap']
-        
-        # Normalize if requested
-        normalized_score = current_score / max_score if max_score > 0 else 0.0
-        normalized_score = max(0.0, min(1.0, normalized_score))  # Clamp to [0, 1]
-        
-        return {
-            'total_score': current_score,
-            'max_score': max_score,
-            'normalized_score': normalized_score,
-            'error_counts': dict(error_counts),
-            'error_costs': dict(error_costs)
-        }
-    
-    def _detect_swaps(
-        self,
-        matches: Dict[int, int],
-        pred_lineage: Dict[int, Dict],
-        gt_lineage: Dict[int, Dict]
-    ) -> int:
-        """
-        Detect track ID swaps.
-        
-        A swap occurs when two predicted tracks map to two GT tracks,
-        but their frame assignments are crossed.
-        
-        This is a simplified heuristic - real swap detection is complex.
-        """
-        
-        swap_count = 0
-        matched_pairs = list(matches.items())
-        
-        for i in range(len(matched_pairs)):
-            for j in range(i + 1, len(matched_pairs)):
-                pred_i, gt_i = matched_pairs[i]
-                pred_j, gt_j = matched_pairs[j]
-                
-                # Get frame sets
-                pred_i_frames = set(pred_lineage[pred_i]['frames'])
-                pred_j_frames = set(pred_lineage[pred_j]['frames'])
-                gt_i_frames = set(gt_lineage[gt_i]['frames'])
-                gt_j_frames = set(gt_lineage[gt_j]['frames'])
-                
-                # Check for swap pattern:
-                # pred_i should overlap with gt_i, but also overlaps significantly with gt_j
-                # AND pred_j should overlap with gt_j, but also overlaps significantly with gt_i
-                
-                correct_overlap_i = len(pred_i_frames & gt_i_frames)
-                cross_overlap_i_j = len(pred_i_frames & gt_j_frames)
-                
-                correct_overlap_j = len(pred_j_frames & gt_j_frames)
-                cross_overlap_j_i = len(pred_j_frames & gt_i_frames)
-                
-                # Only count as swap if cross-overlap is substantial AND
-                # cross-overlap exceeds correct overlap (indicating actual swap)
-                if (cross_overlap_i_j > 2 and cross_overlap_j_i > 2 and
-                    cross_overlap_i_j > correct_overlap_i and 
-                    cross_overlap_j_i > correct_overlap_j):
-                    swap_count += 1
-        
-        return swap_count
-    
-    def compute_tra_score(
-        self,
-        pred_temporal_adj: np.ndarray,
-        gt_temporal_adj: np.ndarray
-    ) -> Dict[str, float]:
-        """
-        Compute TRA (Tracking Accuracy) score.
-        
-        TRA is a standard metric from the Cell Tracking Challenge.
-        
-        TRA = 1 - min(1, (AOGM / AOGM_0))
-        
-        where AOGM is the Acyclic Oriented Graph Matching score.
-        
-        Args:
-            pred_temporal_adj: Predicted adjacency matrix
-            gt_temporal_adj: Ground truth adjacency matrix
-        
-        Returns:
-            Dictionary with TRA score and components
-        """
-        
-        # Extract lineages
-        pred_lineage = self._extract_lineage_from_adjacency(pred_temporal_adj)
-        gt_lineage = self._extract_lineage_from_adjacency(gt_temporal_adj)
-        
-        # Match tracks
-        matches, unmatched_pred, unmatched_gt = self._match_tracks(
-            pred_lineage, gt_lineage
-        )
-        
-        # Compute AOGM components
-        # ED: number of edges to delete (FP)
-        # EA: number of edges to add (FN)  
-        # EC: number of edges to alter (semantic errors)
-        
-        ED = len(unmatched_pred)  # False positive tracks
-        EA = len(unmatched_gt)    # False negative tracks
-        EC = 0  # Semantic errors in matched tracks
-        
-        # Count semantic errors (divisions, merges, etc.)
-        for pred_id, gt_id in matches.items():
-            pred_track = pred_lineage[pred_id]
-            gt_track = gt_lineage[gt_id]
-            
-            # Division errors
-            pred_daughters = len(pred_track['daughters'])
-            gt_daughters = len(gt_track['daughters'])
-            
-            if pred_daughters != gt_daughters:
-                EC += abs(pred_daughters - gt_daughters)
-        
-        # Compute AOGM
-        AOGM = ED + EA + EC
-        
-        # AOGM_0 is the cost of constructing GT from scratch
-        AOGM_0 = len(gt_lineage)  # Each GT track costs 1 to add
-        
-        # Compute TRA
-        if AOGM_0 > 0:
-            TRA = max(0.0, 1.0 - min(1.0, AOGM / AOGM_0))
+    num_frames = gt.shape[0]
+    iou = np.zeros((num_frames, np.max(gt) + 1, np.max(res) + 1))
+
+    # TODO: Compute IOUs only when neccesary
+    # If bboxs for true and pred do not overlap with each other, the assignment is immediate
+    # Otherwise use pixel-wise IOU to determine which cell is which
+
+    # Regionprops expects one frame at a time
+    for frame in range(num_frames):
+        gt_frame = gt[frame]
+        res_frame = res[frame]
+
+        gt_props = regionprops(np.squeeze(gt_frame.astype('int')))
+        gt_boxes = [np.array(gt_prop.bbox) for gt_prop in gt_props]
+        gt_boxes = np.array(gt_boxes).astype('double')
+        gt_box_labels = [int(gt_prop.label) for gt_prop in gt_props]
+
+        res_props = regionprops(np.squeeze(res_frame.astype('int')))
+        res_boxes = [np.array(res_prop.bbox) for res_prop in res_props]
+        res_boxes = np.array(res_boxes).astype('double')
+        res_box_labels = [int(res_prop.label) for res_prop in res_props]
+
+        overlaps = compute_overlap_vectorized(gt_boxes, res_boxes)    # has the form [gt_bbox, res_bbox]
+
+        # Find the bboxes that have overlap at all (ind_ corresponds to box number - starting at 0)
+        ind_gt, ind_res = np.nonzero(overlaps)
+
+        # frame_ious = np.zeros(overlaps.shape)
+        for index in range(ind_gt.shape[0]):
+
+            iou_gt_idx = gt_box_labels[ind_gt[index]]
+            iou_res_idx = res_box_labels[ind_res[index]]
+            intersection = np.logical_and(gt_frame == iou_gt_idx, res_frame == iou_res_idx)
+            union = np.logical_or(gt_frame == iou_gt_idx, res_frame == iou_res_idx)
+            iou[frame, iou_gt_idx, iou_res_idx] = intersection.sum() / union.sum()
+
+    gtcells, rescells = np.where(np.nansum(iou, axis=0) >= threshold)
+
+    return gtcells, rescells
+
+
+def trk_to_graph(lineage, node_key=None):
+    """Converts a lineage dictionary into a graph representation of the lineages
+
+    Args:
+        lineage (dict): Dictionary of lineage data
+        node_key (dict): Map between gt nodes and result nodes
+
+    Returns:
+        networkx.Graph: Graph representation of the lineage data.
+    """
+    edges = []
+
+    all_ids = set()
+    single_nodes = set()
+    attributes = {}
+
+    for i, lin in lineage.items():
+        # Update cell id if node_key is available
+        if node_key and (i in node_key):
+            idx = node_key[i]
         else:
-            TRA = 0.0
-        
-        return {
-            'TRA': TRA,
-            'AOGM': AOGM,
-            'AOGM_0': AOGM_0,
-            'ED': ED,
-            'EA': EA,
-            'EC': EC,
-            'num_pred_tracks': len(pred_lineage),
-            'num_gt_tracks': len(gt_lineage),
-            'num_matched_tracks': len(matches)
-        }
-    
-    def compute_division_metrics(
-        self,
-        pred_temporal_adj: np.ndarray,
-        gt_temporal_adj: np.ndarray
-    ) -> Dict[str, float]:
-        """
-        Compute precision, recall, and F1 specifically for division events.
-        
+            idx = i
+
+        cellids = ['{}_{}'.format(idx, t) for t in lin['frames']]
+
+        if len(cellids) == 1:
+            single_nodes.add(cellids[0])
+
+        all_ids.update(cellids)
+        edges.append(pd.DataFrame({
+            'source': cellids[0:-1],
+            'target': cellids[1:]
+        }))
+
+        # Add connections to any daughters
+        source = '{}_{}'.format(idx, max(lin['frames']))
+        for d in lin['daughters']:
+            # Update cell id if node_key is available
+            if node_key and (i in node_key):
+                d_idx = node_key[d]
+            else:
+                d_idx = d
+
+            # Assume daughter appears in next frame
+            target = '{}_{}'.format(d_idx, max(lin['frames']) + 1)
+            edges.append(pd.DataFrame({
+                'source': [source],
+                'target': [target]
+            }))
+
+            attributes[source] = {'division': True}
+
+    # Create graph
+    edges = pd.concat(edges)
+    G = nx.from_pandas_edgelist(edges, source='source', target='target', create_using=nx.DiGraph)
+    nx.set_node_attributes(G, attributes)
+
+    # Add all isolates to graph
+    for cell_id in single_nodes:
+        G.add_node(cell_id)
+
+    return G
+
+
+def map_node(gt_node, G_res, cells_gt, cells_res):
+    """Finds the res node that matches the gt_node submitted
+
+    Args:
+        gt_node (str): String matching form '{cell id}_{frame}'
+        G_res (networkx.graph): Graph of the results
+        cells_gt (np.array): Array containing ground truth cell ids corresponding to res ids
+        cells_res (np.array): Array containing corresponding res ids
+    """
+    idx = int(gt_node.split('_')[0])
+    frame = int(gt_node.split('_')[1])
+
+    if idx in cells_gt:
+        for r_idx in cells_res[cells_gt == idx]:
+            # Check if node exists with the right frame
+            r_node = '{}_{}'.format(r_idx, frame)
+            if r_node in G_res.nodes:
+                return r_node
+        else:
+            # Can't find result node so return original gt node
+            return gt_node
+    elif gt_node in G_res.nodes:
+        return gt_node
+    else:
+        return gt_node
+
+
+def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[]):
+    """Compare two graphs and calculate the cell division confusion matrix.
+
+    WARNING: This function will only work if the labels underlying both
+    graphs are the same. E.G. the parents only match if the same label
+    splits in the same frame - but each movie isn't guaranteed to be labeled
+    in the same way (with the same order). Should be used with match_nodes
+
+    Args:
+        G_gt (networkx.Graph): Ground truth cell lineage graph.
+        G_res (networkx.Graph): Predicted cell lineage graph.
+        cells_gt (np.ndarray): List of ground truth cell ids from `match_nodes`
+        cells_res (np.ndarray): List of result cell ids from `match_nodes`
+
+    Returns:
+        dict: Diciontary of all division statistics
+
+    Raises:
+        ValueError: cells_gt and cells_res must be the same length
+    """
+    if len(cells_gt) != len(cells_res):
+        raise ValueError('cells_gt and cells_res must be the same length.')
+
+    def _map_node(gt_node):
+        return map_node(gt_node, G_res, cells_gt, cells_res)
+
+    # Identify nodes with parent attribute
+    div_gt = [node for node, d in G_gt.nodes(data=True)
+              if d.get('division', False)]
+    div_res = [node for node, d in G_res.nodes(data=True)
+               if d.get('division', False)]
+
+    correct = []         # Correct division
+    incorrect = []       # Wrong/mismatch division
+    missed = []          # Missed division
+
+    for node in div_gt:
+        idx = int(node.split('_')[0])
+        frame = int(node.split('_')[1])
+
+        # Check if the index is mapped onto a different results index
+        if idx in cells_gt:
+            for r_idx in cells_res[cells_gt == idx]:
+                # Check if node exists with the right frame
+                r_node = '{}_{}'.format(r_idx, frame)
+                if r_node in G_res.nodes:
+                    break  # Exit for loop since we found the right node
+            else:
+                # Node doesn't exist so count this division as missed
+                print('missed node {} division completely'.format(node))
+                missed.append(node)
+                continue  # move on to next node in div_gt
+        # Check if the node exists with same id in G_res
+        elif node in G_res.nodes:
+            r_node = node
+        # Node doesn't exist
+        else:
+            print('missed node {} division completely'.format(node))
+            missed.append(node)
+            continue  # move on to next node in div_gt
+
+        # If we found the results node, evaluate division result
+        # Get gt predecessors and successors for comparsion
+        # Map gt nodes onto results nodes if possible
+        pred_gt = [_map_node(n) for n in G_gt.pred[node]]
+        succ_gt = [_map_node(n) for n in G_gt.succ[node]]
+
+        # Check if res node was also called a division
+        if r_node in div_res:
+            # Get res predecessors and successor
+            pred_res = list(G_res.pred[r_node])
+            succ_res = list(G_res.succ[r_node])
+
+            # Parents and daughters are the same, perfect!
+            if (Counter(pred_gt) == Counter(pred_res) and
+                    Counter(succ_gt) == Counter(succ_res)):
+                correct.append(node)
+
+            else:  # what went wrong?
+                incorrect.append(node)
+                errors = ['out degree = {}'.format(G_res.out_degree(r_node))]
+                if Counter(succ_gt) != Counter(succ_res):
+                    errors.append('daughters mismatch')
+                if Counter(pred_gt) != Counter(pred_res):
+                    errors.append('parents mismatch')
+                if G_res.out_degree(r_node) == G_gt.out_degree(node):
+                    errors.append('gt and res degree equal')
+                print(node, '{}.'.format(', '.join(errors)))
+
+            div_res.remove(r_node)
+
+        else:  # valid division not in results, it was missed
+            print('missed node {} division completely'.format(node))
+            missed.append(node)
+
+    # Count any remaining res nodes as false positives
+    false_positive = div_res
+
+    return {
+        'correct_division': correct,
+        'mismatch_division': incorrect,
+        'false_positive_division': false_positive,
+        'false_negative_division': missed,
+        'total_divisions': len(div_gt)
+    }
+
+
+def correct_shifted_divisions(
+        false_negative_division, false_positive_division, correct_division,
+        y_gt, y_res,
+        G_gt, G_res,
+        threshold):
+    """Correct divisions errors that are shifted by a frame and should be counted as correct
+
+    Args:
+        false_negative_division (list): List of nodes classifed as a false negative division
+        false_positive_division (list): List of nodes classified as false positive division
+        correct_division (list): List of nodes where divisions were correctly assigned
+        y_gt (np.array): Y mask for the ground truth data
+        y_res (np.array): Y mask for the predicted data
+        G_gt (networkx.graph): Graph of the ground truth
+        G_res (networkx.graph): Graph of the results
+        threshold (float): Value between 0 and 1 used to determine matching cells using IoU
+
+    Returns:
+        dict: Dictionary of updated false_negative_division, false_positive_division
+            and correct_division lists
+    """
+
+    metrics = {
+        'false_negative_division': false_negative_division,
+        'false_positive_division': false_positive_division,
+        'correct_division': correct_division
+    }
+    y = {'gt': y_gt, 'res': y_res}
+    G = {'gt': G_gt, 'res': G_res}
+
+    # Explicitly label nodes according to source
+    false_negative_division = ['gt-' + n for n in false_negative_division]
+    false_positive_division = ['res-' + n for n in false_positive_division]
+
+    # Convert to dictionary for lookup by frame
+    d_false_negative_division, d_fp = {}, {}
+    for d, j in [(d_false_negative_division, false_negative_division),
+                 (d_fp, false_positive_division)]:
+        for n in j:
+            t = int(n.split('_')[-1])
+            v = d.get(t, [])
+            v.append(n)
+            d[t] = v
+
+    frame_pairs = []
+    for t in d_false_negative_division:
+        if t + 1 in d_fp:
+            frame_pairs.append((t, t + 1))
+        if t - 1 in d_fp:
+            frame_pairs.append((t - 1, t))
+
+    # Convert to set to remove any duplicates
+    frame_pairs = list(set(frame_pairs))
+
+    matches = []
+
+    # Loop over each pair of frames
+    for t1, t2 in frame_pairs:
+        # Get nodes from each frames
+        n1s = d_false_negative_division.get(t1, []) + d_fp.get(t1, [])
+        n2s = d_false_negative_division.get(t2, []) + d_fp.get(t2, [])
+
+        # Compare each pair and save if they are above the threshold
+        for n1, n2 in itertools.product(n1s, n2s):
+            source1, node1 = n1.split('-')[0], n1.split('-')[1]
+            source2, node2 = n2.split('-')[0], n2.split('-')[1]
+
+            # Check if the nodes are from different sources
+            if source1 == source2:
+                continue
+
+            # Compare sum of daughters in n1 to parent in n2
+            daughters = [int(d.split('_')[0]) for d in list(G[source1].succ[node1])]
+            if len(daughters) == 1:
+                mask1 = y[source1][t2] == daughters[0]
+            else:
+                mask1 = np.logical_or(
+                    y[source1][t2] == daughters[0],
+                    y[source1][t2] == daughters[1])
+                if len(daughters) > 2:
+                    for d in range(2, len(daughters)):
+                        mask1 = np.logical_or(
+                            mask1,
+                            y[source1][t2] == daughters[d]
+                        )
+            mask2 = y[source2][t2] == int(node2.split('_')[0])
+
+            # Compute iou
+            intersection = np.logical_and(mask1, mask2)
+            union = np.logical_or(mask1, mask2)
+            iou = intersection.sum() / union.sum()
+            if iou >= threshold:
+                matches.extend([n1, n2])
+
+    # Remove matches from the list of errors
+    for n in matches:
+        source, node = n.split('-')[0], n.split('-')[1]
+        # Remove error counts
+        if source == 'gt':
+            metrics['false_negative_division'].remove(node)
+            # Add node to the correct_division count
+            metrics['correct_division'].append(node)
+            print('corrected division {} as a frameshift division not an error'.format(node))
+        elif source == 'res':
+            metrics['false_positive_division'].remove(node)
+
+    return metrics
+
+
+def calculate_association_accuracy(lineage_gt, lineage_res, cells_gt=[], cells_res=[]):
+    """Calculate the association accuracy for each ground truth lineage
+
+    Defined as the number of true positive associations between cells divided by
+    the total number of ground truth associations. Associations are equivalent to
+    the edges that connect cells in a graph. As described by:
+        - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
+          Representation of Motion and Position Map for Cell Tracking. In 2020 IEEE/CVF
+          Conference on Computer Vision and Pattern Recognition (CVPR) (IEEE).
+        - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R. (2020).
+          Weakly-Supervised Cell Tracking via Backward-and-Forward Propagation. In
+          Computer Vision - ECCV 2020 Lecture Notes in Computer Science.
+
+    Args:
+        lineage_gt (dict): Ground truth lineages
+        linage_res (dict): Predicted lineages
+        cells_gt (list): List of ground truth cell ids from `match_nodes`
+        cells_res (list): List of result cell ids from `match_nodes`
+
+    Returns:
+        int: Number of true positive associations
+        int: Total number of associations
+
+    Raises:
+        ValueError: cells_gt and cells_res must be the same length
+    """
+    if len(cells_gt) != len(cells_res):
+        raise ValueError('cells_gt and cells_res must be the same length.')
+
+    true_positive = 0
+    total = 0
+
+    for g_idx, g_lin in lineage_gt.items():
+        # Calculate gt edges
+        g_frames = g_lin['frames']
+        g_edges = ['{}-{}'.format(t0, t1) for t0, t1 in zip(g_frames[:-1], g_frames[1:])]
+        total += len(g_edges)
+
+        # Check for any mappings
+        if g_idx in cells_gt:
+            scores = []
+            for r_idx in cells_res[cells_gt == g_idx]:
+                r_frames = lineage_res[r_idx]['frames']
+                r_edges = ['{}-{}'.format(t0, t1) for t0, t1 in zip(r_frames[:-1], r_frames[1:])]
+                scores.append(sum(r in g_edges for r in r_edges))
+            true_positive += max(scores)
+
+        # Check if the idx already matches
+        elif g_idx in lineage_res:
+            r_frames = lineage_res[g_idx]['frames']
+            r_edges = ['{}-{}'.format(t0, t1) for t0, t1 in zip(r_frames[:-1], r_frames[1:])]
+            true_positive += sum(r in g_edges for r in r_edges)
+
+    return true_positive, total
+
+
+def calculate_target_effectiveness(lineage_gt, lineage_res, cells_gt=[], cells_res=[]):
+    """Calculate the target effectiveness. Final score can be obtained by dividing
+    true_positive by total
+
+    The TE measure considers the number of cell instances correctly associated within
+    a track with respect to the total number of cells in a track. Only the best possible
+    true positive score is recorded for each ground truth lineage As described by:
+        - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
+          Representation of Motion and Position Map for Cell Tracking. In 2020 IEEE/CVF
+          Conference on Computer Vision and Pattern Recognition (CVPR) (IEEE).
+        - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R. (2020).
+          Weakly-Supervised Cell Tracking via Backward-and-Forward Propagation. In
+          Computer Vision - ECCV 2020 Lecture Notes in Computer Science.
+
+    Args:
+        lineage_gt (dict): Ground truth lineages
+        linage_res (dict): Predicted lineages
+        cells_gt (list): List of ground truth cell ids from `match_nodes`
+        cells_res (list): List of result cell ids from `match_nodes`
+
+    Returns:
+        int: Number of true positive assignments of cells to lineages
+        int: Number of cells present in ground truth
+
+    Raises:
+        ValueError: cells_gt and cells_res must be the same length
+    """
+    if len(cells_gt) != len(cells_res):
+        raise ValueError('cells_gt and cells_res must be the same length.')
+
+    true_positive = 0
+    total = 0
+
+    for g_idx, g_lin in lineage_gt.items():
+        # Check for any mappings
+        if g_idx in cells_gt:
+            # Collect candidates for overlaps, but only save the best
+            scores = []
+            for r_idx in cells_res[cells_gt == g_idx]:
+                r_frames = lineage_res[r_idx]['frames']
+                scores.append(sum(r in g_lin['frames'] for r in r_frames))
+
+            true_positive += max(scores)
+
+        # Check if the idx already matches
+        elif g_idx in lineage_res:
+            r_frames = lineage_res[g_idx]['frames']
+            true_positive += sum(r in g_lin['frames'] for r in r_frames)
+
+        # Save total assigments for this gt lineage
+        total += len(g_lin['frames'])
+
+    return true_positive, total
+
+
+def calculate_summary_stats(correct_division,
+                            false_positive_division,
+                            false_negative_division,
+                            total_divisions,
+                            aa_total, aa_tp,
+                            te_total, te_tp,
+                            n_digits=2):
+    """Calculate additional summary statistics for tracking performance
+    based on results of classify_divisions
+
+    Catch ZeroDivisionError and set to 0 instead
+
+    Args:
+        correct_division (int): True positive or "correct divisions"
+        false_positive_division (int): False positives
+        false_negative_division (int): False negatives
+        total_divisions (int): Total number of ground truth divisions
+        aa_total (int): Total number of ground truth associations
+        aa_tp (int): True positive associations
+        te_total (int): Total number of target assignments
+        te_tp (int): True positive target assignments
+        n_digits (int, optional): Number of digits to round to. Default 2.
+    """
+
+    _round = functools.partial(round, ndigits=n_digits)
+
+    try:
+        recall = correct_division / (correct_division + false_negative_division)
+    except ZeroDivisionError:
+        recall = 0
+
+    try:
+        precision = correct_division / (correct_division + false_positive_division)
+    except ZeroDivisionError:
+        precision = 0
+
+    try:
+        f1 = 2 * (recall * precision) / (recall + precision)
+    except ZeroDivisionError:
+        f1 = 0
+
+    try:
+        mbc = correct_division / (correct_division
+                                  + false_negative_division
+                                  + false_positive_division)
+    except ZeroDivisionError:
+        mbc = 0
+
+    try:
+        fraction_miss = false_negative_division / total_divisions
+    except ZeroDivisionError:
+        fraction_miss = 0
+
+    try:
+        aa = aa_tp / aa_total
+    except ZeroDivisionError:
+        aa = 0
+
+    try:
+        te = te_tp / te_total
+    except ZeroDivisionError:
+        te = 0
+
+    return {
+        'Division Recall': _round(recall),
+        'Division Precision': _round(precision),
+        'Division F1': _round(f1),
+        'Mitotic branching correctness': _round(mbc),
+        'Fraction missed divisions': _round(fraction_miss),
+        'Association Accuracy': _round(aa),
+        'Target Effectiveness': _round(te)
+    }
+
+
+class TrackingMetrics:
+    def __init__(self,
+                 lineage_gt, y_gt,
+                 lineage_res, y_res,
+                 threshold=1,
+                 allow_division_shift=True):
+        """Class to coordinate the benchmarking of a pair of trk files
+
         Args:
-            pred_temporal_adj: Predicted adjacency matrix
-            gt_temporal_adj: Ground truth adjacency matrix
-        
-        Returns:
-            Dictionary with division detection metrics
+            lineage_gt (dict): Ground truth lineages
+            linage_res (dict): Predicted lineages
+            y_gt (np.array): Y mask for the ground truth data
+            y_res (np.array): Y mask for the predicted data
+            threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
+                If segmentations are identical, 1 works well.
+                For imperfect segmentations try 0.6-0.8 to get better matching
+            allow_division_shift (optional, bool): Allows divisions to be treated as correct if
+                they are off by a single frame. Default True.
         """
-        
-        # Extract lineages
-        pred_lineage = self._extract_lineage_from_adjacency(pred_temporal_adj)
-        gt_lineage = self._extract_lineage_from_adjacency(gt_temporal_adj)
-        
-        # Count divisions
-        pred_divisions = sum(1 for track in pred_lineage.values() 
-                           if len(track['daughters']) > 0)
-        gt_divisions = sum(1 for track in gt_lineage.values() 
-                         if len(track['daughters']) > 0)
-        
-        # Match tracks to count true positive divisions
-        matches, _, _ = self._match_tracks(pred_lineage, gt_lineage)
-        
-        tp_divisions = 0
-        for pred_id, gt_id in matches.items():
-            pred_has_division = len(pred_lineage[pred_id]['daughters']) > 0
-            gt_has_division = len(gt_lineage[gt_id]['daughters']) > 0
-            
-            if pred_has_division and gt_has_division:
-                tp_divisions += 1
-        
-        # Compute metrics
-        precision = tp_divisions / pred_divisions if pred_divisions > 0 else 0.0
-        recall = tp_divisions / gt_divisions if gt_divisions > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall) 
-              if (precision + recall) > 0 else 0.0)
-        
+
+        self.lineage_gt = lineage_gt
+        self.lineage_res = lineage_res
+        self.y_gt = y_gt
+        self.y_res = y_res
+        self.threshold = threshold
+        self.allow_division_shift = allow_division_shift
+
+        # Match up labels in GT to Results to allow for direct comparisons
+        self.cells_gt, self.cells_res = match_nodes(y_gt, y_res, self.threshold)
+
+        # Generate graphs without remapping nodes to avoid losing lineages
+        self.G_gt = trk_to_graph(lineage_gt)
+        self.G_res = trk_to_graph(lineage_res)
+
+        self.stats = self.calculate_metrics()
+
+    def calculate_metrics(self):
+        # Classify divison errors
+        stats = classify_divisions(
+            self.G_gt, self.G_res, cells_gt=self.cells_gt, cells_res=self.cells_res)
+
+        if self.allow_division_shift:
+            updates = correct_shifted_divisions(
+                false_negative_division=stats['false_negative_division'],
+                false_positive_division=stats['false_positive_division'],
+                correct_division=stats['correct_division'],
+                y_gt=self.y_gt,
+                y_res=self.y_res,
+                G_gt=self.G_gt,
+                G_res=self.G_res,
+                threshold=self.threshold)
+
+            for k, v in updates.items():
+                stats[k] = v
+
+        # Convert list of nodes to counts
+        for k, v in stats.items():
+            if isinstance(v, list):
+                stats[k] = len(v)
+
+        # Calculate aa and te
+        aa_tp, aa_total = calculate_association_accuracy(
+            self.lineage_gt, self.lineage_res, self.cells_gt, self.cells_res)
+
+        te_tp, te_total = calculate_target_effectiveness(
+            self.lineage_gt, self.lineage_res, self.cells_gt, self.cells_res)
+
         return {
-            'division_precision': precision,
-            'division_recall': recall,
-            'division_f1': f1,
-            'pred_divisions': pred_divisions,
-            'gt_divisions': gt_divisions,
-            'tp_divisions': tp_divisions
-        }
-    
-    def evaluate_all(
-        self,
-        pred_temporal_adj: np.ndarray,
-        gt_temporal_adj: np.ndarray
-    ) -> Dict[str, Dict]:
-        """
-        Compute all evaluation metrics.
-        
-        Args:
-            pred_temporal_adj: (T-1, N, N, 3) predicted adjacency
-            gt_temporal_adj: (T-1, N, N, 3) ground truth adjacency
-        
-        Returns:
-            Dictionary containing all metrics
-        """
-        
-        return {
-            'cost_based': self.compute_cost_based_score(
-                pred_temporal_adj, gt_temporal_adj
-            ),
-            'tra': self.compute_tra_score(
-                pred_temporal_adj, gt_temporal_adj
-            ),
-            'divisions': self.compute_division_metrics(
-                pred_temporal_adj, gt_temporal_adj
-            )
+            **stats,
+            'aa_tp': aa_tp,
+            'aa_total': aa_total,
+            'te_tp': te_tp,
+            'te_total': te_total
         }
 
 
-def pretty_print_results(results: Dict[str, Dict]):
-    """Pretty print evaluation results."""
-    
-    print("\n" + "="*70)
-    print("TRACKING EVALUATION RESULTS")
-    print("="*70)
-    
-    # Cost-based score
-    if 'cost_based' in results:
-        print("\n[Cost-Based Scoring]")
-        cb = results['cost_based']
-        print(f"  Normalized Score: {cb['normalized_score']:.4f}")
-        print(f"  Total Score: {cb['total_score']:.2f} / {cb['max_score']:.2f}")
-        print(f"\n  Error Breakdown:")
-        for error_type, count in cb['error_counts'].items():
-            cost = cb['error_costs'][error_type]
-            print(f"    {error_type:20s}: {count:3d} errors (cost: {cost:.2f})")
-    
-    # TRA score
-    if 'tra' in results:
-        print("\n[TRA Score (Cell Tracking Challenge)]")
-        tra = results['tra']
-        print(f"  TRA: {tra['TRA']:.4f}")
-        print(f"  AOGM: {tra['AOGM']:.2f} / {tra['AOGM_0']:.2f}")
-        print(f"  Tracks: {tra['num_matched_tracks']} matched, "
-              f"{tra['ED']} FP, {tra['EA']} FN")
-        print(f"  Semantic Errors: {tra['EC']}")
-    
-    # Division metrics
-    if 'divisions' in results:
-        print("\n[Division Detection]")
-        div = results['divisions']
-        print(f"  Precision: {div['division_precision']:.4f}")
-        print(f"  Recall:    {div['division_recall']:.4f}")
-        print(f"  F1 Score:  {div['division_f1']:.4f}")
-        print(f"  Divisions: {div['tp_divisions']} TP, "
-              f"{div['pred_divisions']} pred, {div['gt_divisions']} GT")
-    
-    print("\n" + "="*70 + "\n")
+def benchmark_tracking_performance(trk_gt, trk_res, threshold=1, allow_division_shift=True):
+    """Compare two related .trk files (one being the GT of the other)
 
+    Calculate division statistics, target effectiveness and association accuracy
 
-# Example usage
-if __name__ == "__main__":
-    
-    print("Testing Tracking Evaluation Metrics")
-    print("="*70)
-    
-    # Create synthetic test data
-    T, N = 8, 10
-    
-    # Ground truth: simple lineage with one division
-    gt_adj = np.zeros((T-1, N, N, 3))
-    
-    # Track 0: frames 0-3, divides at frame 3
-    gt_adj[0:3, 0, 0, 0] = 1.0  # same cell
-    gt_adj[2, 0, 1, 2] = 1.0    # division to track 1
-    gt_adj[2, 0, 2, 2] = 1.0    # division to track 2
-    gt_adj[1:3, 0, 0, 1] = 0.0  # mark as not different
-    
-    # Track 1: frames 3-7 (daughter)
-    gt_adj[3:, 1, 1, 0] = 1.0
-    
-    # Track 2: frames 3-7 (daughter)
-    gt_adj[3:, 2, 2, 0] = 1.0
-    
-    # Track 3: frames 0-7 (independent)
-    gt_adj[:, 3, 3, 0] = 1.0
-    
-    # Mark everything else as "different"
-    for t in range(T-1):
-        for i in range(N):
-            for j in range(N):
-                if gt_adj[t, i, j, :].sum() == 0:
-                    gt_adj[t, i, j, 1] = 1.0
-    
-    # Predicted: similar but with some errors
-    pred_adj = gt_adj.copy()
-    
-    # Introduce error: miss the division
-    pred_adj[2, 0, 1, 2] = 0.0  # miss one daughter
-    pred_adj[2, 0, 1, 1] = 1.0  # mark as different instead
-    
-    # Introduce error: add a false positive track
-    pred_adj[:4, 4, 4, 0] = 1.0  # spurious track
-    
-    # Initialize evaluator
-    evaluator = TrackingEvaluator()
-    
-    # Compute all metrics
-    results = evaluator.evaluate_all(pred_adj, gt_adj)
-    
-    # Print results
-    pretty_print_results(results)
-    
-    print("\nTesting with perfect prediction:")
-    perfect_results = evaluator.evaluate_all(gt_adj, gt_adj)
-    pretty_print_results(perfect_results)
+    Currently included for backwards compatibility, but is no longer necessary
+
+    Args:
+        trk_gt (path): Path to the ground truth .trk file.
+        trk_res (path): Path to the predicted results .trk file.
+        threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
+            If segmentations are identical, 1 works well.
+            For imperfect segmentations try 0.6-0.8 to get better matching
+    """
+
+    # Load data
+    m = TrackingMetrics.from_trk_files(trk_gt, trk_res,
+                                       threshold=threshold,
+                                       allow_division_shift=allow_division_shift)
+
+    return m.stats

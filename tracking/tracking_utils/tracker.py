@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from skimage.segmentation import relabel_sequential
-from utils import get_max_cells, get_image_features
+from utils import get_max_cells, get_image_features, histogram_normalization
 
 
 class CellTracker:
@@ -167,6 +167,10 @@ class CellTracker:
         max_cells = get_max_cells(self.y)
         n_frames = self.X.shape[self.time_axis]
         n_channels = self.X.shape[self.channel_axis]
+
+        if self.norm:
+            print("Preprocessing whole image with CLAHE...")
+            self.X = histogram_normalization(self.X, data_format='channels_last')
 
         # Initialize feature arrays
         appearances = np.zeros(
@@ -415,14 +419,17 @@ class CellTracker:
         cost_matrix[:num_tracks, :num_cells] = assignment_matrix
         
         # Bottom-left: Birth costs (diagonal = self.birth, rest = 1)
-        birth_matrix = np.ones((num_cells, num_cells), dtype=self.dtype)
-        birth_matrix += np.diag([self.birth - 1] * num_cells)
-        cost_matrix[num_tracks:, :num_cells] = birth_matrix
+        birth_diagonal = np.array([self.birth] * num_cells)
+        birth_matrix = np.zeros((num_cells, num_cells), dtype=self.dtype)
+        birth_matrix = np.diag(birth_diagonal) + np.ones(birth_matrix.shape)
+        birth_matrix = birth_matrix - np.eye(num_cells)
+        cost_matrix[num_tracks:, 0:num_cells] = birth_matrix
         
         # Top-right: Death costs (diagonal = self.death, rest = 1)
         death_matrix = np.ones((num_tracks, num_tracks), dtype=self.dtype)
-        death_matrix += np.diag([self.death - 1] * num_tracks)
-        cost_matrix[:num_tracks, num_cells:] = death_matrix
+        death_matrix = self.death * np.eye(num_tracks) + death_matrix
+        death_matrix = death_matrix - np.eye(num_tracks)
+        cost_matrix[0:num_tracks, num_cells:] = death_matrix
         
         # Bottom-right: Mordor (transpose of assignment)
         cost_matrix[num_tracks:, num_cells:] = assignment_matrix.T
@@ -490,9 +497,9 @@ class CellTracker:
         # Extract probabilities: (1, 1, N, M, 3) -> (N, M, 3)
         predictions = predictions[0, 0].cpu().numpy()
         
-        # Build assignment matrix from "same cell" probabilities (class 0)
+        # Build assignment matrix from "same cell" probabilities (class 1)
         # Cost = 1 - P(same cell)
-        assignment_matrix = 1 - predictions[..., 0]
+        assignment_matrix = 1 - predictions[..., 1]
         
         # Set high cost for capped tracks (already divided)
         for i, track_id in enumerate(relevant_tracks):

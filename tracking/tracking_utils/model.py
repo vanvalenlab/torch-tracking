@@ -315,8 +315,6 @@ class GNNTrackingModel(nn.Module):
         batch_size = appearances.shape[0]
         time_steps = appearances.shape[1]
         n_cells = appearances.shape[2]
-
-        print(batch_size, time_steps, n_cells)
         
         # CRITICAL FIX: Reshape to merge only batch and time
         # (B, T, N, ...) -> (B*T, N, ...)
