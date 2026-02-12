@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from math import log2
 
-from modules import SemanticHead, FeaturePyramidNetwork, Location2D, BackboneNetwork
+from segmentation.modules import SemanticHead, FeaturePyramidNetwork, Location2D, BackboneNetwork
 
 # In model.py - Update PanopticNet class
 

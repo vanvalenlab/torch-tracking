@@ -34,7 +34,7 @@ from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 from dataclasses import dataclass
 
-from geometry_utils import compute_overlap_vectorized, get_box_labels, _cast_to_tuple
+from segmentation.geometry_utils import compute_overlap_vectorized, get_box_labels, _cast_to_tuple
 
 @dataclass
 class Detection():  # pylint: disable=useless-object-inheritance

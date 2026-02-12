@@ -7,10 +7,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 
-from model import PanopticNet
-from loss import SemanticLoss, LossTracker
-from loaders import create_data_loaders
-from utils import create_sample_overlay
+from segmentation.model import PanopticNet
+from segmentation.loss import SemanticLoss, LossTracker
+from segmentation.loaders import create_data_loaders
+from segmentation.utils import create_sample_overlay
 
 import zarr
 

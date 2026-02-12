@@ -1,4 +1,4 @@
-from dnn import DNN
+from segmentation.dnn import DNN
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 from skimage.color import label2rgb
 from skimage.exposure import rescale_intensity
 
-from metrics import Metrics
+from segmentation.metrics import Metrics
 from scipy.stats import hmean
 import numpy as np
 

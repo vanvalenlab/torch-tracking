@@ -3,8 +3,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 import zarr
-from transforms import transform_masks
-from utils import histogram_normalization
+from segmentation.transforms import transform_masks
+from segmentation.utils import histogram_normalization
 from torchvision.transforms.v2 import functional as F
 import random
 
