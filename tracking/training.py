@@ -8,9 +8,9 @@ import json
 from typing import Dict
 import time
 import datetime
-from model import GNNTrackingModel
-from loader import create_trk_dataloaders
-from utils import weighted_categorical_crossentropy_v2
+from tracking.model import GNNTrackingModel
+from tracking.loader import create_trk_dataloaders
+from tracking.utils import weighted_categorical_crossentropy_v2
 import numpy as np
 
 class TrackingLoss(nn.Module):

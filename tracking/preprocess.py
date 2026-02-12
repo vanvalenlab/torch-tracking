@@ -5,7 +5,7 @@ import tarfile
 import zarr
 import glob
 
-from utils import relabel_sequential_lineage, get_image_features, histogram_normalization
+from tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
 
@@ -248,6 +248,9 @@ def convert_trk_to_zarr(filename, out_dir=None):
         z = zarr.open(output_file)
         z['X'] = X
         z['y'] = y
+
+        with open(os.path.join(file_dir, split) + '.json', 'w') as file:
+            json.dump(lineages, file)
 
         features = get_features(X, y, lineages, max_cells, crop_mode='fixed')
 

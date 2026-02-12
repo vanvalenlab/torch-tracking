@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from skimage.segmentation import relabel_sequential
-from utils import get_max_cells, get_image_features, histogram_normalization
+from tracking.utils import get_max_cells, get_image_features, histogram_normalization
 
 
 class CellTracker:
@@ -58,7 +58,7 @@ class CellTracker:
         death: float = 0.99,
         birth: float = 0.99,
         division: float = 0.9,
-        track_length: int = 5,
+        track_length: int = 8,
         crop_mode: str = 'resize',
         norm: bool = True,
         dtype: str = 'float32',
@@ -433,7 +433,7 @@ class CellTracker:
         
         # Bottom-right: Mordor (transpose of assignment)
         cost_matrix[num_tracks:, num_cells:] = assignment_matrix.T
-        
+
         return cost_matrix
     
     @torch.no_grad()
@@ -499,7 +499,7 @@ class CellTracker:
         
         # Build assignment matrix from "same cell" probabilities (class 1)
         # Cost = 1 - P(same cell)
-        assignment_matrix = 1 - predictions[..., 1]
+        assignment_matrix = predictions[..., 0]
         
         # Set high cost for capped tracks (already divided)
         for i, track_id in enumerate(relevant_tracks):
@@ -677,7 +677,7 @@ class CellTracker:
                     prob = preds[track_idx, cell_idx, 2]
                     
                     if prob > max_prob:
-                        parent_id, max_prob = track_id, prob
+                        parent_id = track_id
         
         return parent_id
     

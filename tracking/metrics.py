@@ -1,44 +1,174 @@
-# Copyright 2016-2022 The Van Valen Lab at the California Institute of
-# Technology (Caltech), with support from the Paul Allen Family Foundation,
-# Google, & National Institutes of Health (NIH) under Grant U24CA224309-01.
-# All rights reserved.
-#
-# Licensed under a modified Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.github.com/vanvalenlab/deepcell-tracking/LICENSE
-#
-# The Work provided may be used for non-commercial academic purposes only.
-# For any other use of the Work, including commercial use, please contact:
-# vanvalenlab@gmail.com
-#
-# Neither the name of Caltech nor the names of its contributors may be used
-# to endorse or promote products derived from this software without specific
-# prior written permission.
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """Functions for evaluating tracking performance"""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 from collections import Counter
 import itertools
 import functools
-import os
+
+from skimage.measure import regionprops
 
 import numpy as np
 
-from deepcell_tracking.trk_io import load_trks
-from deepcell_tracking.utils import match_nodes, trk_to_graph
-from deepcell_tracking.isbi_utils import load_tiffs, txt_to_lineage
+import pandas as pd
+import networkx as nx
+
+def compute_overlap_vectorized(boxes, query_boxes):
+    """
+    Vectorized computation of IoU overlaps.
+    
+    Args
+        boxes: (N, 4) ndarray of float - format [x1, y1, x2, y2]
+        query_boxes: (K, 4) ndarray of float - format [x1, y1, x2, y2]
+
+    Returns
+        overlaps: (N, K) ndarray of overlap between boxes and query_boxes
+    """
+    N = boxes.shape[0]
+    K = query_boxes.shape[0]
+    
+    # Compute areas
+    boxes_area = (boxes[:, 2] - boxes[:, 0] + 1) * (boxes[:, 3] - boxes[:, 1] + 1)
+    query_area = (query_boxes[:, 2] - query_boxes[:, 0] + 1) * (query_boxes[:, 3] - query_boxes[:, 1] + 1)
+    
+    # Broadcast to compute intersections
+    # boxes: (N, 1, 4), query_boxes: (1, K, 4)
+    iw = (np.minimum(boxes[:, None, 2], query_boxes[None, :, 2]) - 
+          np.maximum(boxes[:, None, 0], query_boxes[None, :, 0]) + 1)
+    ih = (np.minimum(boxes[:, None, 3], query_boxes[None, :, 3]) - 
+          np.maximum(boxes[:, None, 1], query_boxes[None, :, 1]) + 1)
+    
+    # Clip to 0
+    iw = np.maximum(iw, 0)
+    ih = np.maximum(ih, 0)
+    
+    # Compute intersection and union
+    intersection = iw * ih
+    union = boxes_area[:, None] + query_area[None, :] - intersection
+    
+    # Compute IoU
+    overlaps = intersection / union
+    
+    return overlaps
+
+def match_nodes(gt, res, threshold=1):
+    """Relabel predicted track to match GT track labels.
+
+    Args:
+        gt (np arr): label movie (y) from ground truth .trk file.
+        res (np arr): label movie (y) from predicted results .trk file
+        threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
+            If segmentations are identical, 1 works well.
+            For imperfect segmentations try 0.6-0.8 to get better matching
+
+    Returns:
+        gtcells (np arr): Array of overlapping ids in the gt movie.
+        rescells (np arr): Array of overlapping ids in the res movie.
+
+    Raises:
+        ValueError: If .
+    """
+    num_frames = gt.shape[0]
+    iou = np.zeros((num_frames, np.max(gt) + 1, np.max(res) + 1))
+
+    # TODO: Compute IOUs only when neccesary
+    # If bboxs for true and pred do not overlap with each other, the assignment is immediate
+    # Otherwise use pixel-wise IOU to determine which cell is which
+
+    # Regionprops expects one frame at a time
+    for frame in range(num_frames):
+        gt_frame = gt[frame]
+        res_frame = res[frame]
+
+        gt_props = regionprops(np.squeeze(gt_frame.astype('int')))
+        gt_boxes = [np.array(gt_prop.bbox) for gt_prop in gt_props]
+        gt_boxes = np.array(gt_boxes).astype('double')
+        gt_box_labels = [int(gt_prop.label) for gt_prop in gt_props]
+
+        res_props = regionprops(np.squeeze(res_frame.astype('int')))
+        res_boxes = [np.array(res_prop.bbox) for res_prop in res_props]
+        res_boxes = np.array(res_boxes).astype('double')
+        res_box_labels = [int(res_prop.label) for res_prop in res_props]
+
+        overlaps = compute_overlap_vectorized(gt_boxes, res_boxes)    # has the form [gt_bbox, res_bbox]
+
+        # Find the bboxes that have overlap at all (ind_ corresponds to box number - starting at 0)
+        ind_gt, ind_res = np.nonzero(overlaps)
+
+        # frame_ious = np.zeros(overlaps.shape)
+        for index in range(ind_gt.shape[0]):
+
+            iou_gt_idx = gt_box_labels[ind_gt[index]]
+            iou_res_idx = res_box_labels[ind_res[index]]
+            intersection = np.logical_and(gt_frame == iou_gt_idx, res_frame == iou_res_idx)
+            union = np.logical_or(gt_frame == iou_gt_idx, res_frame == iou_res_idx)
+            iou[frame, iou_gt_idx, iou_res_idx] = intersection.sum() / union.sum()
+
+    gtcells, rescells = np.where(np.nansum(iou, axis=0) >= threshold)
+
+    return gtcells, rescells
+
+
+def trk_to_graph(lineage, node_key=None):
+    """Converts a lineage dictionary into a graph representation of the lineages
+
+    Args:
+        lineage (dict): Dictionary of lineage data
+        node_key (dict): Map between gt nodes and result nodes
+
+    Returns:
+        networkx.Graph: Graph representation of the lineage data.
+    """
+    edges = []
+
+    all_ids = set()
+    single_nodes = set()
+    attributes = {}
+
+    for i, lin in lineage.items():
+        # Update cell id if node_key is available
+        if node_key and (i in node_key):
+            idx = node_key[i]
+        else:
+            idx = i
+
+        cellids = ['{}_{}'.format(idx, t) for t in lin['frames']]
+
+        if len(cellids) == 1:
+            single_nodes.add(cellids[0])
+
+        all_ids.update(cellids)
+        edges.append(pd.DataFrame({
+            'source': cellids[0:-1],
+            'target': cellids[1:]
+        }))
+
+        # Add connections to any daughters
+        source = '{}_{}'.format(idx, max(lin['frames']))
+        for d in lin['daughters']:
+            # Update cell id if node_key is available
+            if node_key and (i in node_key):
+                d_idx = node_key[d]
+            else:
+                d_idx = d
+
+            # Assume daughter appears in next frame
+            target = '{}_{}'.format(d_idx, max(lin['frames']) + 1)
+            edges.append(pd.DataFrame({
+                'source': [source],
+                'target': [target]
+            }))
+
+            attributes[source] = {'division': True}
+
+    # Create graph
+    edges = pd.concat(edges)
+    G = nx.from_pandas_edgelist(edges, source='source', target='target', create_using=nx.DiGraph)
+    nx.set_node_attributes(G, attributes)
+
+    # Add all isolates to graph
+    for cell_id in single_nodes:
+        G.add_node(cell_id)
+
+    return G
 
 
 def map_node(gt_node, G_res, cells_gt, cells_res):
@@ -68,7 +198,7 @@ def map_node(gt_node, G_res, cells_gt, cells_res):
         return gt_node
 
 
-def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[]):
+def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[], verbose=True):
     """Compare two graphs and calculate the cell division confusion matrix.
 
     WARNING: This function will only work if the labels underlying both
@@ -117,7 +247,8 @@ def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[]):
                     break  # Exit for loop since we found the right node
             else:
                 # Node doesn't exist so count this division as missed
-                print('missed node {} division completely'.format(node))
+                if verbose:
+                    print('missed node {} division completely'.format(node))
                 missed.append(node)
                 continue  # move on to next node in div_gt
         # Check if the node exists with same id in G_res
@@ -125,7 +256,8 @@ def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[]):
             r_node = node
         # Node doesn't exist
         else:
-            print('missed node {} division completely'.format(node))
+            if verbose:
+                print('missed node {} division completely'.format(node))
             missed.append(node)
             continue  # move on to next node in div_gt
 
@@ -155,12 +287,14 @@ def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[]):
                     errors.append('parents mismatch')
                 if G_res.out_degree(r_node) == G_gt.out_degree(node):
                     errors.append('gt and res degree equal')
-                print(node, '{}.'.format(', '.join(errors)))
+                if verbose:
+                    print(node, '{}.'.format(', '.join(errors)))
 
             div_res.remove(r_node)
 
         else:  # valid division not in results, it was missed
-            print('missed node {} division completely'.format(node))
+            if verbose:
+                print('missed node {} division completely'.format(node))
             missed.append(node)
 
     # Count any remaining res nodes as false positives
@@ -179,7 +313,8 @@ def correct_shifted_divisions(
         false_negative_division, false_positive_division, correct_division,
         y_gt, y_res,
         G_gt, G_res,
-        threshold):
+        threshold,
+        verbose=True):
     """Correct divisions errors that are shifted by a frame and should be counted as correct
 
     Args:
@@ -277,7 +412,8 @@ def correct_shifted_divisions(
             metrics['false_negative_division'].remove(node)
             # Add node to the correct_division count
             metrics['correct_division'].append(node)
-            print('corrected division {} as a frameshift division not an error'.format(node))
+            if verbose:
+                print('corrected division {} as a frameshift division not an error'.format(node))
         elif source == 'res':
             metrics['false_positive_division'].remove(node)
 
@@ -474,7 +610,8 @@ class TrackingMetrics:
                  lineage_gt, y_gt,
                  lineage_res, y_res,
                  threshold=1,
-                 allow_division_shift=True):
+                 allow_division_shift=True,
+                 verbose=False):
         """Class to coordinate the benchmarking of a pair of trk files
 
         Args:
@@ -495,6 +632,7 @@ class TrackingMetrics:
         self.y_res = y_res
         self.threshold = threshold
         self.allow_division_shift = allow_division_shift
+        self.verbose = verbose
 
         # Match up labels in GT to Results to allow for direct comparisons
         self.cells_gt, self.cells_res = match_nodes(y_gt, y_res, self.threshold)
@@ -505,46 +643,10 @@ class TrackingMetrics:
 
         self.stats = self.calculate_metrics()
 
-    @classmethod
-    def from_trk_files(cls, trk_gt, trk_res, threshold=1, allow_division_shift=True):
-        # Load data
-        trks = load_trks(trk_gt)
-        lineage_gt, y_gt = trks['lineages'][0], trks['y']
-        trks = load_trks(trk_res)
-        lineage_res, y_res = trks['lineages'][0], trks['y']
-
-        return cls(
-            lineage_gt=lineage_gt, y_gt=y_gt,
-            lineage_res=lineage_res, y_res=y_res,
-            threshold=threshold,
-            allow_division_shift=allow_division_shift
-        )
-
-    @classmethod
-    def from_isbi_dirs(cls,
-                       dir_gt, dir_res,
-                       threshold=1,
-                       allow_division_shift=True,
-                       gt_txt_file='man_track.txt',
-                       res_txt_file='res_track.txt'):
-        # Load data
-        y_gt = load_tiffs(dir_gt)
-        lineage_gt = txt_to_lineage(os.path.join(dir_gt, gt_txt_file))
-
-        y_res = load_tiffs(dir_res)
-        lineage_res = txt_to_lineage(os.path.join(dir_res, res_txt_file))
-
-        return cls(
-            lineage_gt=lineage_gt, y_gt=y_gt,
-            lineage_res=lineage_res, y_res=y_res,
-            threshold=threshold,
-            allow_division_shift=allow_division_shift
-        )
-
     def calculate_metrics(self):
         # Classify divison errors
         stats = classify_divisions(
-            self.G_gt, self.G_res, cells_gt=self.cells_gt, cells_res=self.cells_res)
+            self.G_gt, self.G_res, cells_gt=self.cells_gt, cells_res=self.cells_res, verbose=self.verbose)
 
         if self.allow_division_shift:
             updates = correct_shifted_divisions(
@@ -555,7 +657,8 @@ class TrackingMetrics:
                 y_res=self.y_res,
                 G_gt=self.G_gt,
                 G_res=self.G_res,
-                threshold=self.threshold)
+                threshold=self.threshold,
+                verbose=self.verbose)
 
             for k, v in updates.items():
                 stats[k] = v
@@ -580,25 +683,3 @@ class TrackingMetrics:
             'te_total': te_total
         }
 
-
-def benchmark_tracking_performance(trk_gt, trk_res, threshold=1, allow_division_shift=True):
-    """Compare two related .trk files (one being the GT of the other)
-
-    Calculate division statistics, target effectiveness and association accuracy
-
-    Currently included for backwards compatibility, but is no longer necessary
-
-    Args:
-        trk_gt (path): Path to the ground truth .trk file.
-        trk_res (path): Path to the predicted results .trk file.
-        threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
-            If segmentations are identical, 1 works well.
-            For imperfect segmentations try 0.6-0.8 to get better matching
-    """
-
-    # Load data
-    m = TrackingMetrics.from_trk_files(trk_gt, trk_res,
-                                       threshold=threshold,
-                                       allow_division_shift=allow_division_shift)
-
-    return m.stats

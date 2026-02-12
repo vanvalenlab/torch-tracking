@@ -2,7 +2,7 @@ import numpy as np
 from typing import Dict
 from skimage.measure import regionprops
 import torch
-from utils import resize
+from tracking.utils import resize
 import tqdm
 from skimage.segmentation import relabel_sequential
 import warnings

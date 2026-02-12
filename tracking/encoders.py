@@ -6,10 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
 from torch_geometric.data import Data, Batch
-from utils import normalize_adjacency_symmetric
+from tracking.utils import normalize_adjacency_symmetric
 
 # Import custom layers (assumes they're in the same directory)
-from layers import ImageNormalization2D
+from tracking.layers import ImageNormalization2D
 
 
 class AppearanceEncoder(nn.Module):
