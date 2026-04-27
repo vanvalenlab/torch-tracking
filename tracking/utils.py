@@ -100,10 +100,6 @@ def weighted_categorical_crossentropy_v2(
         y_true, 
         y_pred, 
         n_classes=3, 
-        from_logits=False, 
-        alpha=0.01, 
-        label_smoothing=False,
-        class_weights='batch'
     ):
 
     """
@@ -121,7 +117,6 @@ def weighted_categorical_crossentropy_v2(
     """
     eps = 1e-10
     _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
-    _alpha = torch.tensor(alpha).type(y_pred.dtype).to(y_pred.device)
     
     y_pred = y_pred / torch.sum(y_pred, dim=-1, keepdims=True)
     
@@ -135,18 +130,9 @@ def weighted_categorical_crossentropy_v2(
     class_sum = torch.sum(y_true, dim=0, keepdims=True)
     
     # Compute weights: inverse frequency normalized by n_classes
-    if class_weights == 'batch':
-        class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
-    
-    class_weights = class_weights.to(y_pred.device)
-    
-    if label_smoothing:
-        # Compute element-wise cross-entropy
-        y_ls = ((1-_alpha) * y_true) + (_alpha/n_classes)
-        return - (y_ls * torch.log(y_pred) * class_weights)
-    
-    else:
-        return - (y_true * torch.log(y_pred) * class_weights)
+    class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.).to(y_pred.device)
+        
+    return - (y_true * torch.log(y_pred) * class_weights)
 
 def normalize_adjacency_symmetric(
     adj: torch.Tensor,
@@ -424,7 +410,6 @@ def get_image_features(X, y, appearance_dim=16, crop_mode='fixed', norm=True):
     # iterate over all objects in y
     if crop_mode == 'resize':
         props = regionprops(y[..., 0], cache=False)
-        
 
     for i, prop in enumerate(props):
 

@@ -1,196 +1,18 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import time
+import datetime
+import json
+
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from tqdm import tqdm
-import json
 from typing import Dict
-import time
-import datetime
+
 from tracking.model import GNNTrackingModel
 from tracking.loader import create_trk_dataloaders
-from tracking.utils import weighted_categorical_crossentropy_v2
-import numpy as np
-
-class TrackingLoss(nn.Module):
-    
-    def __init__(self, gamma=2.0, loss='wcce', label_smoothing=False, class_weights='batch', class_samples=None):
-        super().__init__()
-        
-        self.weights = class_weights
-        self.gamma = gamma
-        self.loss = loss
-        self.pad_value = -1
-        self.label_smoothing = label_smoothing
-        self.class_samples = class_samples
-            
-        # Standard CrossEntropyLoss with class weights
-        self.criterion = nn.CrossEntropyLoss(reduction='none', 
-                                                ignore_index=self.pad_value, weight=self.weights)
-
-    def forward(self, predictions, targets):
-        
-        """
-        Args:
-            predictions: (B, T, N, M, 3) logits from model
-            targets: (B, T, N, M) integer class labels [0, 1, 2]
-        
-        Returns:
-            loss: scalar loss value
-        """
-
-        # # Reshape for CrossEntropyLoss
-        B, T, N, _, C = predictions.shape
-        predictions_flat = predictions.view(-1, C)  # (B*T*N*M, 3)
-
-        # Compute weighted cross-entropy
-        if self.loss == 'wcce':
-
-            targets_flat = targets.view(-1, targets.shape[-1])
-            valid_mask = targets_flat >= 0
-
-            loss = weighted_categorical_crossentropy_v2(
-                targets_flat, 
-                predictions_flat, 
-                n_classes=3, 
-                label_smoothing=self.label_smoothing, 
-                class_weights=self.weights
-            )
-
-            return loss[valid_mask].mean()
-
-        else:
-
-            targets_flat = targets.flatten()
-            valid_mask = targets_flat >= 0
-
-            loss = self.criterion(predictions_flat, targets_flat.long())
-            return loss.mean()
-            
-class MetricsTracker:
-    
-    def __init__(self):
-        self.reset()
-        self.pad_value = -1
-    
-    def reset(self):
-        self.total_loss = 0.0
-        self.total_samples = 0
-        self.correct = 0
-        self.total_predictions = 0
-        
-        # Per-class metrics
-        self.class_correct = {0: 0, 1: 0, 2: 0}
-        self.class_total = {0: 0, 1: 0, 2: 0}
-        self.class_predicted = {0: 0, 1: 0, 2: 0}
-
-        self.cm = np.zeros((3,3))
-
-    
-    def update(self, loss, predictions, targets):
-        """
-        Args:
-            loss: scalar loss value
-            predictions: (B, T, N, M, 3) logits
-            targets: (B, T, N, M, 3) one hot encoding of labels
-        """
-
-        batch_size = predictions.shape[0]
-        self.total_loss += loss.item() * batch_size
-        self.total_samples += batch_size
-
-        # Get predicted classes
-        pred_classes = predictions.argmax(dim=-1).view(-1)  # (B*T*N*M)
-        target_classes = targets.view(-1)
-        valid_mask = target_classes.view(-1) >= 0
-
-        # Overall accuracy
-        correct = (pred_classes == target_classes) & valid_mask
-        self.correct += correct.sum().item()
-        self.total_predictions += valid_mask.sum().item()
-        
-        # Per-class metrics
-        for class_idx in range(3):
-            class_mask = (target_classes == class_idx) & valid_mask
-            class_predicted_mask = (pred_classes == class_idx) & valid_mask
-            class_correct = (pred_classes == class_idx) & class_mask
-            
-            self.class_correct[class_idx] += class_correct.sum().item()
-            self.class_total[class_idx] += class_mask.sum().item()
-            self.class_predicted[class_idx] += class_predicted_mask.sum().item()
-    
-    def get_metrics(self):
-        """Compute and return current metrics."""
-        avg_loss = self.total_loss / max(self.total_samples, 1)
-        accuracy = self.correct / max(self.total_predictions, 1)
-        
-        metrics = {
-            'loss': avg_loss,
-            'accuracy': accuracy
-        }
-
-        running_f1 = 0
-        
-        # Add per-class metrics
-        for class_idx in range(3):
-            # Recall: of all true class_idx, how many did we predict correctly?
-            recall = (self.class_correct[class_idx] / 
-                     max(self.class_total[class_idx], 1))
-            
-            # Precision: of all predicted class_idx, how many were correct?
-            precision = (self.class_correct[class_idx] / 
-                        max(self.class_predicted[class_idx], 1))
-            
-            # F1 score
-            f1 = 2 * precision * recall / (precision + recall + 1e-10)
-            
-            metrics[f'recall_class_{class_idx}'] = recall
-            metrics[f'precision_class_{class_idx}'] = precision
-            metrics[f'f1_class_{class_idx}'] = f1
-            running_f1 *= f1
-        
-        metrics['geom_f1'] = f1 ** (1/3)
-        
-        return metrics
-
-
-class EarlyStopping:
-    """Early stopping to prevent overfitting."""
-    
-    def __init__(self, patience=10, min_delta=0.0, mode='min'):
-        """
-        Args:
-            patience: Number of epochs to wait before stopping
-            min_delta: Minimum change to qualify as improvement
-            mode: 'min' for loss, 'max' for accuracy
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_value = None
-        self.should_stop = False
-    
-    def __call__(self, metric_value):
-        if self.best_value is None:
-            self.best_value = metric_value
-            return False
-        
-        if self.mode == 'min':
-            improved = metric_value < (self.best_value - self.min_delta)
-        else:
-            improved = metric_value > (self.best_value + self.min_delta)
-        
-        if improved:
-            self.best_value = metric_value
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.should_stop = True
-        
-        return self.should_stop
+from tracking.loss import TrackingLoss
+from tracking.training_utils import MetricsTracker, CalibrationMetrics, EarlyStopping, create_optimizer, create_scheduler
 
 
 class Trainer:
@@ -229,8 +51,10 @@ class Trainer:
         config=None,
         loss='wcce',
         label_smoothing=False,
-        class_weights='batch',
-        stopping_metric = 'loss'
+        class_weights=None,
+        stopping_metric = 'loss',
+        gamma=0.1,
+        data_precision = 'float32'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -247,26 +71,32 @@ class Trainer:
         self.label_smoothing = label_smoothing
         self.class_weights = class_weights
         self.stopping_metric = stopping_metric
-
-        if loss=='wcce':
-            self.return_logits = False
-        else:
-            self.return_logits = True
-
+        self.return_logits = False
+        self.gamma = gamma
+        self.metrics_tracker = MetricsTracker()
+        self.calibration_tracker = CalibrationMetrics(n_classes=3, n_bins=10)
         curr_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
         self.log_suffix = curr_time
         self.log_dir = Path(log_dir +  self.log_suffix)
         self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
 
-        self.loss_fn = TrackingLoss(loss=loss, 
-                                    label_smoothing=self.label_smoothing, 
-                                    class_weights=self.class_weights)
+        self.loss_fn = TrackingLoss(loss=self.loss, gamma=self.gamma, class_weights=self.class_weights)
         
         # Move to device
         self.model = self.model.to(device)
         self.loss_fn = self.loss_fn.to(device)
-        
+
+        # Altering data precision values
+        if data_precision == 'bfloat16':
+            self.autocast = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+        elif data_precision == 'float32':
+            self.autocast = torch.amp.autocast(device_type='cuda', dtype=None)
+        elif data_precision == 'float16':
+            self.autocast = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
+
+        self.scaler = torch.amp.GradScaler()
+
         # Setup directories and Tensorboard writer
         if self.log_and_save:
             self.writer = SummaryWriter(log_dir=str(self.log_dir))
@@ -290,11 +120,13 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.train_history = []
         self.val_history = []
+
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
         metrics_tracker = MetricsTracker()
+        calibration_tracker = CalibrationMetrics(n_classes=3, n_bins=10)
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]', dynamic_ncols=True)
         
@@ -309,18 +141,33 @@ class Trainer:
 
             # Forward pass
             self.optimizer.zero_grad()
+
+            with self.autocast:
+
+                predictions = self.model.training_forward(
+                    appearances, morphologies, centroids, adj_matrices,
+                    return_logits=self.return_logits
+                )
             
-            predictions = self.model.training_forward(
-                appearances, morphologies, centroids, adj_matrices,
-                return_logits=self.return_logits
-            )
-            
-            # Compute loss
-            loss = self.loss_fn(predictions, labels)
+                # Compute loss
+                loss = self.loss_fn(predictions, labels)
             
             # Backward pass
-            loss.backward()
-            
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer) # Unscales the gradients in-place
+
+            if torch.isnan(loss):
+                print(f"NaN loss detected at epoch {self.current_epoch}, skipping batch")
+                optimizer.zero_grad()
+                continue
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                # Log which batch and what the probs looked like
+                print(f"  min prob: {predictions.min().item():.2e}")
+                print(f"  max prob: {predictions.max().item():.2e}")
+                optimizer.zero_grad()
+                continue
+
             # Gradient clipping
             if self.gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -328,14 +175,16 @@ class Trainer:
                     self.gradient_clip
                 )
             
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             # Update metrics
             with torch.no_grad():
-                metrics_tracker.update(loss, predictions, labels)
-            
+                self.metrics_tracker.update(loss, predictions, labels)
+                self.calibration_tracker.update(predictions, labels)
+
             # Update progress bar
-            current_metrics = metrics_tracker.get_metrics()
+            current_metrics = self.metrics_tracker.get_metrics()
             pbar.set_postfix({
                 'no_f1': f"{current_metrics['f1_class_0']:.4f}",
                 'same_f1': f"{current_metrics['f1_class_1']:.4f}",
@@ -343,7 +192,15 @@ class Trainer:
                 'loss': f"{current_metrics['loss']:.4f}"
             })
 
-        metrics = metrics_tracker.get_metrics()
+        metrics = self.metrics_tracker.get_metrics()
+        cals = self.calibration_tracker.compute()
+
+        # merge the two dicts
+        for k, v in cals.items():
+            metrics[k]= v
+
+        self.metrics_tracker.reset()
+        self.calibration_tracker.reset()
 
         return metrics
     
@@ -351,7 +208,6 @@ class Trainer:
     def validate(self) -> Dict[str, float]:
         """Validate on validation set."""
         self.model.eval()
-        metrics_tracker = MetricsTracker()
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch} [Val]', dynamic_ncols=True)
         
@@ -374,10 +230,11 @@ class Trainer:
             loss = self.loss_fn(predictions, labels)
 
             # Update metrics
-            metrics_tracker.update(loss, predictions, labels)
-            
+            self.metrics_tracker.update(loss, predictions, labels)
+            self.calibration_tracker.update(predictions, labels)          
+
             # Update progress bar
-            current_metrics = metrics_tracker.get_metrics()
+            current_metrics = self.metrics_tracker.get_metrics()
             pbar.set_postfix({
                 'no_f1': f"{current_metrics['f1_class_0']:.4f}",
                 'same_f1': f"{current_metrics['f1_class_1']:.4f}",
@@ -385,7 +242,15 @@ class Trainer:
                 'loss': f"{current_metrics['loss']:.4f}"
             })
 
-        metrics = metrics_tracker.get_metrics()
+        metrics = self.metrics_tracker.get_metrics()
+        cals = self.calibration_tracker.compute()
+
+        # merge the two dicts
+        for k, v in cals.items():
+            metrics[k]=v
+
+        self.metrics_tracker.reset()
+        self.calibration_tracker.reset()
 
         return metrics
     
@@ -467,7 +332,7 @@ class Trainer:
             
             # Update learning rate
             if self.scheduler is not None:
-                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(val_metrics[self.stopping_metric])
                 else:
                     self.scheduler.step()
@@ -482,20 +347,10 @@ class Trainer:
 
             if self.writer is not None:
             # Log to tensorboard
-
-                self.writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
-                self.writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
-                self.writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
-                self.writer.add_scalar('Accuracy/val', val_metrics['accuracy'], epoch)
-                self.writer.add_scalar('Learning_rate', current_lr, epoch)
-
-                for i in range(3):
-                    self.writer.add_scalar(f'Precision/train/class_{i}', train_metrics[f'precision_class_{i}'], epoch)
-                    self.writer.add_scalar(f'Precision/val/class_{i}', val_metrics[f'precision_class_{i}'], epoch)
-                    self.writer.add_scalar(f'Recall/train/class_{i}', train_metrics[f'recall_class_{i}'], epoch)
-                    self.writer.add_scalar(f'Recall/val/class_{i}', val_metrics[f'recall_class_{i}'], epoch)
-                    self.writer.add_scalar(f'F1/train/class_{i}', train_metrics[f'f1_class_{i}'], epoch)
-                    self.writer.add_scalar(f'F1/val/class_{i}', val_metrics[f'f1_class_{i}'], epoch)
+                for k, v in train_metrics.items():
+                    self.writer.add_scalar(f'train/{k}', v, epoch)
+                for k, v in val_metrics.items():
+                    self.writer.add_scalar(f'val/{k}', v, epoch)
 
                 self.save_checkpoint(is_best=is_best)
 
@@ -534,107 +389,6 @@ class Trainer:
             }, f, indent=2)
 
 
-def create_optimizer(model, config):
-    """Create optimizer based on config."""
-
-    optimizer_name = config.get('optimizer', 'radam').lower()
-    lr = config.get('learning_rate', 1e-3)
-    weight_decay = config.get('weight_decay', 1e-5)
-    
-    if optimizer_name == 'radam':
-        # Actually using RAdamW
-        optimizer = optim.RAdam(
-            model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-            decoupled_weight_decay=True,
-        )
-        
-    elif optimizer_name == 'muon':
-        optimizer = optim.Muon(
-            model.parameters(),
-            lr=lr
-            )
-
-    elif optimizer_name == 'adamw':
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=lr,
-        )
-
-    elif optimizer_name == 'sgd':
-        momentum = config.get('momentum', 0.9)
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay
-        )
-
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer_name}")
-    
-    return optimizer
-
-
-def create_scheduler(optimizer, config):
-    """Create learning rate scheduler."""
-
-    scheduler_name = config.get('scheduler', 'reduce_on_plateau').lower()
-    
-    if scheduler_name == 'reduce_on_plateau':
-        patience = config.get('patience', 5)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.1,
-            patience=patience
-            )
-        
-    elif scheduler_name == 'cosine':
-        T_max = config.get('max_epochs', 100)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=T_max,
-            eta_min=1e-6
-        )
-
-    elif scheduler_name == 'step':
-        step_size = config.get('step_size', 30)
-        gamma = config.get('gamma', 0.1)
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=step_size,
-            gamma=gamma
-        )
-
-    elif scheduler_name == 'exp':
-        decay = config.get('decay', 0.99)
-        scheduler = optim.lr_scheduler.ExponentialLR(
-            optimizer,
-            gamma=decay
-        )
-
-    elif scheduler_name == 'none':
-        scheduler = None
-
-    elif scheduler_name == 'caliban': 
-        step_size = config.get('step_size', 30)
-        decay = config.get('decay', 0.99)
-        scheduler=optim.lr_scheduler.ChainedScheduler([        
-            optim.lr_scheduler.ExponentialLR(
-                optimizer,
-                gamma=decay
-            ),
-            optim.lr_scheduler.StepLR(
-                optimizer,
-                step_size=step_size
-            )
-        ])
-        
-    return scheduler
-
-
 # Example usage
 if __name__ == "__main__":
 
@@ -642,14 +396,14 @@ if __name__ == "__main__":
 
     config = {
         "optimizer": "radam",
-        "learning_rate": 1e-4,
+        "learning_rate": 0.0001,
         "weight_decay": 0,
         "decay": 0.99,
         "scheduler": "reduce_on_plateau",
         "max_epochs": 50,
-        "batch_size": 5,
+        "batch_size": 10,
         "n_layers": 1,
-        "num_workers": 8,
+        "num_workers": 10,
         "clipnorm": 0.001,
         "step_size": 5,
         "crop_mode": "fixed",
@@ -659,13 +413,15 @@ if __name__ == "__main__":
         "crop_size": 32,
         "attention": False,
         "truncate_dataset": None,
-        "loss": "cce",
+        "loss": "focal_wcce",
         "t_direction": "forward",
         "processed": True,
         "dropout": 0,
-        "device": "cuda:1",
+        "device": "cuda:0",
         "label_smoothing": False,
-        "stopping_metric": 'loss'
+        "stopping_metric": "loss",
+        'data_precision': 'bfloat16',
+        'gamma': 1.0
     }
 
     # Initialize model
@@ -712,8 +468,9 @@ if __name__ == "__main__":
         log_and_save = True,
         config=config,
         loss=config['loss'],
-        class_weights=torch.tensor([1, 100, 1000]).float(),
+        class_weights=[1, 10, 20],
         stopping_metric = config['stopping_metric'],
+        data_precision=config['data_precision']
     )   
 
     trainer.train()

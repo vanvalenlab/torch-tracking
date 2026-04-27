@@ -169,7 +169,6 @@ class CellTracker:
         n_channels = self.X.shape[self.channel_axis]
 
         if self.norm:
-            print("Preprocessing whole image with CLAHE...")
             self.X = histogram_normalization(self.X, data_format='channels_last')
 
         # Initialize feature arrays
@@ -710,7 +709,7 @@ class CellTracker:
         # Track remaining frames
         num_frames = self.X.shape[self.time_axis]
 
-        for frame in tqdm(range(1, num_frames)):
+        for frame in tqdm(range(1, num_frames), leave=False):
             self._track_frame(frame)
         
         elapsed = timeit.default_timer() - start

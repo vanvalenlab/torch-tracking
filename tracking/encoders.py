@@ -70,11 +70,11 @@ class AppearanceEncoder(nn.Module):
                     in_channels if i == 0 else n_filters,
                     n_filters,
                     kernel_size=(1, 3, 3),  # CRITICAL: (cells=1, height=3, width=3)
-                    stride=(1, 1, 1),
-                    padding=(0, 1, 1),  # No padding on cell dimension
+                    stride=1,
+                    padding='same',  # No padding on cell dimension
                     bias=False
                 ),
-                nn.BatchNorm3d(n_filters) if norm_layer == 'batch' else nn.GroupNorm(8, n_filters),
+                nn.BatchNorm3d(n_filters),
                 nn.ReLU(),
                 nn.MaxPool3d(kernel_size=(1, 2, 2))  # Pool only spatial dims
             )
@@ -82,7 +82,7 @@ class AppearanceEncoder(nn.Module):
         
         # Final dense layer
         self.dense = nn.Linear(n_filters, encoder_dim)
-        self.final_norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
+        self.final_norm = nn.BatchNorm1d(encoder_dim)
         self.final_activation = nn.ReLU()
 
     def forward(self, x):
@@ -170,7 +170,7 @@ class MorphologyEncoder(nn.Module):
         # Input: (batch, channels, length) = (B*T, input_dim, N)
         # Output: (batch, out_channels, length) = (B*T, encoder_dim, N)
         self.conv = nn.Conv1d(input_dim, encoder_dim, kernel_size=1)
-        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
+        self.norm = nn.BatchNorm1d(encoder_dim)
         self.activation = nn.ReLU()
 
     def forward(self, x):
@@ -222,7 +222,7 @@ class CentroidEncoder(nn.Module):
         # Input: (batch, channels, length) = (B*T, input_dim, N)
         # Output: (batch, out_channels, length) = (B*T, encoder_dim, N)
         self.conv = nn.Conv1d(input_dim, encoder_dim, kernel_size=1)
-        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
+        self.norm = nn.BatchNorm1d(encoder_dim)
         self.activation = nn.ReLU()
 
     def forward(self, x):
@@ -266,7 +266,7 @@ class DeltaEncoder(nn.Module):
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
         self.norm_layer_type = norm_layer
-        self.norm = nn.BatchNorm1d(encoder_dim) if norm_layer == 'batch' else nn.LayerNorm(encoder_dim)
+        self.norm = nn.BatchNorm1d(encoder_dim)
         self.dropout = nn.Dropout(dropout)
 
 

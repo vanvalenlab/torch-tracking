@@ -75,7 +75,7 @@ def get_temporal_adjacency(lineage, max_frames, max_cells):
 
 
 def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1), 
-                 crop_mode='fixed', clahe=True, distance_threshold=64, verbose=True):
+                 crop_mode='fixed', clahe=True, distance_threshold=64):
     
     n_batches = X.shape[0]
     n_frames = X.shape[1]
@@ -102,9 +102,6 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
     
     for batch in tqdm(range(n_batches), desc="Processing batches"):
         
-        # =====================================================================
-        # STEP 1: Extract per-frame features (appearances, morphologies, etc.)
-        # =====================================================================
         
         for frame in range(n_frames):
             frame_features = get_image_features(
@@ -227,55 +224,43 @@ def convert_trk_to_zarr(filename, out_dir=None):
     y = data['y']
     lineages = data['lineages']
 
+    if out_dir is None:
+        file_dir = os.path.dirname(filename)
+        split = os.path.splitext(os.path.basename(filename))[0]
+        processed_file = os.path.join(file_dir, split) + '_proc.zarr'
+
     # Step 1: correct lineages function
     X, y, lineages = correct_lineages(X, y, lineages)
 
-    # Step 2: get maximum cells from lineages
+    # Step 2: get maximum cells from lineages and save
     max_cells = 0
+
     for i in lineages:
         curr_m = len(i.keys())
         if curr_m > max_cells:
             max_cells = curr_m
 
-    if 'test' in filename:
+    with open(os.path.join(file_dir, split) + '.json', 'w') as file:
+        json.dump(lineages, file)
 
-        if out_dir is None:
-            file_dir = os.path.dirname(filename)
-            split = os.path.splitext(os.path.basename(filename))[0]
-            output_file = os.path.join(file_dir, split) + '.zarr'
-            processed_file = os.path.join(file_dir, split) + '_proc.zarr'
+    # Write regular unprocessed file
+    output_file = os.path.join(file_dir, split) + '.zarr'
+    z = zarr.open(output_file, mode='w')
+    z['X'] = X
+    z['y'] = y
 
-        z = zarr.open(output_file)
-        z['X'] = X
-        z['y'] = y
+    # Write processed file
+    features = get_features(X, y, lineages, max_cells, crop_mode='fixed')
 
-        with open(os.path.join(file_dir, split) + '.json', 'w') as file:
-            json.dump(lineages, file)
+    z_proc = zarr.open(processed_file, mode='w')
 
-        features = get_features(X, y, lineages, max_cells, crop_mode='fixed')
-
-        z2 = zarr.open(processed_file)
-
-        for k, v in features.items():
-            z2.create_array(k, data=v)
-
-    else:
-
-        if out_dir is None:
-            file_dir = os.path.dirname(filename)
-            split = os.path.splitext(os.path.basename(filename))[0]
-            output_file = os.path.join(file_dir, split) + '_proc.zarr'
-        
-        features = get_features(X, y, lineages, max_cells, crop_mode='fixed')
-
-        z = zarr.open(output_file)
-
-        for k, v in features.items():
-            z.create_array(k, data=v)
+    for k, v in features.items():
+        z_proc.create_array(k, data=v)
+    
 
 if __name__ == "__main__":
 
-    data_directory = 'data/DynamicNuclearNet-tracking-v1_0/test.trks'
+    data_directory = 'data/DynamicNuclearNet-tracking-v1_0/*.trks'
     
     for filename in glob.glob(data_directory):
         print(f"Converting {os.path.basename(filename)}")

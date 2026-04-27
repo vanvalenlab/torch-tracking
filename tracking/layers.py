@@ -196,7 +196,7 @@ def compute_deltas(x):
     deltas = x[:, 1:] - x[:, :-1]
     
     # Pad at the beginning with zeros
-    pad_shape = [0, 0] * (len(x.shape) - 2) + [1, 0]
+    pad_shape = [0, 0, 0, 0, 1, 0, 0, 0]
     deltas = F.pad(deltas, pad_shape)
     
     return deltas

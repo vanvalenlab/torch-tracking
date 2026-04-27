@@ -110,9 +110,8 @@ class TrkDataset(Dataset):
 
     def _apply_augmentation(self, appearances, centroids):
         
-        rotation_angle = torch.rand(1).item() * self.rotation_range
-        self.rotation_angle = rotation_angle
-        angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
+        self.rotation_angle = torch.rand(1).item() * self.rotation_range
+        angle_rad = torch.deg2rad(torch.tensor(self.rotation_angle))
 
         rotation_mat =  torch.tensor([
             [torch.cos(angle_rad), -torch.sin(angle_rad)],
@@ -121,7 +120,7 @@ class TrkDataset(Dataset):
 
         # Apply rotation
         appearances = appearances.permute(0, 1, 4, 2, 3)
-        appearances = F.rotate(appearances, rotation_angle,
+        appearances = F.rotate(appearances, self.rotation_angle,
                             interpolation=F.InterpolationMode.BILINEAR)
         appearances = appearances.permute(0, 1, 3, 4, 2)
 
@@ -129,9 +128,8 @@ class TrkDataset(Dataset):
             
         # Apply translation
         random_translate = torch.rand(2) * self.translation_range
-        self.random_translate = random_translate
-        random_translate = random_translate.unsqueeze(0).unsqueeze(0)
-        centroids = centroids + random_translate
+        self.random_translate = random_translate.unsqueeze(0).unsqueeze(0)
+        centroids = centroids + self.random_translate
 
         return appearances, centroids
     
@@ -328,3 +326,50 @@ def create_trk_dataloaders(
         loaders.append(None)
     
     return tuple(loaders)
+
+
+if __name__ == '__main__':
+
+    config = {
+        "optimizer": "radam",
+        "learning_rate": 1e-3,
+        "weight_decay": 0,
+        "decay": 0.99,
+        "scheduler": "reduce_on_plateau",
+        "max_epochs": 50,
+        "batch_size": 6,
+        "n_layers": 1,
+        "num_workers": 8,
+        "clipnorm": 0.001,
+        "step_size": 5,
+        "crop_mode": "resize",
+        "patience": 5,
+        "log_and_save": True,
+        "enable_early_stopping": False,
+        "crop_size": 32,
+        "attention": False,
+        "truncate_dataset": 4,
+        "loss": "wcce",
+        "t_direction": "forward",
+        "processed": True,
+        "dropout": 0,
+        "device": "cuda:0",
+        "label_smoothing": False,
+        "stopping_metric": 'loss'
+    }
+
+    train_loader, val_loader, _ = create_trk_dataloaders(
+        train_path='data/DynamicNuclearNet-tracking-v1_0/train_proc.zarr',
+        val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
+        batch_size=config['batch_size'],
+        distance_threshold=64,
+        num_workers=config['num_workers'],
+        truncate_dataset = config['truncate_dataset'],
+        t_direction=config['t_direction'],
+    )
+
+    for sample in train_loader:
+        print(sample)
+
+    print()
+

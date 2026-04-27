@@ -4,11 +4,16 @@ import torch
 import numpy as np
 from typing import Dict
 from tracking.model import GNNTrackingModel
-from tracker import CellTracker
+from tracking.tracker import CellTracker
 import zarr
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+
+import json
+from tracking.metrics import TrackingMetrics
+
+from tracking.visualization import create_timelapse_gif_with_lineage
 
 
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
@@ -90,56 +95,87 @@ def build_indices(X):
 if __name__ == "__main__":
 
     config = {
-        'batch_size': 16,
+        'batch_size': 6,
         'n_layers': 1,
-        'crop_size': 32
+        'crop_size': 32,
+        'crop_mode': 'resize'
     }
 
     # Initialize model
 
     model = GNNTrackingModel(
-                             graph_layer='gat', 
-                             data_format='channels_last',
-                             encoder_dim=64,
-                             n_layers=config['n_layers'],
-                             crop_size=config['crop_size'],
-                             )
+                            graph_layer='gat', 
+                            data_format='channels_last',
+                            encoder_dim=64,
+                            n_layers=config['n_layers'],
+                            crop_size=config['crop_size'],
+                            )
 
-    checkpoint_dir = 'checkpoints/20260131-201751/checkpoint_epoch_49.pt'
+    checkpoint_dir = 'checkpoints/20260227-112127/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
-    model.load_state_dict(checkpoint['model_state_dict'])   
+    model.load_state_dict(checkpoint['model_state_dict'])     
     
     z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
     z2 = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test_proc.zarr')
-    batch = 6
+
+    with open('data/DynamicNuclearNet-tracking-v1_0/test.json') as file:
+        gt_lineage = json.load(file)
 
     X = z['X'][:]
     y = z['y'][:]
 
     samples = build_indices(X)
 
-    for batch in range(8,9):
+    metrics_out = []
+
+    compiled_metrics = {
+        'correct_division': 0,
+        'mismatch_division': 0,
+        'false_positive_division': 0,
+        'false_negative_division': 0,
+        'total_divisions': 0,
+        'aa_tp': 0,
+        'aa_total': 0,
+        'te_tp': 0,
+        'te_total': 0
+    }
+
+    for batch in range(X.shape[0]):
+
+        curr_gt_lineage= gt_lineage[batch]
+        X = z['X'][batch]
+        y = z['y'][batch]
+        gt = z2['labels'][batch]
         end_frame = samples[batch]
 
         tracker = CellTracker(
-            movie=X[batch, :end_frame],  # (T, Y, X, C)
-            annotation=y[batch, :end_frame],  # (T, Y, X, C)
+            movie=X[:end_frame],  # (T, Y, X, C)
+            annotation=y[:end_frame],  # (T, Y, X, C)
             tracking_model=model,
             device='cuda:0',
             appearance_dim=32,
-            division=0.99,  # Threshold for detecting mitosis,
             track_length=8,
-            distance_threshold=72,
-            crop_mode='fixed'
+            division=0.3,
+            crop_mode=config['crop_mode'],
+            data_format = 'channels_last',
         )
 
         tracker.track_cells()
 
+        y_tracked = tracker.y_tracked
+        lineage = tracker.get_lineage_dict()
+
+        metrics = TrackingMetrics(curr_gt_lineage, y[:end_frame], lineage, y_tracked, threshold=0.8)
+
+        for k, v in metrics.stats.items():
+            compiled_metrics[k] += v
+        metrics_out.append(metrics.stats)
+
         track_review = tracker._track_review_dict()
         y_tracked = track_review['y_tracked']
-        gt_movie = y[batch, :end_frame]
-        outname = f"timelapse_batch_{batch}.gif"
-        create_timelapse_gif(y_tracked, gt_movie, output_path=outname, cmap='viridis')
+        gt_movie = y[:end_frame]
+        outname = f"movies/timelapse_batch_{batch}.gif"
+        create_timelapse_gif_with_lineage(y_tracked, gt_movie, lineage1=lineage, lineage2=curr_gt_lineage, output_path=outname, cmap='viridis')
     
 
 
