@@ -5,9 +5,10 @@ import tarfile
 import zarr
 import glob
 
-from tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization
+from tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization, resize
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
+from pathlib import Path
 
 import numpy as np
 
@@ -74,14 +75,14 @@ def get_temporal_adjacency(lineage, max_frames, max_cells):
     return adjacency
 
 
-def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1), 
-                 crop_mode='fixed', clahe=True, distance_threshold=64):
+def get_features(X, y, lineages, max_cells, appearance_shape=(16, 16, 1), 
+                 crop_mode='fixed', clahe=False, distance_threshold=64, mpps=None):
     
-    n_batches = X.shape[0]
-    n_frames = X.shape[1]
+    B, T, H, W, C = X.shape
+
     max_tracks = max_cells
     
-    batch_shape = (n_batches, n_frames, max_tracks)
+    batch_shape = (B, T, max_tracks)
     
     # Initialize feature arrays
     appearances = np.zeros(batch_shape + appearance_shape, dtype='float32')
@@ -89,24 +90,28 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
     centroids = np.zeros(batch_shape + (2,), dtype='float32')
     adj_matrix = np.zeros(batch_shape + (max_tracks,), dtype='float32')
     temporal_adj_matrix = np.zeros(
-        (n_batches, n_frames-1, max_tracks, max_tracks), 
+        (B, T-1, max_tracks, max_tracks), 
         dtype='float32'
     )
     mask = np.zeros(batch_shape + (max_tracks,), dtype='bool')
-    track_length = np.zeros((n_batches, max_tracks, 2), dtype='int32')
+    track_length = np.zeros((B, max_tracks, 2), dtype='int32')
 
     # Histogram normalization on image
     if clahe:
         print("Preprocessing whole image with CLAHE...")
         X = histogram_normalization(X, data_format='channels_last')
-    
-    for batch in tqdm(range(n_batches), desc="Processing batches"):
+
+    for batch in tqdm(range(B), desc="Processing batches"):
         
-        
-        for frame in range(n_frames):
+        new_size = (int(0.55/mpps[batch]*H), int(0.55/mpps[batch]*W)) # resizing image so that crops are standardized to MPP of 0.55
+
+        X_batch = resize(X[batch], shape=new_size, data_format='channels_last')
+        y_batch = resize(y[batch], shape=new_size, data_format='channels_last', labeled_image=True)
+
+        for frame in range(T):
             frame_features = get_image_features(
-                X[batch, frame], 
-                y[batch, frame],
+                X_batch[frame], 
+                y_batch[frame],
                 appearance_dim=appearance_shape[0],
                 crop_mode=crop_mode
             )
@@ -134,7 +139,7 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
             adj = within_threshold * (~is_padding)
             adj_matrix[batch, frame] = adj.astype(np.float32)
         
-        temporal_adj_matrix[batch] = get_temporal_adjacency(lineages[batch], max_frames=n_frames, max_cells=max_cells)
+        temporal_adj_matrix[batch] = get_temporal_adjacency(lineages[batch], max_frames=T, max_cells=max_cells)
 
     features = {
         'appearances': appearances,
@@ -219,15 +224,20 @@ def correct_lineages(X, y, lineages):
 def convert_trk_to_zarr(filename, out_dir=None):
 
     data = load_trks(filename)
+    dir = os.path.dirname(filename)
 
-    X = data['X']
-    y = data['y']
-    lineages = data['lineages']
+    metadata = np.load(os.path.join(dir, 'data-source.npz'),allow_pickle=True)
 
     if out_dir is None:
         file_dir = os.path.dirname(filename)
         split = os.path.splitext(os.path.basename(filename))[0]
         processed_file = os.path.join(file_dir, split) + '_proc.zarr'
+
+    X = data['X']
+    y = data['y']
+    lineages = data['lineages']
+    mpps = metadata[split][:,2]
+
 
     # Step 1: correct lineages function
     X, y, lineages = correct_lineages(X, y, lineages)
@@ -250,7 +260,7 @@ def convert_trk_to_zarr(filename, out_dir=None):
     z['y'] = y
 
     # Write processed file
-    features = get_features(X, y, lineages, max_cells, crop_mode='fixed')
+    features = get_features(X, y, lineages, max_cells, crop_mode='fixed', mpps=mpps)
 
     z_proc = zarr.open(processed_file, mode='w')
 
@@ -260,8 +270,9 @@ def convert_trk_to_zarr(filename, out_dir=None):
 
 if __name__ == "__main__":
 
-    data_directory = 'data/DynamicNuclearNet-tracking-v1_0/*.trks'
+    data_directory = Path.home() / '.deepcell/tracking/'
+    print(data_directory)
     
-    for filename in glob.glob(data_directory):
+    for filename in Path(data_directory).glob('*.trks'):
         print(f"Converting {os.path.basename(filename)}")
         convert_trk_to_zarr(filename)

@@ -11,3 +11,5 @@ notebooks/
 movies/
 *.gif
 *.ipynb
+*.csv
+*.egg-info/

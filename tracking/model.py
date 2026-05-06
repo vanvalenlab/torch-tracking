@@ -58,9 +58,8 @@ class GNNTrackingModel(nn.Module):
         norm_layer='batch',
         appearance_norm=True,
         n_classes=3,
-        crop_size=32,
+        crop_size=16,
         data_format='channels_first',
-        attention=False,
         dropout = 0.1
     ):
         super().__init__()
@@ -76,7 +75,6 @@ class GNNTrackingModel(nn.Module):
         self.appearance_norm = appearance_norm
         self.n_classes = n_classes
         self.data_format = data_format
-        self.attention = attention
         self.dropout = dropout
         
         # Validate inputs
@@ -205,24 +203,14 @@ class GNNTrackingModel(nn.Module):
         )
     
     def _build_decoder(self):
-        """Build tracking decoder."""
-        if self.attention:
-            self.tracking_decoder = TrackingDecoderWithAttention(
-                embedding_dim=self.encoder_dim,
-                n_filters=self.n_filters,
-                n_classes=self.n_classes,
-                norm_layer=self.norm_layer,
-                attention_heads = 2
-            )
 
-        else:
-            self.tracking_decoder = TrackingDecoder(
-                embedding_dim=self.encoder_dim,
-                n_filters=self.n_filters,
-                n_classes=self.n_classes,
-                norm_layer=self.norm_layer,
-                dropout=self.dropout
-            )
+        self.tracking_decoder = TrackingDecoder(
+            embedding_dim=self.encoder_dim,
+            n_filters=self.n_filters,
+            n_classes=self.n_classes,
+            norm_layer=self.norm_layer,
+            dropout=self.dropout
+        )
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
                         return_logits=True):

@@ -6,6 +6,7 @@ from typing import Dict
 from tracking.model import GNNTrackingModel
 from tracking.tracker import CellTracker
 import zarr
+import pandas as pd
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -97,8 +98,8 @@ if __name__ == "__main__":
     config = {
         'batch_size': 6,
         'n_layers': 1,
-        'crop_size': 32,
-        'crop_mode': 'resize'
+        'crop_size': 16,
+        'crop_mode': 'fixed'
     }
 
     # Initialize model
@@ -175,10 +176,30 @@ if __name__ == "__main__":
         y_tracked = track_review['y_tracked']
         gt_movie = y[:end_frame]
         outname = f"movies/timelapse_batch_{batch}.gif"
-        create_timelapse_gif_with_lineage(y_tracked, gt_movie, lineage1=lineage, lineage2=curr_gt_lineage, output_path=outname, cmap='viridis')
+
+        create_timelapse_gif_with_lineage(
+            y_tracked, 
+            gt_movie, 
+            lineage1=lineage, 
+            lineage2=curr_gt_lineage, 
+            output_path=outname, 
+            cmap='viridis'
+        )
+
+    df = pd.DataFrame(metrics_out)
+
+    df['division_precision'] = (df['correct_division'])/(df['correct_division'] + df['false_positive_division'])
+    df['division_recall'] = df['correct_division']/(df['correct_division'] + df['false_negative_division'])
+    df['division_f1'] = (2 * df['division_recall'] * df['division_precision'])/(df['division_precision'] + df['division_recall'])
+
+
+    df['aa_accuracy'] = df['aa_tp']/df['aa_total']
+    df['te_accuracy'] = df['te_tp']/df['te_total']
     
 
-
+    print(df['division_f1'].mean())
+    print(df['division_recall'].mean())
+    print(df['division_precision'].mean())
 
 
     

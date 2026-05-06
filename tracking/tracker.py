@@ -7,7 +7,6 @@ Integrates with the InferenceBranch for online tracking and handles division det
 from __future__ import absolute_import, division, print_function
 
 import copy
-import logging
 import timeit
 from tqdm import tqdm
 import numpy as np
@@ -17,8 +16,7 @@ import pandas as pd
 from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
-from skimage.segmentation import relabel_sequential
-from tracking.utils import get_max_cells, get_image_features, histogram_normalization
+from tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
 
 
 class CellTracker:
@@ -54,11 +52,12 @@ class CellTracker:
         tracking_model: torch.nn.Module,
         device: str = 'cuda',
         distance_threshold: int = 64,
-        appearance_dim: int = 32,
+        appearance_dim: int = 16,
         death: float = 0.99,
         birth: float = 0.99,
         division: float = 0.9,
         track_length: int = 8,
+        mpp = 0.55,
         crop_mode: str = 'resize',
         norm: bool = True,
         dtype: str = 'float32',
@@ -86,7 +85,9 @@ class CellTracker:
         # Store data
         self.X = copy.copy(movie)
         self.tracks = {}
-        
+
+        self.model_mpp = 0.55
+
         # Store model and config
         self.tracking_model = tracking_model.to(device)
         self.tracking_model.eval()
@@ -100,7 +101,9 @@ class CellTracker:
         self.track_length = track_length
         self.crop_mode = crop_mode
         self.norm = norm
-        
+
+        self.scale_factor = self.model_mpp/mpp
+
         # Tracking state
         self.a_matrix = []
         self.c_matrix = []
@@ -114,19 +117,23 @@ class CellTracker:
         self.n_batch = 1
 
         # Logging
-        self.logger = logging.getLogger(self.__class__.__name__)
         
         # Clean up annotations
-        self._clean_labels(annotation)        
+        self._clean_labels(annotation)
+
+        # Rescale if needed
+        new_shape = (int(self.X.shape[1]*self.scale_factor), int(self.X.shape[2] * self.scale_factor))
+        self.X = resize(self.X, new_shape, data_format = self.data_format)
+        self.y = resize(self.y, new_shape, data_format = self.data_format, labeled_image=True)
+
+
         # ID mappings (accounting for 0-indexing vs 1-based labels)
         self.id_to_idx = {}  # cell_id -> index in feature arrays
         self.idx_to_id = {}  # (frame, idx) -> cell_id
         
         # Extract features and compute embeddings
-        self.logger.info('Extracting features from all frames...')
         adj_matrices, appearances, morphologies, centroids = self._extract_features()
         
-        self.logger.info('Computing embeddings with GNN model...')
         embeddings = self._compute_embeddings(
             appearances, morphologies, centroids, adj_matrices
         )
@@ -137,11 +144,11 @@ class CellTracker:
             'centroid': centroids.squeeze(0),
         }
         
-        self.logger.info('Tracker initialized successfully')
 
     """Ensure valid lineages and sequential labels for all batches"""
     def _clean_labels(self, annotation):
-        self.y, _, _ = relabel_sequential(annotation)
+        self.y = copy.copy(annotation)
+        self.y = clean_up_annotations(self.y)
     
     def _get_frame(self, tensor: np.ndarray, frame: int) -> np.ndarray:
         """Helper to fetch a frame from tensor based on data_format."""
@@ -168,8 +175,8 @@ class CellTracker:
         n_frames = self.X.shape[self.time_axis]
         n_channels = self.X.shape[self.channel_axis]
 
-        if self.norm:
-            self.X = histogram_normalization(self.X, data_format='channels_last')
+        # if self.norm:
+        #     self.X = histogram_normalization(self.X, data_format='channels_last')
 
         # Initialize feature arrays
         appearances = np.zeros(
@@ -179,9 +186,12 @@ class CellTracker:
         morphologies = np.zeros((self.n_batch, n_frames, max_cells, 3), dtype=np.float32)
         centroids = np.zeros((self.n_batch, n_frames, max_cells, 2), dtype=np.float32)
         adj_matrices = np.zeros((self.n_batch, n_frames, max_cells, max_cells), dtype=np.float32)
+
+
         
         # Extract features for each frame
         for batch in range(self.n_batch):
+            
             for frame in range(n_frames):
                 frame_features = get_image_features(
                     self.X[frame],
@@ -203,9 +213,8 @@ class CellTracker:
                 appearances[batch, frame, :num_tracks] = frame_features['appearances']
                 
                 # Compute adjacency based on distance threshold
-                cent = centroids[batch, frame]
-                distance = cdist(cent, cent, metric='euclidean') < self.distance_threshold
-                adj = distance.astype(np.float32)
+                distance = cdist(centroids[batch, frame], centroids[batch, frame], metric='euclidean')
+                adj = ((distance > 0) & (distance < self.distance_threshold)).astype(np.float32)
                 
                 # Disconnect padded nodes
                 morph = morphologies[batch, frame]
@@ -295,6 +304,7 @@ class CellTracker:
         
         return frame_features
     
+    
     def _create_new_track(self, frame: int, old_label: int):
         """Create a new track for a cell."""
 
@@ -323,10 +333,10 @@ class CellTracker:
         }
         
         # Sanity check
-        # if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
-        #     raise Exception(
-        #         f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
-        #     )
+        if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
+            raise Exception(
+                f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
+            )
         
         # Update labels
         if self.data_format == 'channels_first':
@@ -339,7 +349,7 @@ class CellTracker:
         frame = 0
         cell_ids = self._get_cells_in_frame(frame)
         
-        self.logger.info(f'Initializing {len(cell_ids)} tracks from frame 0')
+
         
         for cell_id in cell_ids:
             self._create_new_track(frame, cell_id)
@@ -496,9 +506,9 @@ class CellTracker:
         # Extract probabilities: (1, 1, N, M, 3) -> (N, M, 3)
         predictions = predictions[0, 0].cpu().numpy()
         
-        # Build assignment matrix from "same cell" probabilities (class 1)
+        # Build assignment matrix from "different cell" probabilities (class 1)
         # Cost = 1 - P(same cell)
-        assignment_matrix = predictions[..., 0]
+        assignment_matrix = 1 - predictions[..., 1]
         
         # Set high cost for capped tracks (already divided)
         for i, track_id in enumerate(relevant_tracks):
@@ -512,9 +522,6 @@ class CellTracker:
         cost_matrix = self._build_cost_matrix(assignment_matrix)
         self.c_matrix.append(cost_matrix)
         
-        self.logger.debug(
-            f'Built cost matrix for frame {frame} in {timeit.default_timer() - t:.3f}s'
-        )
         
         predictions_dict = {
             'predictions': predictions,
@@ -578,14 +585,11 @@ class CellTracker:
                 new_track_id = max(self.tracks)
                 new_label = new_track_id + 1
                 
-                self.logger.info(f'Created new track {new_label} for cell {cell_id}')
                 
                 # Check for parent (division detection)
                 parent = self._get_parent(frame, cell_id, predictions)
                 if parent is not None:
-                    self.logger.info(
-                        f'Detected division! Cell {new_label} is daughter of {parent + 1}'
-                    )
+
                     self.tracks[new_track_id]['parent'] = parent
                     self.tracks[parent]['daughters'].append(new_track_id)
                 else:
@@ -637,10 +641,7 @@ class CellTracker:
         
         # Append to tracked labels
         self.y_tracked = np.concatenate([self.y_tracked, y_tracked_update], axis=0)
-        
-        self.logger.debug(
-            f'Updated tracks for frame {frame} in {timeit.default_timer() - t:.3f}s'
-        )
+
     
     def _get_parent(self, frame: int, cell_id: int, predictions: Dict) -> Optional[int]:
         """Find parent track for a cell (division detection).
@@ -677,13 +678,13 @@ class CellTracker:
                     
                     if prob > max_prob:
                         parent_id = track_id
+                        max_prob = prob
         
         return parent_id
     
     def _track_frame(self, frame: int):
         """Track cells in a single frame."""
         t = timeit.default_timer()
-        self.logger.info(f'Tracking frame {frame}')
         
         # Get cost matrix and predictions
         cost_matrix, predictions = self._get_cost_matrix(frame)
@@ -694,10 +695,6 @@ class CellTracker:
         
         # Update tracks based on solution
         self._update_tracks(assignments, frame, predictions)
-        
-        self.logger.info(
-            f'Tracked frame {frame} in {timeit.default_timer() - t:.3f}s'
-        )
     
     def track_cells(self):
         """Track all cells across all frames."""
@@ -712,11 +709,7 @@ class CellTracker:
         for frame in tqdm(range(1, num_frames), leave=False):
             self._track_frame(frame)
         
-        elapsed = timeit.default_timer() - start
-        self.logger.info(
-            f'Tracked all {num_frames} frames in {elapsed:.2f}s '
-            f'({elapsed/num_frames:.3f}s per frame)'
-        )
+
     
     def _track_review_dict(self) -> Dict:
         """Create dictionary for review/export."""

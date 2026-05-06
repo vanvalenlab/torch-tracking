@@ -361,7 +361,7 @@ class NeighborhoodEncoder(nn.Module):
             if graph_layer_name == 'gcn':
                 layer = GCNConv(n_filters, n_filters)
             elif graph_layer_name == 'gat':
-                layer = GATv2Conv(n_filters, n_filters, dropout=0.5, heads=1)
+                layer = GATConv(n_filters, n_filters, dropout=0.5, heads=1, add_self_loops=False)
             else:
                 raise ValueError(f'Unsupported graph layer: {graph_layer_name}')
             

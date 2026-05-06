@@ -94,7 +94,7 @@ class TrkDataset(Dataset):
             for start_frame in range(0, T - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
 
-                if end_frame == max_frames-1:
+                if end_frame == max_frames:
                     break
 
                 samples.append({
@@ -110,7 +110,7 @@ class TrkDataset(Dataset):
 
     def _apply_augmentation(self, appearances, centroids):
         
-        self.rotation_angle = torch.rand(1).item() * self.rotation_range
+        self.rotation_angle = (torch.rand(1) - 0.5) * 2 * self.rotation_range
         angle_rad = torch.deg2rad(torch.tensor(self.rotation_angle))
 
         rotation_mat =  torch.tensor([
@@ -127,7 +127,7 @@ class TrkDataset(Dataset):
         centroids = torch.matmul(centroids, rotation_mat)
             
         # Apply translation
-        random_translate = torch.rand(2) * self.translation_range
+        random_translate = (torch.rand(2) - 0.5) * 2 * self.translation_range
         self.random_translate = random_translate.unsqueeze(0).unsqueeze(0)
         centroids = centroids + self.random_translate
 

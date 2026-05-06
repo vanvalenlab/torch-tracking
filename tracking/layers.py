@@ -145,6 +145,10 @@ class TemporalMerge(nn.Module):
     """Layer for merging the time dimension of a Tensor using LSTM.
     
     Processes temporal sequences at each spatial location independently.
+    Initialized to match Keras LSTM defaults:
+        - Glorot Uniform for input weights
+        - Orthogonal for recurrent weights
+        - Zero biases with forget gate bias set to 1.0
     
     Args:
         encoder_dim (int): Desired encoder dimension and LSTM hidden size.
@@ -163,6 +167,26 @@ class TemporalMerge(nn.Module):
             hidden_size=encoder_dim,
             batch_first=True
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        for name, param in self.lstm.named_parameters():
+            if 'weight_ih' in name:
+                # Glorot Uniform — matches Keras `kernel_initializer='glorot_uniform'`
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:
+                # Orthogonal — matches Keras `recurrent_initializer='orthogonal'`
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                # Zero init — matches Keras `bias_initializer='zeros'`
+                nn.init.zeros_(param)
+                # Forget gate bias set to 1.0 — matches Keras `unit_forget_bias=True`
+                # PyTorch concatenates biases as [input, forget, cell, output]
+                # There are two bias vectors (bias_ih, bias_hh); the convention is to
+                # set the forget gate on bias_ih and leave bias_hh at zero
+                if 'bias_ih' in name:
+                    hidden_size = self.encoder_dim
+                    param.data[hidden_size:hidden_size * 2].fill_(1.0)
 
     def forward(self, x):
         # x shape: (batch, time, tracks, encoder_dim)
@@ -176,7 +200,7 @@ class TemporalMerge(nn.Module):
         x, _ = self.lstm(x)
         
         # Reshape back
-        # (B*T, T, F) -> (B, T, N, F)
+        # (B*N, T, F) -> (B, T, N, F)
         x = x.reshape(batch_size, time_steps, num_tracks, self.encoder_dim)
         
         return x

@@ -55,11 +55,19 @@ class TrackingLoss(nn.Module):
             targets_one_hot = (1 - label_smoothing) * targets_one_hot + label_smoothing / C
 
         if self.loss == 'wcce':
-            loss = weighted_categorical_crossentropy_v2(
-                targets_one_hot,
-                probs_flat,
-                n_classes=C,
-            )
+            
+            # weighted categorical cross entropy
+            eps = 1e-7
+            probs = probs_flat.clamp(eps, 1 - eps)
+
+            total_sum = targets_one_hot.sum()
+            class_sum = targets_one_hot.sum(dim=0, keepdim=True)
+            if self.class_weights is None:
+                class_weights = (1.0 / C) * (total_sum / (class_sum + 1.0))  # (1, C)
+            else:
+                class_weights = torch.tensor(self.class_weights).to(total_sum.device)
+
+            loss = -(targets_one_hot * torch.log(probs) * class_weights)    # (K, C)
 
         elif self.loss == 'focal':
             loss = multiclass_focal_loss(probs_flat, targets_one_hot, gamma=self.gamma)
