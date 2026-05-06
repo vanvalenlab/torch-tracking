@@ -120,7 +120,6 @@ class AppearanceEncoder(nn.Module):
                 # Convert to channels_first: (B*T, N, H, W, C) -> (B*T, N, C, H, W)
                 x = x.permute(0, 1, 4, 2, 3)
 
-
         # We need (B*T, C, N, H, W) - swap channels and cells
         x = x.permute(0, 2, 1, 3, 4)  # (B*T, C, N, H, W)
 

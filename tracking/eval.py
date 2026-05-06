@@ -1,20 +1,32 @@
 """Inference and evaluation scripts for GNN cell tracking model"""
 
+import pandas as pd
+
 import torch
 import numpy as np
-from typing import Dict
 from tracking.model import GNNTrackingModel
 from tracking.tracker import CellTracker
 import zarr
-import pandas as pd
+import json
+import tqdm
+from tracking.visualization import create_timelapse_gif_with_lineage
 
 import matplotlib.pyplot as plt
+from pathlib import Path
 import matplotlib.animation as animation
 
-import json
 from tracking.metrics import TrackingMetrics
 
-from tracking.visualization import create_timelapse_gif_with_lineage
+def build_indices(X):
+
+    samples = []
+
+    for batch in range(X.shape[0]):
+
+        end_frame = np.sum(np.sum(X[batch], axis=(1, 2, 3)) != 0) - 1
+        samples.append(end_frame.item())
+    
+    return samples
 
 
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
@@ -81,82 +93,60 @@ def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10,
     print(f"GIF saved to {output_path}")
 
 
-def build_indices(X):
-
-    samples = []
-
-    for batch in range(X.shape[0]):
-
-        end_frame = np.sum(np.sum(X[batch], axis=(1, 2, 3)) != 0) - 1
-        samples.append(end_frame.item())
-    
-    return samples
-
 
 if __name__ == "__main__":
 
     config = {
-        'batch_size': 6,
-        'n_layers': 1,
-        'crop_size': 16,
-        'crop_mode': 'fixed'
-    }
+            'batch_size': 6,
+            'n_layers': 1,
+            'crop_size': 32,
+            'crop_mode': 'fixed'
+        }
 
     # Initialize model
 
     model = GNNTrackingModel(
-                            graph_layer='gat', 
-                            data_format='channels_last',
-                            encoder_dim=64,
-                            n_layers=config['n_layers'],
-                            crop_size=config['crop_size'],
-                            )
+                    graph_layer='gat', 
+                    data_format='channels_last',
+                    encoder_dim=64,
+                    n_layers=config['n_layers'],
+                    crop_size=config['crop_size'],
+                )
 
-    checkpoint_dir = 'checkpoints/20260227-112127/best_model.pt'
+    checkpoint_dir = 'checkpoints/20260505-192401/checkpoint_epoch_49.pt'
     checkpoint = torch.load(checkpoint_dir) 
-    model.load_state_dict(checkpoint['model_state_dict'])     
-    
-    z = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test.zarr')
-    z2 = zarr.open('data/DynamicNuclearNet-tracking-v1_0/test_proc.zarr')
+    model.load_state_dict(checkpoint['model_state_dict'])   
+
+    z = zarr.open(Path.home() / '.deepcell/tracking/test.zarr')
+    z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
+    batch = 1
 
     with open('data/DynamicNuclearNet-tracking-v1_0/test.json') as file:
         gt_lineage = json.load(file)
 
+    metrics_out = []
+
     X = z['X'][:]
     y = z['y'][:]
 
-    samples = build_indices(X)
-
-    metrics_out = []
-
-    compiled_metrics = {
-        'correct_division': 0,
-        'mismatch_division': 0,
-        'false_positive_division': 0,
-        'false_negative_division': 0,
-        'total_divisions': 0,
-        'aa_tp': 0,
-        'aa_total': 0,
-        'te_tp': 0,
-        'te_total': 0
-    }
-
-    for batch in range(X.shape[0]):
+    for batch in tqdm.tqdm(range(X.shape[0]), leave=False):
 
         curr_gt_lineage= gt_lineage[batch]
-        X = z['X'][batch]
-        y = z['y'][batch]
-        gt = z2['labels'][batch]
+        # gt = z2['labels'][:][batch]
+
+        samples = build_indices(y)
         end_frame = samples[batch]
 
         tracker = CellTracker(
-            movie=X[:end_frame],  # (T, Y, X, C)
-            annotation=y[:end_frame],  # (T, Y, X, C)
+            movie=X[batch, :end_frame],  # (T, Y, X, C)
+            annotation=y[batch, :end_frame],  # (T, Y, X, C)
             tracking_model=model,
-            device='cuda:0',
-            appearance_dim=32,
+            device='cuda:1',
+            appearance_dim=config['crop_size'],
+            division=0.1,
+            birth=0.99,
+            death=0.99,
             track_length=8,
-            division=0.3,
             crop_mode=config['crop_mode'],
             data_format = 'channels_last',
         )
@@ -166,22 +156,21 @@ if __name__ == "__main__":
         y_tracked = tracker.y_tracked
         lineage = tracker.get_lineage_dict()
 
-        metrics = TrackingMetrics(curr_gt_lineage, y[:end_frame], lineage, y_tracked, threshold=0.8)
+        curr_gt_lineage  = {int(k): v for k, v in curr_gt_lineage.items()}
+        lineage = {int(k): v for k, v in lineage.items()}
 
-        for k, v in metrics.stats.items():
-            compiled_metrics[k] += v
-        metrics_out.append(metrics.stats)
+        metrics = TrackingMetrics(curr_gt_lineage, y[batch, :end_frame].squeeze(), lineage, y_tracked.squeeze(), threshold=0.8, verbose=False).stats
+
+        metrics_out.append(metrics)
 
         track_review = tracker._track_review_dict()
         y_tracked = track_review['y_tracked']
-        gt_movie = y[:end_frame]
+        gt_movie = y[batch, :end_frame]
         outname = f"movies/timelapse_batch_{batch}.gif"
 
-        create_timelapse_gif_with_lineage(
+        create_timelapse_gif(
             y_tracked, 
-            gt_movie, 
-            lineage1=lineage, 
-            lineage2=curr_gt_lineage, 
+            gt_movie,  
             output_path=outname, 
             cmap='viridis'
         )
@@ -192,14 +181,8 @@ if __name__ == "__main__":
     df['division_recall'] = df['correct_division']/(df['correct_division'] + df['false_negative_division'])
     df['division_f1'] = (2 * df['division_recall'] * df['division_precision'])/(df['division_precision'] + df['division_recall'])
 
-
     df['aa_accuracy'] = df['aa_tp']/df['aa_total']
     df['te_accuracy'] = df['te_tp']/df['te_total']
     
+    df.to_csv('eval_results.csv')
 
-    print(df['division_f1'].mean())
-    print(df['division_recall'].mean())
-    print(df['division_precision'].mean())
-
-
-    

@@ -75,7 +75,7 @@ def get_temporal_adjacency(lineage, max_frames, max_cells):
     return adjacency
 
 
-def get_features(X, y, lineages, max_cells, appearance_shape=(16, 16, 1), 
+def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1), 
                  crop_mode='fixed', clahe=False, distance_threshold=64, mpps=None):
     
     B, T, H, W, C = X.shape
