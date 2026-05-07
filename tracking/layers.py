@@ -85,17 +85,16 @@ class Comparison(nn.Module):
         (batch, time, tracks_x, tracks_y, features * 2)
     """
     def forward(self, x, y):
-        # Expand x: add dimension for tracks_y
+
         # (B, T, X, F) -> (B, T, X, 1, F)
         x = x.unsqueeze(3)
-        # Tile along the new dimension
+
         # (B, T, X, 1, F) -> (B, T, X, Y, F)
         x = x.expand(-1, -1, -1, y.shape[2], -1)
         
-        # Expand y: add dimension for tracks_x
         # (B, T, Y, F) -> (B, T, 1, Y, F)
         y = y.unsqueeze(2)
-        # Tile along the new dimension
+
         # (B, T, 1, Y, F) -> (B, T, X, Y, F)
         y = y.expand(-1, -1, x.shape[2], -1, -1)
         

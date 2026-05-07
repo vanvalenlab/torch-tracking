@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Assuming these are imported from your other modules
 from tracking.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge

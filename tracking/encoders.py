@@ -3,8 +3,7 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
+from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data, Batch
 from tracking.utils import normalize_adjacency_symmetric
 
@@ -451,16 +450,8 @@ class NeighborhoodEncoder(nn.Module):
         
         node_features = self.initial_activation(node_features)
 
-        # Apply graph convolutions
-        # Need to flatten batch and time for PyG
-
-        
-        # Convert adj_matrix to edge_index format for PyG
-        # adj_matrix shape: (B, T, N, N)
-
         # For each graph in the batch, apply GNN
-        # This is simplified - in practice you'd want to create proper batched graphs
-        # Here we assume fully connected within each time step
+
         for gnn_layer, norm, activation in zip(
             self.graph_layers, self.graph_norms, self.graph_activations
         ):
