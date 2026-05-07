@@ -40,6 +40,11 @@ if __name__ == "__main__":
 
     # Initialize model
 
+    metrics_out = Path('metrics')
+
+    if not metrics_out.exists():
+        metrics_out.mkdir()
+
     model = GNNTrackingModel(
                     graph_layer='gat', 
                     data_format='channels_last',
@@ -48,7 +53,7 @@ if __name__ == "__main__":
                     crop_size=config['crop_size'],
                 )
 
-    checkpoint_dir = 'checkpoints/20260506-053550/checkpoint_epoch_49.pt'
+    checkpoint_dir = 'checkpoints/20260506-053550/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
 
@@ -56,12 +61,12 @@ if __name__ == "__main__":
     z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
     batch = 1
 
-    with open('data/DynamicNuclearNet-tracking-v1_0/test.json') as file:
+    with open(Path.home() / '.deepcell/tracking/test.json') as file:
         gt_lineage = json.load(file)
 
-    division_sweep = [0.01, 0.05, 0.07, 0.08, 0.1]
-    birth_sweep = [0.999]
-    death_sweep = [0.999]
+    division_sweep = [0.01, 0.05, 0.1]
+    birth_sweep = [0.9, 0.99, 0.999]
+    death_sweep = [0.9, 0.99, 0.999]
 
     metrics_out = []
 
@@ -121,5 +126,5 @@ if __name__ == "__main__":
     df['aa_accuracy'] = df['aa_tp']/df['aa_total']
     df['te_accuracy'] = df['te_tp']/df['te_total']
     
-    df.to_csv('postprocess_sweep.csv')
+    df.to_csv('metrics/postprocess_sweep.csv')
 

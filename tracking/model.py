@@ -10,7 +10,7 @@ from tracking.encoders import (
     AppearanceEncoder, MorphologyEncoder, CentroidEncoder,
     DeltaEncoder, NeighborhoodEncoder
 )
-from tracking.decoder import TrackingDecoder, TrackingDecoderWithAttention
+from tracking.decoder import TrackingDecoder
 from tracking.branches import TrainingBranch, InferenceBranch
 
 class GNNTrackingModel(nn.Module):

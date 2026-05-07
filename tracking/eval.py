@@ -27,6 +27,24 @@ def build_indices(X):
     
     return samples
 
+def pretty_print(df):
+
+    print('='*50)
+    print()
+
+    full_precision = df['correct_division'].sum() / (df['correct_division'].sum() + df['false_positive_division'].sum())
+    full_recall = df['correct_division'].sum() / (df['correct_division'].sum() + df['false_negative_division'].sum())
+    full_f1 = 2*full_precision*full_recall / (full_recall+full_precision)
+
+    metrics = {
+        'Precision': full_precision,
+        'Recall': full_recall,
+        "F1": full_f1
+    }
+
+    for k,v in metrics.items():
+        print(f"{k}: {v:04}")
+
 
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
                          titles=('Predicted', 'True'), 
@@ -100,6 +118,16 @@ if __name__ == "__main__":
             'crop_mode': 'fixed'
         }
 
+    # Make output directories
+
+    movies_out = Path('movies')
+    metrics_out = Path('metrics')
+
+    if not movies_out.exists():
+        movies_out.mkdir()
+    if not metrics_out.exists():
+        metrics_out.mkdir()
+
     # Initialize model
 
     model = GNNTrackingModel(
@@ -118,7 +146,7 @@ if __name__ == "__main__":
     z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
     batch = 1
 
-    with open('data/DynamicNuclearNet-tracking-v1_0/test.json') as file:
+    with open(Path.home() / '.deepcell/tracking/test.json') as file:
         gt_lineage = json.load(file)
 
     metrics_out = []
@@ -140,8 +168,8 @@ if __name__ == "__main__":
             tracking_model=model,
             device='cuda:1',
             appearance_dim=config['crop_size'],
-            division=0.1,
-            birth=0.999,
+            division=0.05,
+            birth=0.99,
             death=0.999,
             track_length=8,
             crop_mode=config['crop_mode'],
@@ -182,4 +210,8 @@ if __name__ == "__main__":
     df['te_accuracy'] = df['te_tp']/df['te_total']
 
     df.to_csv('eval_results.csv')
+
+    pretty_print(df)
+
+
 
