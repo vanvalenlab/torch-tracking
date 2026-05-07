@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
     config = {
             'batch_size': 6,
-            'n_layers': 1,
+            'n_layers': 2,
             'crop_size': 32,
             'crop_mode': 'fixed'
         }
@@ -113,7 +113,7 @@ if __name__ == "__main__":
                     crop_size=config['crop_size'],
                 )
 
-    checkpoint_dir = 'checkpoints/20260505-192401/checkpoint_epoch_49.pt'
+    checkpoint_dir = 'checkpoints/20260506-053550/best_model.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
 
@@ -144,8 +144,8 @@ if __name__ == "__main__":
             device='cuda:1',
             appearance_dim=config['crop_size'],
             division=0.1,
-            birth=0.99,
-            death=0.99,
+            birth=0.999,
+            death=0.999,
             track_length=8,
             crop_mode=config['crop_mode'],
             data_format = 'channels_last',
@@ -183,6 +183,8 @@ if __name__ == "__main__":
 
     df['aa_accuracy'] = df['aa_tp']/df['aa_total']
     df['te_accuracy'] = df['te_tp']/df['te_total']
+
+    
     
     df.to_csv('eval_results.csv')
 

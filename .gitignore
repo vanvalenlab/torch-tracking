@@ -7,7 +7,7 @@ deepcell-tracking/
 checkpoints/
 logs/
 markdown_notes/
-notebooks/
+notebooks/*
 movies/
 *.gif
 *.ipynb

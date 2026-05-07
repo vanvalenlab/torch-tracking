@@ -33,8 +33,8 @@ if __name__ == "__main__":
 
     config = {
             'batch_size': 6,
-            'n_layers': 1,
-            'crop_size': 16,
+            'n_layers': 2,
+            'crop_size': 32,
             'crop_mode': 'fixed'
         }
 
@@ -48,7 +48,7 @@ if __name__ == "__main__":
                     crop_size=config['crop_size'],
                 )
 
-    checkpoint_dir = 'checkpoints/20260505-145836/checkpoint_epoch_49.pt'
+    checkpoint_dir = 'checkpoints/20260506-053550/checkpoint_epoch_49.pt'
     checkpoint = torch.load(checkpoint_dir) 
     model.load_state_dict(checkpoint['model_state_dict'])   
 
@@ -59,9 +59,9 @@ if __name__ == "__main__":
     with open('data/DynamicNuclearNet-tracking-v1_0/test.json') as file:
         gt_lineage = json.load(file)
 
-    division_sweep = [0.01, 0.05, 0.1]
-    birth_sweep = [0.8, 0.9, 0.99]
-    death_sweep = [0.8, 0.9, 0.99]
+    division_sweep = [0.01, 0.05, 0.07, 0.08, 0.1]
+    birth_sweep = [0.999]
+    death_sweep = [0.999]
 
     metrics_out = []
 
@@ -87,7 +87,7 @@ if __name__ == "__main__":
                 annotation=y[batch, :end_frame],  # (T, Y, X, C)
                 tracking_model=model,
                 device='cuda:1',
-                appearance_dim=16,
+                appearance_dim=config['crop_size'],
                 division=div_thresh,
                 birth=birth_thresh,
                 death=death_thresh,
@@ -108,6 +108,7 @@ if __name__ == "__main__":
             metrics['div'] = div_thresh
             metrics['birth'] = birth_thresh
             metrics['death'] = death_thresh
+            metrics['set_id'] = batch+1
 
             metrics_out.append(metrics)
 

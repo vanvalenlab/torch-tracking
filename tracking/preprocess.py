@@ -270,7 +270,7 @@ def convert_trk_to_zarr(filename, out_dir=None):
 
 if __name__ == "__main__":
 
-    data_directory = Path.home() / '.deepcell/tracking/'
+    data_directory = Path.home() / '.deepcell/tracking2/'
     print(data_directory)
     
     for filename in Path(data_directory).glob('*.trks'):

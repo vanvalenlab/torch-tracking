@@ -222,6 +222,10 @@ class Trainer:
             # Compute loss
             loss = self.loss_fn(predictions, labels)
 
+            if torch.isnan(loss):
+                continue
+
+
             # Update metrics
             self.metrics_tracker.update(loss, predictions, labels)
 
@@ -348,7 +352,7 @@ class Trainer:
             
             print()
 
-        self.save_checkpoint(is_best=is_best)
+        self.save_checkpoint(is_best=True)
 
         total_time = time.time() - start_time
         print("="*70)
@@ -381,8 +385,8 @@ if __name__ == "__main__":
         "scheduler": "reduce_on_plateau",
         "max_epochs": 50,
         "batch_size": 8,
-        "n_layers": 1,
-        "num_workers": 16,
+        "n_layers": 2,
+        "num_workers": 4,
         "clipnorm": 1.0,
         "step_size": 5,
         "crop_mode": "fixed",
