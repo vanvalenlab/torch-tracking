@@ -12,7 +12,7 @@ from typing import Dict
 from tracking.model import GNNTrackingModel
 from tracking.loader import create_trk_dataloaders
 from tracking.loss import TrackingLoss
-from tracking.training_utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
+from tracking.utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
 
 
 class Trainer:

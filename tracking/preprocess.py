@@ -3,7 +3,6 @@ import io
 import json
 import tarfile
 import zarr
-import glob
 
 from tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization, resize
 from scipy.spatial.distance import cdist
