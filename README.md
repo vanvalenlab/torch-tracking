@@ -21,7 +21,7 @@ Cell relationships are based on the pairwise distances between objects. The cent
 
 The adjacency matrix is then normalized using symmetric normalization:
 
-$$ \bold{\hat{A}} =  \bold{D}^{-1/2}\bold{A}\bold{D}^{-1/2}$$
+$$ \bold{\hat{A}} =  \mathbf{D}^{-1/2}\mathbf{A}\mathbf{D}^{-1/2}$$
 
 A graph attention network is built using two graph convolution layers (a divergence from Caliban's original one graph convolution). Each node of the network is given the embeddings previously calculated with the identity encoder. Messages are then passed between neighboring cells. Centroids are passed through the `NeighborhoodEncoder` module unchanged.
 

@@ -139,21 +139,6 @@ if __name__ == "__main__":
     print(f"   Logits range: [{logits.min():.2f}, {logits.max():.2f}]")
     print()
     
-    # Test TrackingDecoderWithAttention
-    print("2. TrackingDecoderWithAttention")
-    decoder_attn = TrackingDecoderWithAttention(
-        embedding_dim=64,
-        encoder_dim=64,
-        n_filters=64,
-        n_classes=3,
-        attention_heads=4
-    )
-    
-    output_attn = decoder_attn(embedding_comp, deltas, apply_softmax=True)
-    print(f"   Output with attention: {output_attn.shape}")
-    print(f"   Output sum along class dim: {output_attn[0, 0, 0, 0].sum():.4f}")
-    print()
-    
     # Test with different batch sizes
     print("3. Testing different input sizes")
     embedding_comp_small = torch.randn(1, 3, 10, 15, 128)
@@ -184,5 +169,3 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in decoder.parameters())
     print(f"\nTotal parameters in basic decoder: {total_params:,}")
     
-    total_params_attn = sum(p.numel() for p in decoder_attn.parameters())
-    print(f"Total parameters in attention decoder: {total_params_attn:,}")
