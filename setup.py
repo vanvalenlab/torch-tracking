@@ -5,7 +5,7 @@ setup(
     version='0.0.1',
     author='Sam Holtzen',
     author_email='sholtzen@caltech.edu',
-    description='A short description of your project',
+    description='a cell tracking pipeline in pytorch',
     packages=find_packages(),
     install_requires=[
         'requests>=2.25.1',
