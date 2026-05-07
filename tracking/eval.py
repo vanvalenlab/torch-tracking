@@ -9,7 +9,6 @@ from tracking.tracker import CellTracker
 import zarr
 import json
 import tqdm
-from tracking.visualization import create_timelapse_gif_with_lineage
 
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -91,8 +90,6 @@ def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10,
     plt.close()
     
     print(f"GIF saved to {output_path}")
-
-
 
 if __name__ == "__main__":
 
@@ -184,7 +181,5 @@ if __name__ == "__main__":
     df['aa_accuracy'] = df['aa_tp']/df['aa_total']
     df['te_accuracy'] = df['te_tp']/df['te_total']
 
-    
-    
     df.to_csv('eval_results.csv')
 
