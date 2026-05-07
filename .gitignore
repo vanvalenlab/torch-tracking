@@ -1,15 +1,11 @@
 .venv/
-Caliban-2024_Schwartz_et_al/
-data/
-torch-mesmer/
 **/__pycache__/*
-deepcell-tracking/
 checkpoints/
 logs/
-markdown_notes/
-notebooks/*
 movies/
-*.gif
+*.egg-info/
+
+# personal use
+notebooks/
 *.ipynb
 *.csv
-*.egg-info/
