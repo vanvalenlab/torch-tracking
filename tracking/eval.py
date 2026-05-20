@@ -115,7 +115,8 @@ if __name__ == "__main__":
             'batch_size': 6,
             'n_layers': 2,
             'crop_size': 32,
-            'crop_mode': 'fixed'
+            'crop_mode': 'fixed',
+            'write_movies': False
         }
 
     # Make output directories
@@ -188,17 +189,18 @@ if __name__ == "__main__":
 
         metrics_out.append(metrics)
 
-        track_review = tracker._track_review_dict()
-        y_tracked = track_review['y_tracked']
-        gt_movie = y[batch, :end_frame]
-        outname = f"movies/timelapse_batch_{batch}.gif"
+        if config['write_movies']:
+            track_review = tracker._track_review_dict()
+            y_tracked = track_review['y_tracked']
+            gt_movie = y[batch, :end_frame]
+            outname = f"movies/timelapse_batch_{batch}.gif"
 
-        create_timelapse_gif(
-            y_tracked, 
-            gt_movie,  
-            output_path=outname, 
-            cmap='viridis'
-        )
+            create_timelapse_gif(
+                y_tracked, 
+                gt_movie,  
+                output_path=outname, 
+                cmap='viridis'
+            )
 
     df = pd.DataFrame(metrics_out)
 
