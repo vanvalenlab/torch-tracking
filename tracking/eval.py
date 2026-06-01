@@ -2,9 +2,7 @@
 
 import pandas as pd
 
-import torch
 import numpy as np
-from tracking.model import GNNTrackingModel
 from tracking.tracker import CellTracker
 import zarr
 import json
@@ -131,17 +129,6 @@ if __name__ == "__main__":
 
     # Initialize model
 
-    model = GNNTrackingModel(
-                    graph_layer='gat', 
-                    data_format='channels_last',
-                    encoder_dim=64,
-                    n_layers=config['n_layers'],
-                    crop_size=config['crop_size'],
-                )
-
-    checkpoint_dir = 'checkpoints/20260506-053550/best_model.pt'
-    checkpoint = torch.load(checkpoint_dir) 
-    model.load_state_dict(checkpoint['model_state_dict'])   
 
     z = zarr.open(Path.home() / '.deepcell/tracking/test.zarr')
     z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
@@ -164,19 +151,16 @@ if __name__ == "__main__":
         end_frame = samples[batch]
 
         tracker = CellTracker(
-            movie=X[batch, :end_frame],  # (T, Y, X, C)
-            annotation=y[batch, :end_frame],  # (T, Y, X, C)
-            tracking_model=model,
             device='cuda:1',
-            appearance_dim=config['crop_size'],
             division=0.05,
             birth=0.99,
             death=0.999,
-            track_length=8,
-            crop_mode=config['crop_mode'],
-            data_format = 'channels_last',
+            track_length=8
         )
 
+        tracker.preprocess_movie(movie=X[batch, :end_frame],
+                                 annotation=y[batch, :end_frame])
+        
         tracker.track_cells()
 
         y_tracked = tracker.y_tracked

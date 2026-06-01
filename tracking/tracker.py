@@ -3,9 +3,6 @@
 Modernized version of CellTracker that uses PyTorch GNN model instead of TensorFlow.
 Integrates with the InferenceBranch for online tracking and handles division detection.
 """
-
-from __future__ import absolute_import, division, print_function
-
 import copy
 import timeit
 from tqdm import tqdm
@@ -17,6 +14,9 @@ from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
+from pathlib import Path
+
+from tracking.model import GNNTrackingModel
 
 
 class CellTracker:
@@ -47,22 +47,70 @@ class CellTracker:
     
     def __init__(
         self,
-        movie: np.ndarray,
-        annotation: np.ndarray,
-        tracking_model: torch.nn.Module,
+        checkpoint_dir = None,
         device: str = 'cuda',
         distance_threshold: int = 64,
-        appearance_dim: int = 16,
         death: float = 0.99,
         birth: float = 0.99,
         division: float = 0.9,
         track_length: int = 8,
         mpp = 0.55,
-        crop_mode: str = 'resize',
-        norm: bool = True,
         dtype: str = 'float32',
-        data_format: str = 'channels_last'
     ):
+
+
+        # Store model and config
+        
+        self.device = device
+        self.distance_threshold = distance_threshold
+        self.appearance_dim = 32
+        self.death = death
+        self.birth = birth
+        self.division = division
+        self.dtype = dtype
+        self.track_length = track_length
+        self.tracks = {}
+
+        self.model_mpp = 0.55
+        self.scale_factor = self.model_mpp/mpp
+
+        # Tracking state
+        self.a_matrix = []
+        self.c_matrix = []
+        self.assignments = []
+        
+        # Format config
+        self.channel_axis = -1
+        self.time_axis = 0
+        self.n_batch = 1
+
+        print("Initializing model...")
+
+        self.tracking_model = GNNTrackingModel(
+                        graph_layer='gat', 
+                        data_format='channels_last',
+                        encoder_dim=64,
+                        n_layers=2,
+                        crop_size=self.appearance_dim,
+                    )
+        
+        if checkpoint_dir is None:
+            checkpoint = torch.load(Path.home() / '.deepcell/models/tracking/best_model.pt') 
+        else:
+            checkpoint = torch.load(checkpoint_dir)
+            
+        self.tracking_model.load_state_dict(checkpoint['model_state_dict'])  
+
+        self.tracking_model = self.tracking_model.to(self.device)
+        self.tracking_model.eval()
+
+        print()
+        print("Model initialized.")
+
+    def preprocess_movie(self,
+                         movie,
+                         annotation):
+        
         # Validate inputs
         if len(movie.shape) != 4 or len(annotation.shape) != 4:
             raise ValueError(
@@ -76,55 +124,16 @@ class CellTracker:
                 f'Got {movie.shape} and {annotation.shape}'
             )
         
-        if data_format not in {'channels_first', 'channels_last'}:
-            raise ValueError(
-                f'data_format must be "channels_first" or "channels_last". '
-                f'Got: {data_format}'
-            )
-        
+        print("Processing data and generating embeddings...")
+
         # Store data
         self.X = copy.copy(movie)
-        self.tracks = {}
-
-        self.model_mpp = 0.55
-
-        # Store model and config
-        self.tracking_model = tracking_model.to(device)
-        self.tracking_model.eval()
-        self.device = device
-        self.distance_threshold = distance_threshold
-        self.appearance_dim = appearance_dim
-        self.death = death
-        self.birth = birth
-        self.division = division
-        self.dtype = dtype
-        self.track_length = track_length
-        self.crop_mode = crop_mode
-        self.norm = norm
-
-        self.scale_factor = self.model_mpp/mpp
-
-        # Tracking state
-        self.a_matrix = []
-        self.c_matrix = []
-        self.assignments = []
-        
-        # Format config
-        self.data_format = data_format
-        self.channel_axis = 0 if data_format == 'channels_first' else -1
-        self.time_axis = 0
-        
-        self.n_batch = 1
-
-        # Logging
-        
-        # Clean up annotations
         self._clean_labels(annotation)
 
         # Rescale if needed
         new_shape = (int(self.X.shape[1]*self.scale_factor), int(self.X.shape[2] * self.scale_factor))
-        self.X = resize(self.X, new_shape, data_format = self.data_format)
-        self.y = resize(self.y, new_shape, data_format = self.data_format, labeled_image=True)
+        self.X = resize(self.X, new_shape)
+        self.y = resize(self.y, new_shape, labeled_image=True)
 
 
         # ID mappings (accounting for 0-indexing vs 1-based labels)
@@ -143,6 +152,8 @@ class CellTracker:
             'embedding': embeddings,
             'centroid': centroids.squeeze(0),
         }
+
+        print('Embeddings generated. Ready to track.')
         
 
     """Ensure valid lineages and sequential labels for all batches"""
@@ -152,8 +163,6 @@ class CellTracker:
     
     def _get_frame(self, tensor: np.ndarray, frame: int) -> np.ndarray:
         """Helper to fetch a frame from tensor based on data_format."""
-        if self.data_format == 'channels_first':
-            return tensor[:, frame]
         return tensor[frame]
     
     def _get_cells_in_frame(self, frame: int) -> list:
@@ -187,18 +196,13 @@ class CellTracker:
         centroids = np.zeros((self.n_batch, n_frames, max_cells, 2), dtype=np.float32)
         adj_matrices = np.zeros((self.n_batch, n_frames, max_cells, max_cells), dtype=np.float32)
 
-
-        
         # Extract features for each frame
         for batch in range(self.n_batch):
             
             for frame in range(n_frames):
                 frame_features = get_image_features(
                     self.X[frame],
-                    self.y[frame],
-                    appearance_dim=self.appearance_dim,
-                    crop_mode=self.crop_mode,
-                    norm=self.norm
+                    self.y[frame]
                 )
                 
                 # Build ID mappings
@@ -338,11 +342,7 @@ class CellTracker:
                 f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
             )
         
-        # Update labels
-        if self.data_format == 'channels_first':
-            self.y[:, frame][self.y[:, frame] == old_label] = new_label
-        else:
-            self.y[frame][self.y[frame] == old_label] = new_label
+        self.y[frame][self.y[frame] == old_label] = new_label
     
     def _initialize_tracks(self):
         """Initialize tracks from first frame."""

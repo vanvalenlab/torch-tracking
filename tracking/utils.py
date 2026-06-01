@@ -364,7 +364,7 @@ def get_max_cells(y):
             max_cells = n_cells
     return max_cells
 
-def get_image_features(X, y, appearance_dim=16, crop_mode='fixed', norm=True):
+def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
     """Return features for every object in the array.
 
     Args:
