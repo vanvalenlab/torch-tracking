@@ -1,8 +1,6 @@
-"""PyTorch-based cell tracker for GNN tracking model.
+from typing import Dict, Optional, Tuple
+from pathlib import Path
 
-Modernized version of CellTracker that uses PyTorch GNN model instead of TensorFlow.
-Integrates with the InferenceBranch for online tracking and handles division detection.
-"""
 import copy
 import timeit
 from tqdm import tqdm
@@ -10,67 +8,73 @@ import numpy as np
 import torch
 import pandas as pd
 
-from typing import Dict, Optional, Tuple
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
-from pathlib import Path
 
 from tracking.model import GNNTrackingModel
 
-
 class CellTracker:
-    """PyTorch-based cell tracker using GNN model with Hungarian algorithm.
-    
-    Solves the linear assignment problem to build cell lineage graphs by:
-    1. Computing embeddings for all cells across frames using NeighborhoodEncoder
-    2. Running InferenceBranch to get linking probabilities
-    3. Using Hungarian algorithm to solve optimal assignment
-    4. Detecting divisions based on probability thresholds
-    
-    Args:
-        movie (np.array): Raw time series movie of cells (T, Y, X, C)
-        annotation (np.array): Labeled cell movie (T, Y, X, C)
-        tracking_model: GNNTrackingModel instance
-        device (str): Device for inference ('cuda' or 'cpu')
-        distance_threshold (int): Maximum distance for adjacency matrix
-        appearance_dim (int): Size of appearance crops
-        death (float): Parameter for death matrix in LAP
-        birth (float): Parameter for birth matrix in LAP
-        division (float): Probability threshold for assigning daughter cells
-        track_length (int): Track length for temporal context
-        crop_mode (str): 'resize' or 'fixed' for appearance extraction
-        norm (bool): Whether to normalize appearance features
-        dtype (str): Data type for features
-        data_format (str): 'channels_first' or 'channels_last'
     """
-    
+    Args:
+        checkpoint_dir (str or None): The directory of the model weight file
+
+        device (str, optional): The device that you want to use for inference.
+            Default is `cuda`, can also be `cpu` or `mps`
+            If you have a multi-GPU device, specify using `cuda:<N>` where N is the GPU ID
+
+
+        distance_threshold (int, optional): The distance threshold by which cells are 
+            considered "connected" in the GNN in pixels
+            Default is 64 pixels
+
+            
+        death (float, optional): The threshold probability for a 
+            linkage to be considered a "death"
+            Default is 0.999
+
+
+        birth (float, optional): The threshold probability for a 
+            linkage to be considered a new cell, or "birth"
+            Default is 0.99
+
+        division (float, optional): The threshold probability for a 
+            linkage to be considered a mitosis
+            Default is 0.05
+
+        track_length (int, optional): The frames of the movie used to 
+            make an educated guess on the next frame
+            Default is 8.
+
+        mpp (float, optional): The microns per pixel of the movie, 
+            used to resize the input image to
+            match the input resolution of the model.
+            Default is 0.55 microns per pixel
+
+    Returns: Initialized `CellTracker` object
+    """
     def __init__(
         self,
         checkpoint_dir = None,
         device: str = 'cuda',
         distance_threshold: int = 64,
-        death: float = 0.99,
+        death: float = 0.999,
         birth: float = 0.99,
-        division: float = 0.9,
+        division: float = 0.05,
         track_length: int = 8,
-        mpp = 0.55,
-        dtype: str = 'float32',
+        mpp = 0.55
     ):
-
-
-        # Store model and config
         
+        # Store model and config
         self.device = device
         self.distance_threshold = distance_threshold
         self.appearance_dim = 32
         self.death = death
         self.birth = birth
         self.division = division
-        self.dtype = dtype
+        self.dtype = 'float32'
         self.track_length = track_length
         self.tracks = {}
-
         self.model_mpp = 0.55
         self.scale_factor = self.model_mpp/mpp
 
@@ -85,7 +89,6 @@ class CellTracker:
         self.n_batch = 1
 
         print("Initializing model...")
-
         self.tracking_model = GNNTrackingModel(
                         graph_layer='gat', 
                         data_format='channels_last',
@@ -100,9 +103,19 @@ class CellTracker:
             checkpoint = torch.load(checkpoint_dir)
             
         self.tracking_model.load_state_dict(checkpoint['model_state_dict'])  
-
         self.tracking_model = self.tracking_model.to(self.device)
         self.tracking_model.eval()
+
+        ## Setup placeholder values
+        self.X = None
+        self.y = None
+        self.y_tracked = None
+        self.features = None
+        self.tensors = None
+
+        # ID mappings (accounting for 0-indexing vs 1-based labels)
+        self.id_to_idx = {}  # cell_id -> index in feature arrays
+        self.idx_to_id = {}  # (frame, idx) -> cell_id
 
         print()
         print("Model initialized.")
@@ -110,7 +123,22 @@ class CellTracker:
     def preprocess_movie(self,
                          movie,
                          annotation):
-        
+        """Ingest the movie, resize, extract features, and embeddings.
+
+        Args:
+            movie (ndarray[np.float32]): Time lapse image with shape (T, H, W, C) 
+                where T is the frames dimension
+                H and W are the spatial dimension
+                C is the number of channels (should always be 1)
+
+            annotation (ndarray[np.int]): Time lapse image of the 
+                corresponding nuclear masks to the input movie
+                Must be the same shape as the time lapse image 
+                except for the final dimension.
+
+        Returns:
+            None
+        """
         # Validate inputs
         if len(movie.shape) != 4 or len(annotation.shape) != 4:
             raise ValueError(
@@ -135,11 +163,6 @@ class CellTracker:
         self.X = resize(self.X, new_shape)
         self.y = resize(self.y, new_shape, labeled_image=True)
 
-
-        # ID mappings (accounting for 0-indexing vs 1-based labels)
-        self.id_to_idx = {}  # cell_id -> index in feature arrays
-        self.idx_to_id = {}  # (frame, idx) -> cell_id
-        
         # Extract features and compute embeddings
         adj_matrices, appearances, morphologies, centroids = self._extract_features()
         
@@ -155,8 +178,6 @@ class CellTracker:
 
         print('Embeddings generated. Ready to track.')
         
-
-    """Ensure valid lineages and sequential labels for all batches"""
     def _clean_labels(self, annotation):
         self.y = copy.copy(annotation)
         self.y = clean_up_annotations(self.y)
@@ -226,7 +247,6 @@ class CellTracker:
                 adj = adj * (1 - is_pad)
                 
                 adj_matrices[batch, frame] = adj
-
         return adj_matrices, appearances, morphologies, centroids
 
     def _to_tensors(
@@ -246,7 +266,6 @@ class CellTracker:
         tensors['adj_matrix'] = torch.from_numpy(adj_matrices).float().to(self.device)
 
         self.tensors = tensors
-
 
     @torch.no_grad()
     def _compute_embeddings(
@@ -280,7 +299,6 @@ class CellTracker:
         
         # Remove batch dimension and convert back to numpy
         embeddings = embeddings_t.squeeze(0).cpu().numpy()
-        
         return embeddings
     
     def _validate_feature_name(self, feature_name: str):
@@ -305,13 +323,10 @@ class CellTracker:
         
         for cell_id in cells_in_frame:
             frame_features[cell_id] = self._get_feature(frame, cell_id, feature_name)
-        
         return frame_features
-    
     
     def _create_new_track(self, frame: int, old_label: int):
         """Create a new track for a cell."""
-
         track_id = len(self.tracks)
         new_label = track_id + 1
         
@@ -338,7 +353,7 @@ class CellTracker:
         
         # Sanity check
         if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
-            raise Exception(
+            raise ValueError(
                 f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
             )
         
@@ -348,8 +363,6 @@ class CellTracker:
         """Initialize tracks from first frame."""
         frame = 0
         cell_ids = self._get_cells_in_frame(frame)
-        
-
         
         for cell_id in cell_ids:
             self._create_new_track(frame, cell_id)
@@ -397,7 +410,6 @@ class CellTracker:
             # Get feature data
             fetched = self.tracks[n][feature_name][[frame_dict[f] for f in frames]]
             tracked_features[i] = fetched
-        
         return tracked_features
     
     def _build_cost_matrix(self, assignment_matrix: np.ndarray) -> np.ndarray:
@@ -442,7 +454,6 @@ class CellTracker:
         
         # Bottom-right: Mordor (transpose of assignment)
         cost_matrix[num_tracks:, num_cells:] = assignment_matrix.T
-
         return cost_matrix
     
     @torch.no_grad()
@@ -476,10 +487,10 @@ class CellTracker:
             relevant_tracks.append(track_id)
         
         # Convert to arrays
-        current_emb_arr = np.stack([current_embeddings[k] for k in current_embeddings], axis=1)
-        current_cent_arr = np.stack([current_centroids[k] for k in current_centroids], axis=1)
-        future_emb_arr = np.stack([future_embeddings[k] for k in future_embeddings], axis=0)
-        future_cent_arr = np.stack([future_centroids[k] for k in future_centroids], axis=0)
+        current_emb_arr = np.stack([v for k,v in current_embeddings.items()], axis=1)
+        current_cent_arr = np.stack([v for k,v in current_centroids.items()], axis=1)
+        future_emb_arr = np.stack([v for k,v in future_embeddings.items()], axis=0)
+        future_cent_arr = np.stack([v for k,v in future_centroids.items()], axis=0)
         
         # Add time and batch dimensions
         current_emb_arr = np.expand_dims(current_emb_arr, axis=0)  # (1, T, N, D)
@@ -527,7 +538,6 @@ class CellTracker:
             'predictions': predictions,
             'track_ids': relevant_tracks
         }
-        
         return cost_matrix, predictions_dict
     
     def _update_tracks(self, assignments: np.ndarray, frame: int, predictions: Dict):
@@ -538,7 +548,6 @@ class CellTracker:
             frame: Current frame
             predictions: Dict with prediction probabilities and track IDs
         """
-        t = timeit.default_timer()
         cells_in_frame = self._get_cells_in_frame(frame)
         
         # Initialize tracked labels for this frame
@@ -600,7 +609,7 @@ class CellTracker:
                 self.y[frame][self.y[frame] == new_label] = new_track_id + 1
         
         # Handle divided cells that were incorrectly assigned
-        for track_id in range(len(self.tracks)):
+        for track_id, _ in enumerate(self.tracks):
             if not self.tracks[track_id]['daughters']:
                 continue
             
@@ -642,7 +651,6 @@ class CellTracker:
         # Append to tracked labels
         self.y_tracked = np.concatenate([self.y_tracked, y_tracked_update], axis=0)
 
-    
     def _get_parent(self, frame: int, cell_id: int, predictions: Dict) -> Optional[int]:
         """Find parent track for a cell (division detection).
         
@@ -679,13 +687,10 @@ class CellTracker:
                     if prob > max_prob:
                         parent_id = track_id
                         max_prob = prob
-        
         return parent_id
     
     def _track_frame(self, frame: int):
-        """Track cells in a single frame."""
-        t = timeit.default_timer()
-        
+        """Track cells in a single frame."""        
         # Get cost matrix and predictions
         cost_matrix, predictions = self._get_cost_matrix(frame)
         
@@ -697,9 +702,7 @@ class CellTracker:
         self._update_tracks(assignments, frame, predictions)
     
     def track_cells(self):
-        """Track all cells across all frames."""
-        start = timeit.default_timer()
-        
+        """Track all cells across all frames."""        
         # Initialize from first frame
         self._initialize_tracks()
         
@@ -709,8 +712,6 @@ class CellTracker:
         for frame in tqdm(range(1, num_frames), leave=False):
             self._track_frame(frame)
         
-
-    
     def _track_review_dict(self) -> Dict:
         """Create dictionary for review/export."""
         def process(key, track_item):
@@ -718,13 +719,11 @@ class CellTracker:
                 return track_item
             if key == 'daughters':
                 return [x + 1 for x in track_item]
-            elif key == 'parent':
+            if key == 'parent':
                 return track_item + 1 if track_item is not None else None
-            else:
-                return track_item
+            return track_item
         
         track_keys = ['label', 'frames', 'daughters', 'capped', 'frame_div', 'parent']
-        
         return {
             'tracks': {
                 track['label']: {key: process(key, track[key]) for key in track_keys}
@@ -758,7 +757,7 @@ class CellTracker:
         
         # Build dataframe
         data = []
-        for cell_id, track in self.tracks.items():
+        for _, track in self.tracks.items():
             row = extra_column_vals + [track[c] for c in track_columns]
             data.append(row)
         
@@ -768,7 +767,6 @@ class CellTracker:
         df['daughters'] = df['daughters'].apply(
             lambda d: [self.tracks[x]['label'] for x in d]
         )
-        
         return df
     
     def _get_assignment_matrix(self):
@@ -783,7 +781,6 @@ class CellTracker:
 
         for idx, frame in enumerate(self.a_matrix):
             assignment_matrix[(idx,), :frame.shape[0], :frame.shape[1], :] = frame
-
         return assignment_matrix
 
     def _get_assignments(self):
@@ -798,14 +795,13 @@ class CellTracker:
 
         for idx, frame in enumerate(self.assignments):
             assignment_matrix[(idx,), :frame.shape[0], :frame.shape[1]] = frame
-
         return assignment_matrix
     
     def get_lineage_dict(self) -> Dict:
         """Export lineage in standard format for .trk files."""
         lineage = {}
         
-        for track_id, track in self.tracks.items():
+        for _, track in self.tracks.items():
             label = track['label']
             lineage[label] = {
                 'label': label,
@@ -815,5 +811,6 @@ class CellTracker:
                 'frame_div': track['frame_div'],
                 'capped': track['capped']
             }
-        
+
         return lineage
+    
