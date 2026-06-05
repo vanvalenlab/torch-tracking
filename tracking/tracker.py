@@ -609,7 +609,7 @@ class CellTracker:
                 self.y[frame][self.y[frame] == new_label] = new_track_id + 1
         
         # Handle divided cells that were incorrectly assigned
-        for track_id, _ in enumerate(self.tracks):
+        for track_id in list(self.tracks):
             if not self.tracks[track_id]['daughters']:
                 continue
             

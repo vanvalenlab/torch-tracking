@@ -71,7 +71,7 @@ test = [
 zip-safe = false
 include-package-data = false
 packages = [
-    "torch_tracking"
+    "tracking"
 ]
 platforms = [
     'Linux',
@@ -81,10 +81,10 @@ platforms = [
 ]
 
 [tool.setuptools.dynamic.version]
-attr = 'torch_tracking.__version__'
+attr = 'tracking.__version__'
 
 # [tool.setuptools.package-data]
-# torch_tracking = ['tests/*.py']
+# tracking = ['tests/*.py']
 
 [tool.ruff]
 line-length = 110
