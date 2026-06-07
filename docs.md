@@ -2,7 +2,7 @@
 
 ---
 
-## 1. `tracker.py` — `CellTracker`
+## 1. `CellTracker` - `tracker.py`
 
 ### 1.1 Module overview
 
@@ -36,16 +36,15 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 ##### `preprocess_movie()`
 
-- **Purpose**
+- **Purpose**: Extract features from each object in the image and preprocess embeddings for tracking
 
 - **Parameters**:
   - `movie`: raw time-series NumPy array `(T, Y, X, C)`
   - `annotation`: segmentation label array, must match `movie` shape except in the channel dimension
   
-
 ##### `track_cells()`
 
-- **Purpose**: Main entry point — runs the full tracking loop
+- **Purpose**: runs the full tracking loop
 - **Workflow**:
   1. Calls `_initialize_tracks()` to seed one track per cell in frame 0
   2. Iterates over frames 1 … T−1, calling `_track_frame()` at each step
@@ -56,7 +55,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 - **Purpose**: Serialises the completed tracks into the standard lineage dictionary format expected by `.trk` files and `TrackingMetrics`
 - **Returns**: `dict` keyed by 1-based cell label; each value contains `label`, `frames`, `parent`, `daughters`, `frame_div`, `capped`
-- **Note**: `parent` and `daughters` are converted from internal 0-based track IDs to 1-based labels here — explain this indexing shift so users are not surprised
+- **Note**: since the background of the mask is always 0, `parent` and `daughters` are indexed from 1. To access a track, simply index it with its track ID, which corresponds to its label in the `CellTracker.y_tracked` attribute.
 
 ##### `dataframe(**kwargs)`
 
@@ -77,7 +76,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 - Iterates over every frame, calling `get_image_features` to obtain appearance crops, morphology vectors `(area, perimeter, eccentricity)`, and centroids for each cell
 - Builds the adjacency matrix per frame using Euclidean distance between centroids — two cells are connected if their distance is > 0 and < `distance_threshold`; padded (zero-morphology) nodes are explicitly disconnected
-- Returns four zero-padded arrays shaped `(1, T, max_cells, …)` — explain why `max_cells` is determined globally and all frames are padded to this size
+- Returns four zero-padded arrays shaped `(1, T, max_cells, …)`. The padding is there to run the GNN on a GPU. Changing the adjacency matrix size every iteration would increase computation overhead.
 - Also populates `id_to_idx` and `idx_to_id` mappings used throughout tracking
 
 ##### `_compute_embeddings(appearances, morphologies, centroids, adj_matrices)`
@@ -95,7 +94,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 - Allocates a new entry in `self.tracks` with fields: `label`, `frames`, `frame_labels`, `daughters`, `capped`, `frame_div`, `parent`, `embedding`, `centroid`
 - Rewrites the label in `self.y` from `old_label` to the new sequential track label
-- **Important**: raises an exception if the new label already exists in any frame > 0, which would indicate a label collision
+- **Important**: raises an exception if the new label already exists in any frame > 0, which would indicate a label collision. This should never happen, but may if `_clean_labels()` is malfunctioning.
 
 ##### `_track_frame(frame)`
 
@@ -115,8 +114,8 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
   - **Top-left**: the raw `(N_tracks × N_cells)` assignment costs from the model
   - **Top-right** (death): diagonal `self.death`, off-diagonal 1.0 — allows a track to "die" rather than be forced to link
   - **Bottom-left** (birth): diagonal `self.birth`, off-diagonal 1.0 — allows a new cell to be born
-  - **Bottom-right** (Mordor): transpose of the assignment matrix — a standard LAP trick to make the problem feasible
-- Note that lower cost = more likely to be assigned
+  - **Bottom-right** (Mordor): transpose of the assignment matrix — a standard LAP trick to make the problem feasible. Assignments will never be made in this region.
+- Lower cost = more likely to be assigned
 
 ##### `_fetch_tracked_features(before_frame, feature_name)`
 
@@ -156,7 +155,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 Document the internal schema of a single entry in `self.tracks`:
 
 | Key | Type | Description |
-|---|---|---|
+| --- | --- | --- |
 | `label` | `int` | 1-based cell label used in `self.y` |
 | `frames` | `list[int]` | Frame indices where this track is active |
 | `frame_labels` | `list[int]` | Original cell label in each frame before relabelling |
@@ -170,34 +169,39 @@ Document the internal schema of a single entry in `self.tracks`:
 ---
 
 ### 1.4 Indexing conventions (potential gotchas)
+
 - Internal track IDs are 0-based; exported labels (in lineage dicts and DataFrames) are 1-based. The conversion happens inside `get_lineage_dict()` and `_track_review_dict()`.
 - `id_to_idx` maps `(frame, cell_id)` → position in the padded feature array; `idx_to_id` is the reverse. Both are built during `_extract_features()` and are critical for linking the LAP solution back to cell identities.
 - `relevant_tracks` in `_get_cost_matrix` uses sequential indices (0, 1, 2, …) as rows of the assignment matrix; these are mapped back to internal track IDs via the ordered dict produced by `_fetch_tracked_features`.
 
 ---
 
-## 2. `eval.py` — Evaluation Loop
+## 2. Evaluation Loop - `eval.py` 
 
 ### 2.1 Module overview
+
 - Script that loads a test zarr dataset, runs `CellTracker` on each sample, computes `TrackingMetrics`, and aggregates results into a CSV
-- Also contains a visualisation utility (`create_timelapse_gif`) for qualitative inspection
+- Also contains a visualization utility (`create_timelapse_gif`) for qualitative inspection
 
 ---
 
 ### 2.2 Functions
 
 #### `build_indices(X)`
+
 - **Purpose**: Determines the last valid (non-empty) frame for each sample in a batched array, to avoid running the tracker on zero-padded frames
 - **Parameters**: `X` — batched label array of shape `(B, T, H, W, C)`
 - **Logic**: sums pixels across spatial and channel dimensions for each frame; the last frame with a non-zero sum is the end frame
 - **Returns**: list of `int`, one per batch entry
 
 #### `pretty_print(df)`
+
 - **Purpose**: Prints a formatted summary of division detection performance (precision, recall, F1) aggregated across the full evaluation set
 - **Parameters**: `df` — the results DataFrame with columns `correct_division`, `false_positive_division`, `false_negative_division`
 - **Note**: computes macro-level (pooled) metrics rather than averaging per-sample, which is the appropriate choice when sample sizes vary
 
 #### `create_timelapse_gif(im1, im2, output_path, fps, titles, cmap)`
+
 - **Purpose**: Saves a side-by-side animated GIF comparing two label movies (typically predicted vs. ground truth) for qualitative review
 - **Parameters**:
   - `im1`, `im2`: arrays of shape `(T, H, W, C)` — note channels are not split, the whole slice is passed to `imshow`
@@ -212,15 +216,18 @@ Document the internal schema of a single entry in `self.tracks`:
 ### 2.3 `__main__` evaluation loop
 
 #### Setup
+
 - Config dict — document each key: `batch_size`, `n_layers`, `crop_size`, `crop_mode`, `write_movies`
 - Output directories (`movies/`, `metrics/`) created if absent
 - Model initialisation and checkpoint loading — note that `model_state_dict` is expected in the checkpoint
 
 #### Data loading
-- Opens two zarr stores: raw data (`test.zarr`, contains `X` and `y`) and preprocessed data (`test_proc.zarr`, currently unused in the loop — mention this is vestigial)
+
+- Opens raw data (`test.zarr`, contains nuclear image `X` and segmentation ground truth segmentation image `y`)
 - Loads ground-truth lineage from a paired JSON file indexed by batch position
 
 #### Per-sample loop
+
 - `build_indices` is called once on `y` to get all end frames; note it is called inside the loop but the result is constant — this could be moved outside
 - `CellTracker` is constructed and `track_cells()` called for each sample
 - `get_lineage_dict()` and `y_tracked` are retrieved from the tracker
@@ -228,19 +235,22 @@ Document the internal schema of a single entry in `self.tracks`:
 - `TrackingMetrics(...).stats` is the raw dict appended to `metrics_out`
 
 #### Post-loop aggregation
+
 - `metrics_out` is collected into a DataFrame
 - Division precision, recall, F1, association accuracy, and target effectiveness are computed as derived columns — document the formulas
 - Results written to `eval_results.csv`
 - `pretty_print(df)` called for a terminal summary
 
 #### Optional GIF output
+
 - Controlled by `config['write_movies']`; when enabled, calls `_track_review_dict()` (note the private method access) and `create_timelapse_gif` per sample
 
 ---
 
-## 3. `training.py` — `Trainer`
+## 3. `Trainer` - `training.py`
 
 ### 3.1 Module overview
+
 - Encapsulates the full supervised training loop: forward pass, loss computation, gradient update, validation, learning rate scheduling, early stopping, TensorBoard logging, and checkpoint management
 - Wraps a `GNNTrackingModel` and is configured entirely through constructor arguments — no global config file is required at runtime
 
@@ -249,6 +259,7 @@ Document the internal schema of a single entry in `self.tracks`:
 ### 3.2 `Trainer` class
 
 #### Constructor — `__init__`
+
 - **Parameters** — document each:
   - `model`: `GNNTrackingModel` instance — moved to `device` in the constructor
   - `train_loader`, `val_loader`: PyTorch `DataLoader` objects producing batches with keys `appearances`, `morphologies`, `centroids`, `adj_matrices`, `labels`
@@ -263,8 +274,7 @@ Document the internal schema of a single entry in `self.tracks`:
   - `log_and_save`: when `False`, TensorBoard writer is not created and no checkpoints are written — useful for quick debugging runs
   - `config`: arbitrary dict saved as `config.json` alongside checkpoints for reproducibility
   - `loss`: one of `'wcce'`, `'focal'`, `'focal_wcce'` — passed to `TrackingLoss`
-  - `label_smoothing`: float in [0, 1); 0 disables smoothing
-  - `class_weights`: optional list of per-class weights passed to `TrackingLoss`; when `None`, weights are computed dynamically from each batch
+  - `class_weights`: optional list of per-class weights passed to `TrackingLoss`; when `None`, weights are computed dynamically from each batch, but leads to unstable training. The default is 1:10:100 for different:same:mitosis.
   - `stopping_metric`: key from the metrics dict used to determine best model — typically `'loss'`
   - `gamma`: focal loss focusing parameter (only used when `loss` contains `'focal'`)
   - `data_precision`: `'float32'`, `'float16'`, or `'bfloat16'` — controls `torch.amp.autocast` dtype and whether `GradScaler` is active
@@ -273,6 +283,7 @@ Document the internal schema of a single entry in `self.tracks`:
 ---
 
 #### `train_epoch()`
+
 - **Purpose**: Runs one full pass over the training set
 - **Workflow**:
   1. Sets model to `train()` mode
@@ -282,22 +293,26 @@ Document the internal schema of a single entry in `self.tracks`:
 - **Note on precision**: when `data_precision='float32'`, `GradScaler` is instantiated with `enabled=False`, making it a no-op — so the scaler calls are safe regardless of precision mode
 
 #### `validate()`
+
 - **Purpose**: Runs one full pass over the validation set without gradient computation
 - Decorated with `@torch.no_grad()` — no need to call `torch.no_grad()` manually inside
 - Identical structure to `train_epoch()` except no backward pass, no scaler, and NaN batches are silently skipped
 - **Returns**: metrics dict; resets tracker before returning
 
 #### `save_checkpoint(is_best)`
+
 - **Purpose**: Persists model and optimizer state to disk
 - Saves the full checkpoint dict (epoch, model state, optimizer state, best val loss, history) to `checkpoint_epoch_N.pt` for regular saves, or `best_model.pt` when `is_best=True`
 - Only the best checkpoint overwrites; regular checkpoints are pruned to keep only the last 3
 
 #### `load_checkpoint(checkpoint_path)`
+
 - **Purpose**: Restores a training run from a saved checkpoint
 - Restores model weights, optimizer state, epoch counter, best val loss, and full history
 - Allows resuming training by calling `train()` after loading
 
 #### `train()`
+
 - **Purpose**: Main training loop — calls `train_epoch()` and `validate()` for each epoch, steps the scheduler, saves checkpoints, and triggers early stopping
 - **Scheduler step logic**: `ReduceLROnPlateau` is stepped with the current stopping metric; all other schedulers are stepped without arguments — document that list schedulers (the `'caliban'` case) are not handled
 - **Best model logic**: `is_best` is determined by comparing `val_metrics[stopping_metric]` against `self.best_val_loss`; note that `save_checkpoint(is_best=True)` is always called at the end of training, saving whatever state the model is in at the final epoch (not necessarily the best)
@@ -307,17 +322,18 @@ Document the internal schema of a single entry in `self.tracks`:
 ---
 
 ### 3.3 `__main__` example script
+
 - Shows a minimal end-to-end training run using `create_trk_dataloaders`, `create_optimizer`, and `create_scheduler` from `utils.py`
 - Document the config keys used and their meaning: `optimizer`, `learning_rate`, `weight_decay`, `decay`, `scheduler`, `max_epochs`, `batch_size`, `n_layers`, `num_workers`, `clipnorm`, `step_size`, `crop_mode`, `patience`, `log_and_save`, `enable_early_stopping`, `crop_size`, `truncate_dataset`, `loss`, `dropout`, `device`, `label_smoothing`, `stopping_metric`, `data_precision`, `gamma`
-- Note that `class_weights=[1, 10, 20]` is hardcoded here — document the implication (strong upweighting of division class relative to background and same-cell class) and suggest making it configurable
 
 ---
 
 ### 3.4 Checkpoints
+
 Document the schema of a saved checkpoint file:
 
 | Key | Description |
-|---|---|
+| --- | --- |
 | `epoch` | Last completed epoch index |
 | `model_state_dict` | `model.state_dict()` — load with `model.load_state_dict()` |
 | `optimizer_state_dict` | Optimizer state — load with `optimizer.load_state_dict()` |

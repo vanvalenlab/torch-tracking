@@ -62,7 +62,8 @@ class CellTracker:
         birth: float = 0.99,
         division: float = 0.05,
         track_length: int = 8,
-        mpp = 0.55
+        mpp = 0.55,
+        verbose=True,
     ):
         
         # Store model and config
@@ -77,6 +78,7 @@ class CellTracker:
         self.tracks = {}
         self.model_mpp = 0.55
         self.scale_factor = self.model_mpp/mpp
+        self.verbose = verbose
 
         # Tracking state
         self.a_matrix = []
@@ -87,8 +89,9 @@ class CellTracker:
         self.channel_axis = -1
         self.time_axis = 0
         self.n_batch = 1
+        if self.verbose:
+            print("Initializing model...")
 
-        print("Initializing model...")
         self.tracking_model = GNNTrackingModel(
                         graph_layer='gat', 
                         data_format='channels_last',
@@ -117,8 +120,9 @@ class CellTracker:
         self.id_to_idx = {}  # cell_id -> index in feature arrays
         self.idx_to_id = {}  # (frame, idx) -> cell_id
 
-        print()
-        print("Model initialized.")
+        if self.verbose:
+            print()
+            print("Model initialized.")
 
     def preprocess_movie(self,
                          movie,
@@ -152,7 +156,8 @@ class CellTracker:
                 f'Got {movie.shape} and {annotation.shape}'
             )
         
-        print("Processing data and generating embeddings...")
+        if self.verbose:
+            print("Processing data and generating embeddings...")
 
         # Store data
         self.X = copy.copy(movie)
@@ -176,7 +181,8 @@ class CellTracker:
             'centroid': centroids.squeeze(0),
         }
 
-        print('Embeddings generated. Ready to track.')
+        if self.verbose:
+            print('Embeddings generated. Ready to track.')
         
     def _clean_labels(self, annotation):
         self.y = copy.copy(annotation)

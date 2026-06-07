@@ -42,18 +42,17 @@ class Trainer:
         device='cuda',
         checkpoint_dir='./checkpoints/',
         log_dir='./logs/',
-        max_epochs=100,
+        max_epochs=50,
         gradient_clip=1.0,
         early_stopping_patience=10,
-        enable_early_stopping=True,
+        enable_early_stopping=False,
         log_and_save=True,
         config=None,
-        loss='wcce',
-        label_smoothing=False,
         class_weights=None,
+        loss='wcce',
         stopping_metric = 'loss',
         gamma=0.1,
-        data_precision = 'float32'
+        data_precision = 'bfloat16'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -67,13 +66,12 @@ class Trainer:
         self.log_and_save = log_and_save
         self.config=config
         self.loss=loss
-        self.label_smoothing = label_smoothing
-        self.class_weights = class_weights
         self.stopping_metric = stopping_metric
         self.return_logits = False
         self.gamma = gamma
         self.metrics_tracker = MetricsTracker()
         curr_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.class_weights = class_weights
 
         self.log_suffix = curr_time
         self.log_dir = Path(log_dir +  self.log_suffix)
@@ -329,6 +327,8 @@ class Trainer:
             
             if is_best:
                 self.best_val_loss = val_metrics[self.stopping_metric]
+                self.save_checkpoint(is_best=True)
+
 
             if self.writer is not None:
             # Log to tensorboard
@@ -351,8 +351,6 @@ class Trainer:
                     break
             
             print()
-
-        self.save_checkpoint(is_best=True)
 
         total_time = time.time() - start_time
         print("="*70)
@@ -444,10 +442,10 @@ if __name__ == "__main__":
         log_and_save = True,
         config=config,
         loss=config['loss'],
-        class_weights=[1, 10, 20],
         stopping_metric = config['stopping_metric'],
         data_precision=config['data_precision'],
-        gamma=config['gamma']
+        gamma=config['gamma'],
+        class_weights=[1,10,100]
     )   
 
     trainer.train()

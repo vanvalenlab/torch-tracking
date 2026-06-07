@@ -26,9 +26,11 @@ def build_indices(X):
     return samples
 
 def pretty_print(df):
-
-    print('='*50)
+    
     print()
+    print('='*25)
+    print('Results')
+    print('='*25)
 
     full_precision = df['correct_division'].sum() / (df['correct_division'].sum() + df['false_positive_division'].sum())
     full_recall = df['correct_division'].sum() / (df['correct_division'].sum() + df['false_negative_division'].sum())
@@ -41,7 +43,8 @@ def pretty_print(df):
     }
 
     for k,v in metrics.items():
-        print(f"{k}: {v:04}")
+        print(f"{k}: {v:.4}")
+        print()
 
 
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
@@ -109,13 +112,9 @@ def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10,
 
 if __name__ == "__main__":
 
-    config = {
-            'batch_size': 6,
-            'n_layers': 2,
-            'crop_size': 32,
-            'crop_mode': 'fixed',
-            'write_movies': False
-        }
+    write_movies = False
+
+
 
     # Make output directories
 
@@ -131,8 +130,6 @@ if __name__ == "__main__":
 
 
     z = zarr.open(Path.home() / '.deepcell/tracking/test.zarr')
-    z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
-    batch = 1
 
     with open(Path.home() / '.deepcell/tracking/test.json') as file:
         gt_lineage = json.load(file)
@@ -145,17 +142,18 @@ if __name__ == "__main__":
     for batch in tqdm.tqdm(range(X.shape[0]), leave=False):
 
         curr_gt_lineage= gt_lineage[batch]
-        # gt = z2['labels'][:][batch]
 
         samples = build_indices(y)
         end_frame = samples[batch]
 
         tracker = CellTracker(
+            checkpoint_dir=Path.home() / 'torch-tracking/checkpoints/20260607-083350/best_model.pt',
             device='cuda:1',
-            division=0.05,
+            division=0.5,
             birth=0.99,
-            death=0.999,
-            track_length=8
+            death=0.99,
+            track_length=8,
+            verbose=False
         )
 
         tracker.preprocess_movie(movie=X[batch, :end_frame],
@@ -173,7 +171,7 @@ if __name__ == "__main__":
 
         metrics_out.append(metrics)
 
-        if config['write_movies']:
+        if write_movies:
             track_review = tracker._track_review_dict()
             y_tracked = track_review['y_tracked']
             gt_movie = y[batch, :end_frame]

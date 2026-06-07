@@ -61,9 +61,14 @@ class TrackingLoss(nn.Module):
             probs = probs_flat.clamp(eps, 1 - eps)
 
             total_sum = targets_one_hot.sum()
-            class_sum = targets_one_hot.sum(dim=0, keepdim=True)
+            class_sum = targets_one_hot.sum(dim=0, keepdim=True)  # (1, C)
+
             if self.class_weights is None:
-                class_weights = (1.0 / C) * (total_sum / (class_sum + 1.0))  # (1, C)
+                # Inverse frequency: rare classes get higher weight
+                inv_freq = total_sum / (class_sum.clamp(min=1.0) * C)  # (1, C)
+
+                # Normalize so the most-frequent class has weight=1
+                class_weights = inv_freq / inv_freq.min()
             else:
                 class_weights = torch.tensor(self.class_weights).to(total_sum.device)
 
