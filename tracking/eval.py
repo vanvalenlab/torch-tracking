@@ -150,8 +150,8 @@ if __name__ == "__main__":
             checkpoint_dir=Path.home() / 'torch-tracking/checkpoints/20260607-083350/best_model.pt',
             device='cuda:1',
             division=0.5,
-            birth=0.99,
-            death=0.99,
+            birth=0.999,
+            death=0.999,
             track_length=8,
             verbose=False
         )

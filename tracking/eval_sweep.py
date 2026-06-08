@@ -1,19 +1,13 @@
 """Inference and evaluation scripts for GNN cell tracking model"""
 
 import pandas as pd
-
-import torch
 import numpy as np
-from tracking.model import GNNTrackingModel
 from tracking.tracker import CellTracker
 import zarr
 import json
 import tqdm
 import itertools
-import matplotlib.pyplot as plt
 from pathlib import Path
-import matplotlib.animation as animation
-
 
 from tracking.metrics import TrackingMetrics
 
@@ -45,28 +39,16 @@ if __name__ == "__main__":
     if not metrics_out.exists():
         metrics_out.mkdir()
 
-    model = GNNTrackingModel(
-                    graph_layer='gat', 
-                    data_format='channels_last',
-                    encoder_dim=64,
-                    n_layers=config['n_layers'],
-                    crop_size=config['crop_size'],
-                )
-
-    checkpoint_dir = 'checkpoints/20260506-053550/best_model.pt'
-    checkpoint = torch.load(checkpoint_dir) 
-    model.load_state_dict(checkpoint['model_state_dict'])   
+    checkpoint_dir = Path.home() / '.deepcell/models/tracking/best_model.pt'
 
     z = zarr.open(Path.home() / '.deepcell/tracking/test.zarr')
-    z2 = zarr.open(Path.home() / '.deepcell/tracking/test_proc.zarr')
-    batch = 1
 
     with open(Path.home() / '.deepcell/tracking/test.json') as file:
         gt_lineage = json.load(file)
 
-    division_sweep = [0.01, 0.05, 0.1]
-    birth_sweep = [0.9, 0.99, 0.999]
-    death_sweep = [0.9, 0.99, 0.999]
+    division_sweep = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    birth_sweep = [0.999]
+    death_sweep = [0.999]
 
     metrics_out = []
 
@@ -75,31 +57,26 @@ if __name__ == "__main__":
 
     all_comb = [tup for tup in itertools.product(*[division_sweep, birth_sweep, death_sweep])]
 
-    for comb in tqdm.tqdm(all_comb):
-
-        div_thresh, birth_thresh, death_thresh = comb
-
+    for div_thresh, birth_thresh, death_thresh in tqdm.tqdm(all_comb):
         for batch in tqdm.tqdm(range(X.shape[0]), leave=False):
 
             curr_gt_lineage= gt_lineage[batch]
-            # gt = z2['labels'][:][batch]
 
             samples = build_indices(y)
             end_frame = samples[batch]
 
             tracker = CellTracker(
-                movie=X[batch, :end_frame],  # (T, Y, X, C)
-                annotation=y[batch, :end_frame],  # (T, Y, X, C)
-                tracking_model=model,
+                checkpoint_dir=checkpoint_dir,
                 device='cuda:1',
-                appearance_dim=config['crop_size'],
                 division=div_thresh,
                 birth=birth_thresh,
                 death=death_thresh,
                 track_length=8,
-                crop_mode=config['crop_mode'],
-                data_format = 'channels_last',
+                verbose=False
             )
+
+            tracker.preprocess_movie(movie=X[batch, :end_frame],
+                                    annotation=y[batch, :end_frame])
 
             tracker.track_cells()
 
