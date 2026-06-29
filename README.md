@@ -1,46 +1,320 @@
-# PyTorch implementation of Caliban's cell tracker model
+# torch-tracking
 
-## Description
+A PyTorch implementation of a graph neural network (GNN) cell tracker for live-cell fluorescence time-lapse microscopy. The model assigns consistent track IDs to nuclei across frames, detects cell divisions (mitosis), and handles cell births and deaths.
 
-Caliban originally consisted of two parts: the first is the nuclear segmentation pipeline, which is based on a Panoptic Network and segmented nuclei in a live-cell time lapse. The second is a graph neural network used to infer linkages between two frames of the movie, based on the appearance, morphology, and location of each cell. This repo is the PyTorch port of the cell tracker model in Caliban.
+This is a PyTorch port of the cell tracking model from [Caliban](https://www.biorxiv.org/content/10.1101/803205v3), originally implemented in TensorFlow.
 
-## The Model
-### The Encoders: Cell Identity
+---
 
-Cells in the image are identified using the nuclear mask provided. Each cell is cropped to a 32x32 image around the centroid of the nucleus (called the `appearance` image). Further, the cell's nuclear morphology (represented by area, perimeter, eccentricity) is recorded. Finally, the cell's location in the image is recorded (represented by the centroid). Given N cells in the image of time T:
+## Table of Contents
 
-- Appearances: `T, N, 1, 32, 32`, where `1` is the number of channels in the image.
-- Morphology: `T, N, 3`.
-- Centroid: `T, N, 2`, Y and X values for location in the image.
+- [Installation](#installation)
+- [Data Format](#data-format)
+  - [Input Arrays](#input-arrays)
+  - [Preprocessing: `.trk` → Zarr](#preprocessing-trk--zarr)
+  - [Processed Zarr Layout](#processed-zarr-layout)
+- [Basic Usage](#basic-usage)
+  - [Running the Tracker](#running-the-tracker)
+  - [Outputs](#outputs)
+- [Training](#training)
+  - [Training Hyperparameters](#training-hyperparameters)
+- [Inference Hyperparameters](#inference-hyperparameters)
+- [Evaluation](#evaluation)
+- [Model Architecture](#model-architecture)
 
-After the appearance, morphology, and centroid of each cell is encoded, they are each of shape `T, 64, N`, where `64` is the number of channels returned from each encoder.
+---
 
-### The Encoders: Cell Relationship
+## Installation
 
-Cell relationships are based on the pairwise distances between objects. The centroids are used to determine pairwise distances, repsented in a distance matrix. A threshold is used to get an adjacency matrix, where a 1 value indicates an edge in the network between those two nodes, and a 0 means there is no connection. We set the threshold as 64 pixels.
+```bash
+git clone https://github.com/sholtzen/torch-tracking.git
+cd torch-tracking
+pip install -e .
+pip install -r requirements.txt
+```
 
-The adjacency matrix is then normalized using symmetric normalization:
+The default model weights are loaded from `~/.deepcell/models/tracking/best_model.pt`. Place your checkpoint there, or pass the path explicitly (see below).
 
-$$ \mathbf{\hat{A}} =  \mathbf{D}^{-1/2}\mathbf{A}\mathbf{D}^{-1/2}$$
+---
 
-A graph attention network is built using two graph convolution layers (a divergence from Caliban's original one graph convolution). Each node of the network is given the embeddings previously calculated with the identity encoder. Messages are then passed between neighboring cells. Centroids are passed through the `NeighborhoodEncoder` module unchanged.
+## Data Format
 
-## The Model Branches
+### Input Arrays
 
-At this point, the training and inference branches diverge significantly. I will discuss the training branch first, then discuss the inference branch.
+The tracker operates on two numpy arrays:
 
-### The Training Branch
+| Array | Shape | dtype | Description |
+| --- | --- | --- | --- |
+| `movie` | `(T, H, W, C)` | `float32` | Raw fluorescence image. `C` should be `1`. |
+| `annotation` | `(T, H, W, 1)` | `int` | Nuclear segmentation mask. Each integer label corresponds to one nucleus; background is `0`. |
 
-Once the model has calculated the embeddings for each cell, the data is split into two arrays: the current embeddings (from indices 0 to -2), and future embeddings (from indices 2 to -1). This yields one frame of current embeddings (the cell tracker's state at the current moment), and the future embeddings (the ones we are trying to assign to tracks).
+- `T` — number of frames
+- `H`, `W` — spatial dimensions (pixels)
+- `C` — number of channels (always `1` for nuclear images)
 
-The current embeddings are passed into an LSTM module. This module acts as a short-term memory bank. It updates the embeddings based on the embeddings' "history", in this case on frames of the time lapse leading up to the frames we are testing. You may notice that we now have two arrays: one with a "history" applied, and the other without.
+The tracker internally rescales images to a resolution of **0.55 µm/pixel**. If your data has a different resolution, set `mpp` when initializing the tracker.
 
-The current and future embeddings are merged together. At this point, the previous split embeddings are of shape `(T-1, Nx, F)` and `(T-1, Ny, F)`. These two arrays are concatenated together to give an array of shape `(T-1, Nx, Ny, 2F)`. We leave the morphology, centroid, and appearance embeddings alone or a moment, and turn our attention to the movement of cells within frames and between frames.
+---
 
-The difference between centroids within the same frame and between two frames is calculated using simple subtraction. These values are then passed into the `DeltaEncoder`, which encodes the changes in centroid between frames (i.e. movement), and within the same frame (i.e. pairwise distances between cells). The second (`deltas_current`) is then passed into a different LSTM to incorporate changes in relative distances between cells. The embedding comparisons and the deltas are returned to the decoder, which returns a temporal adjacency matrix (TAM), predicting the mapping of cells in the "current" frame onto the cells in the "future" frame.
+### Preprocessing: `.trk` → Zarr
 
-### The Inference Branch
+Training data must be converted from `.trk`/`.trks` files (a tar-based format from Caliban) to Zarr arrays before training. Run:
 
-After being trained to infer deltas and embeddings, the model is able to accept "current" embeddings (embeddings from frames T-8 to T-1), and "future" embeddings (embeddings of the cells you want to track) as well as current and future centroids. These embeddings are calculated using the `NeighborhoodEncoder` module that was trained on images, centroids, and morphologies before being fed into the inference branch.
+```bash
+python -m tracking.preprocess
+```
 
-The model calculates the deltas and encodes them, alongside encoding the deltas and appearance embeddings using their respective LSTM layers. Finally, these delta and appearance embeddings are taken together and passed on to the decoder, which returns the TAM linking the current frame `T-1` to the future frame `T`.
+By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file it produces:
+
+- `<split>.zarr` — raw arrays (`X`, `y`)
+- `<split>_proc.zarr` — pre-extracted features ready for the dataloader
+- `<split>.json` — ground-truth lineage records
+
+The `convert_trk_to_zarr` function in [tracking/preprocess.py](tracking/preprocess.py) can also be called directly:
+
+```python
+from tracking.preprocess import convert_trk_to_zarr
+
+convert_trk_to_zarr('path/to/train.trks', out_dir='data/')
+```
+
+---
+
+### Processed Zarr Layout
+
+The processed Zarr file (`*_proc.zarr`) stores pre-extracted per-cell features:
+
+| Key | Shape | Description |
+| --- | --- | --- |
+| `appearances` | `(B, T, N, 32, 32, 1)` | 32×32 image crop centered on each cell nucleus |
+| `morphologies` | `(B, T, N, 3)` | Per-cell morphological features: area, perimeter, eccentricity |
+| `centroids` | `(B, T, N, 2)` | Y and X centroid coordinates in pixels |
+| `labels` | `(B, T-1, N, N)` | Temporal adjacency matrix (ground truth): `1` = same cell, `2` = daughter, `0` = different cell, `-1` = padding |
+
+- `B` — number of movies in the batch
+- `T` — number of frames
+- `N` — maximum number of cells across the dataset (padded with zeros)
+
+---
+
+## Basic Usage
+
+### Running the Tracker
+
+```python
+import numpy as np
+from tracking.tracker import CellTracker
+
+# Load your movie and segmentation masks
+movie = np.load('movie.npy')        # shape (T, H, W, 1), float32
+annotation = np.load('masks.npy')   # shape (T, H, W, 1), int
+
+# Initialize the tracker
+tracker = CellTracker(
+    checkpoint_dir='path/to/best_model.pt',  # omit to use ~/.deepcell default
+    device='cuda',
+    mpp=0.65,        # set to your image's microns-per-pixel
+)
+
+# Preprocess and embed the movie
+tracker.preprocess_movie(movie=movie, annotation=annotation)
+
+# Run tracking
+tracker.track_cells()
+
+# Retrieve results
+y_tracked = tracker.y_tracked        # (T, H, W, 1) integer label array
+lineage = tracker.get_lineage_dict() # dict of track metadata
+df = tracker.dataframe()             # pandas DataFrame summary
+```
+
+### Outputs
+
+**`tracker.y_tracked`** — shape `(T, H, W, 1)`. An integer label array where each unique integer corresponds to a tracked cell. Labels are consistent across frames: the same integer means the same cell.
+
+**`tracker.get_lineage_dict()`** — returns a dictionary keyed by track label:
+
+```python
+{
+    1: {
+        'label': 1,
+        'frames': [0, 1, 2, 3, ...],   # frames this cell appeared in
+        'parent': None,                  # parent track label (if from division)
+        'daughters': [4, 5],            # daughter track labels (if divided)
+        'frame_div': 12,                # frame where division occurred
+        'capped': True                  # True if track ended due to division
+    },
+    ...
+}
+```
+
+**`tracker.dataframe()`** — returns a pandas DataFrame with columns `label`, `daughters`, `frame_div`. Optional keyword arguments (`cell_type`, `set`, `part`, `montage`) add metadata columns.
+
+---
+
+## Training
+
+Training requires processed Zarr files (see [Preprocessing](#preprocessing-trk--zarr)).
+
+```python
+from pathlib import Path
+from tracking.model import GNNTrackingModel
+from tracking.loader import create_trk_dataloaders
+from tracking.training import Trainer
+from tracking.utils import create_optimizer, create_scheduler
+
+config = {
+    "optimizer": "radam",
+    "learning_rate": 1e-3,
+    "weight_decay": 0,
+    "scheduler": "reduce_on_plateau",
+    "patience": 5,
+    "max_epochs": 50,
+    "batch_size": 8,
+    "n_layers": 2,
+    "num_workers": 4,
+    "clipnorm": 1.0,
+    "loss": "wcce",
+    "gamma": 1.0,
+    "dropout": 0,
+    "device": "cuda:0",
+    "data_precision": "bfloat16",
+    "stopping_metric": "loss",
+    "log_and_save": True,
+}
+
+model = GNNTrackingModel(
+    graph_layer='gat',
+    data_format='channels_last',
+    encoder_dim=64,
+    n_layers=config['n_layers'],
+    crop_size=32,
+    dropout=config['dropout'],
+)
+
+train_loader, val_loader, _ = create_trk_dataloaders(
+    train_path=Path.home() / '.deepcell/tracking/train_proc.zarr',
+    val_path=Path.home() / '.deepcell/tracking/val_proc.zarr',
+    batch_size=config['batch_size'],
+    distance_threshold=64,
+    num_workers=config['num_workers'],
+)
+
+optimizer = create_optimizer(model, config)
+scheduler = create_scheduler(optimizer, config)
+
+trainer = Trainer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    device=config['device'],
+    checkpoint_dir='./checkpoints/',
+    log_dir='./logs/',
+    max_epochs=config['max_epochs'],
+    gradient_clip=config['clipnorm'],
+    loss=config['loss'],
+    gamma=config['gamma'],
+    class_weights=[1, 10, 100],   # upweight mitosis class
+    data_precision=config['data_precision'],
+    stopping_metric=config['stopping_metric'],
+    config=config,
+)
+
+trainer.train()
+```
+
+Checkpoints are saved to `./checkpoints/<timestamp>/best_model.pt`. TensorBoard logs are written to `./logs/<timestamp>/`.
+
+### Training Hyperparameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `learning_rate` | `1e-3` | Initial learning rate for the optimizer |
+| `optimizer` | `"radam"` | Optimizer type. Options: `"radam"`, `"adam"`, `"sgd"` |
+| `scheduler` | `"reduce_on_plateau"` | LR scheduler. Options: `"reduce_on_plateau"`, `"step"`, `"cosine"` |
+| `patience` | `5` | Epochs without improvement before LR is reduced (ReduceLROnPlateau) |
+| `max_epochs` | `50` | Maximum number of training epochs |
+| `batch_size` | `8` | Number of sequences per batch |
+| `clipnorm` | `1.0` | Maximum gradient norm for clipping. Lower values (e.g. `0.001`) stabilize training if gradients are exploding |
+| `n_layers` | `2` | Number of GNN message-passing layers in the neighborhood encoder |
+| `encoder_dim` | `64` | Feature dimension for all encoders and the GNN hidden state |
+| `dropout` | `0` | Dropout rate in the decoder |
+| `loss` | `"wcce"` | Loss function. `"wcce"` = weighted cross-entropy; `"focal"` = focal loss |
+| `gamma` | `1.0` | Focal loss exponent (only used when `loss="focal"`) |
+| `class_weights` | `[1, 10, 100]` | Per-class weights for `[no-link, same-cell, mitosis]`. Mitosis events are rare so a high weight (e.g. `100`) is recommended |
+| `data_precision` | `"bfloat16"` | Mixed-precision training mode. Options: `"bfloat16"`, `"float16"`, `"float32"` |
+| `distance_threshold` | `64` | Pixel radius for GNN edges (cells farther apart are disconnected). Should match the value used at inference |
+| `track_length` | `8` | Number of frames per training window. Should match the inference `track_length` |
+| `stride` | `1` | Temporal stride when sliding the training window |
+
+---
+
+## Inference Hyperparameters
+
+These are set on the `CellTracker` object and control the post-processing decisions made after the model scores each potential linkage.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `death` | `0.999` | Minimum model confidence to call a track "dead" (cell exited the field of view). Higher values make deaths rarer |
+| `birth` | `0.999` | Minimum model confidence to call a detection a "new cell" rather than assigning it to an existing track. Higher values make spontaneous births rarer |
+| `division` | `0.5` | Minimum model confidence for a new-cell event to be attributed to a cell division (mitosis). Lower values increase division sensitivity at the cost of more false positives |
+| `distance_threshold` | `64` | Pixel radius for GNN adjacency at inference. Should match the value used during training |
+| `track_length` | `8` | Number of historical frames used to build the LSTM context for each track. Longer histories give more context but require more memory |
+| `mpp` | `0.55` | Microns per pixel of your input movie. The model was trained at `0.55 µm/pixel`; images are rescaled to match this before inference |
+| `device` | `"cuda"` | PyTorch device string (`"cuda"`, `"cuda:1"`, `"cpu"`, `"mps"`) |
+
+**Tuning guidance:**
+
+- `division` is the most impactful parameter. Run `tracking/eval_sweep.py` to sweep over values (e.g. `0.3`–`0.8`) and pick the threshold that maximizes division F1 on a held-out set.
+- `birth` and `death` rarely need to be changed from `0.999` unless you see many spurious track births or premature track terminations.
+- `mpp` must be set correctly for your microscope. An incorrect value shifts the spatial scale of appearance crops and degrades accuracy.
+
+---
+
+## Evaluation
+
+To evaluate on a test set and produce metrics:
+
+```bash
+python -m tracking.eval
+```
+
+This reads `~/.deepcell/tracking/test.zarr` and `~/.deepcell/tracking/test.json` and writes results to `eval_results.csv`. Reported metrics include:
+
+- **Division precision / recall / F1** — how accurately the tracker detects mitotic events
+- **`aa_accuracy`** — assignment accuracy (fraction of cells correctly linked frame-to-frame)
+- **`te_accuracy`** — track-end accuracy
+
+To sweep over post-processing thresholds and find the best combination:
+
+```bash
+python -m tracking.eval_sweep
+```
+
+Results are saved to `metrics/postprocess_sweep.csv`.
+
+---
+
+## Model Architecture
+
+The model has two phases: a shared **neighborhood encoder** and separate **training** and **inference** branches.
+
+**Neighborhood Encoder** (`NeighborhoodEncoder`)
+
+Each cell in each frame is described by three features:
+
+- **Appearance** — a 32×32 grayscale crop around the nucleus, encoded by a CNN (`AppearanceEncoder`)
+- **Morphology** — area, perimeter, eccentricity, encoded by an MLP (`MorphologyEncoder`)
+- **Centroid** — Y/X position in pixels, encoded by an MLP (`CentroidEncoder`)
+
+The three embeddings are summed and passed through a graph attention network (GAT). Edges connect any two cells within `distance_threshold` pixels of each other, allowing the model to learn context from neighboring cells.
+
+**Training Branch** (`TrainingBranch`)
+
+Operates on a window of `track_length` frames. Splits the sequence into "current" (frames `0:T-1`) and "future" (frames `1:T`) embeddings. An LSTM integrates the current embeddings over time. Pairwise centroid differences (within-frame and between-frame) are encoded by `DeltaEncoder` modules and a second LSTM. All features are merged and passed to the decoder, which predicts a temporal adjacency matrix (TAM) of shape `(T-1, N_current, N_future, 3)` where the 3 classes are: different cell, same cell, mitosis.
+
+**Inference Branch** (`InferenceBranch`)
+
+Accepts pre-computed embeddings for existing tracks (from frames up to `T-1`) and embeddings for cells in the new frame `T`. Applies the same LSTM and delta encoding, then decodes to produce linking probabilities. The `CellTracker` solves a Linear Assignment Problem (Hungarian algorithm) on the resulting cost matrix to assign detections to tracks frame by frame.
