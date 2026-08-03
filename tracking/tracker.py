@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import pandas as pd
+import glob
 
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
@@ -101,11 +102,17 @@ class CellTracker:
                     )
         
         if checkpoint_dir is None:
-            checkpoint = torch.load(Path.home() / '.deepcell/models/tracking/best_model.pt') 
-        else:
-            checkpoint = torch.load(checkpoint_dir)
+            from deepcell_auth import download_torch_tracking_model
+
+            download_torch_tracking_model()
+
+            canonical_path = Path.home() / ".deepcell/models"
+            # Use latest version
+            checkpoint_dir = sorted(
+                glob.glob(str(canonical_path / "torch-mesmer*.pth"))
+            )[-1]
             
-        self.tracking_model.load_state_dict(checkpoint['model_state_dict'])  
+        self.tracking_model.load_state_dict(checkpoint_dir)  
         self.tracking_model = self.tracking_model.to(self.device)
         self.tracking_model.eval()
 

@@ -8,19 +8,21 @@ This is a PyTorch port of the cell tracking model from [Caliban](https://www.bio
 
 ## Table of Contents
 
-- [Installation](#installation)
-- [Data Format](#data-format)
-  - [Input Arrays](#input-arrays)
-  - [Preprocessing: `.trk` → Zarr](#preprocessing-trk--zarr)
-  - [Processed Zarr Layout](#processed-zarr-layout)
-- [Basic Usage](#basic-usage)
-  - [Running the Tracker](#running-the-tracker)
-  - [Outputs](#outputs)
-- [Training](#training)
-  - [Training Hyperparameters](#training-hyperparameters)
-- [Inference Hyperparameters](#inference-hyperparameters)
-- [Evaluation](#evaluation)
-- [Model Architecture](#model-architecture)
+- [torch-tracking](#torch-tracking)
+  - [Table of Contents](#table-of-contents)
+  - [Installation](#installation)
+  - [Data Format](#data-format)
+    - [Input Arrays](#input-arrays)
+    - [Preprocessing: `.trk` → Zarr](#preprocessing-trk--zarr)
+    - [Processed Zarr Layout](#processed-zarr-layout)
+  - [Basic Usage](#basic-usage)
+    - [Running the Tracker](#running-the-tracker)
+    - [Outputs](#outputs)
+  - [Training](#training)
+    - [Training Hyperparameters](#training-hyperparameters)
+  - [Inference Hyperparameters](#inference-hyperparameters)
+  - [Evaluation](#evaluation)
+  - [Model Architecture](#model-architecture)
 
 ---
 
@@ -33,7 +35,7 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
-The default model weights are loaded from `~/.deepcell/models/tracking/best_model.pt`. Place your checkpoint there, or pass the path explicitly (see below).
+Default model weights are downloaded from DeepCell's model zoo. You must first generate an API key from [DeepCell.org](users.deepcell.org) and add it to your terminal's config file. Once you do this, you can import the tracker from the package and instantiate a tracking instance using `CellTracker()`. This will download the model weights from DeepCell and move them to the canonical `.deepcell` folder in your home directory.
 
 ---
 

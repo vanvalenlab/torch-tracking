@@ -12,3 +12,4 @@ matplotlib
 networkx
 tensorboard
 opencv-python
+deepcell_auth@git+https://github.com/vanvalenlab/deepcell-auth.git
