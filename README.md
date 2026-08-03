@@ -31,11 +31,14 @@ This is a PyTorch port of the cell tracking model from [Caliban](https://www.bio
 ```bash
 git clone https://github.com/sholtzen/torch-tracking.git
 cd torch-tracking
-pip install -e .
+pip install .
 pip install -r requirements.txt
 ```
 
 Default model weights are downloaded from DeepCell's model zoo. You must first generate an API key from [DeepCell.org](users.deepcell.org) and add it to your terminal's config file. Once you do this, you can import the tracker from the package and instantiate a tracking instance using `CellTracker()`. This will download the model weights from DeepCell and move them to the canonical `.deepcell` folder in your home directory.
+
+>[!note]
+If you plan to use a GPU for inference (which we suggest), you will have to make sure the PyTorch version installed is compatible with the CUDA version on your GPUs. If you are having problems with installation, check out [this page](https://pytorch.org/get-started/previous-versions/) to make sure you installed the correct PyTorch version that is compatible with your system's CUDA version. If you find that there is a version mismatch, follow the instructions on the page to `pip` install the correct PyTorch version.
 
 ---
 
