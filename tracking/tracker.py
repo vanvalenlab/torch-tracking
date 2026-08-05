@@ -57,7 +57,7 @@ class CellTracker:
     def __init__(
         self,
         checkpoint_dir = None,
-        device: str = 'cuda',
+        device = None,
         distance_threshold: int = 64,
         death: float = 0.999,
         birth: float = 0.999,
@@ -68,7 +68,11 @@ class CellTracker:
     ):
         
         # Store model and config
-        self.device = device
+        if device is None:
+            self.device = 'cpu'
+        else:
+            self.device = device
+        
         self.distance_threshold = distance_threshold
         self.appearance_dim = 32
         self.death = death
