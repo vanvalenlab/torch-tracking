@@ -73,7 +73,7 @@ test = [
 zip-safe = false
 include-package-data = false
 packages = [
-    "tracking"
+    "torch_tracking"
 ]
 platforms = [
     'Linux',
