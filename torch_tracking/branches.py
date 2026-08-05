@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 
 # Assuming these are imported from your other modules
-from tracking.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
-from tracking.layers import compute_deltas, compute_deltas_across_frames
+from torch_tracking.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
+from torch_tracking.layers import compute_deltas, compute_deltas_across_frames
 
-from tracking.encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder, DeltaEncoder
+from torch_tracking.encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder, DeltaEncoder
 
 
 class TrainingBranch(nn.Module):

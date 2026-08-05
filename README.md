@@ -78,7 +78,7 @@ By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file 
 The `convert_trk_to_zarr` function in [tracking/preprocess.py](tracking/preprocess.py) can also be called directly:
 
 ```python
-from tracking.preprocess import convert_trk_to_zarr
+from torch_tracking.preprocess import convert_trk_to_zarr
 
 convert_trk_to_zarr('path/to/train.trks', out_dir='data/')
 ```
@@ -108,7 +108,7 @@ The processed Zarr file (`*_proc.zarr`) stores pre-extracted per-cell features:
 
 ```python
 import numpy as np
-from tracking.tracker import CellTracker
+from torch_tracking.tracker import CellTracker
 
 # Load your movie and segmentation masks
 movie = np.load('movie.npy')        # shape (T, H, W, 1), float32
@@ -163,10 +163,10 @@ Training requires processed Zarr files (see [Preprocessing](#preprocessing-trk--
 
 ```python
 from pathlib import Path
-from tracking.model import GNNTrackingModel
-from tracking.loader import create_trk_dataloaders
-from tracking.training import Trainer
-from tracking.utils import create_optimizer, create_scheduler
+from torch_tracking.model import GNNTrackingModel
+from torch_tracking.loader import create_trk_dataloaders
+from torch_tracking.training import Trainer
+from torch_tracking.utils import create_optimizer, create_scheduler
 
 config = {
     "optimizer": "radam",

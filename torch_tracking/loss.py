@@ -1,5 +1,5 @@
 import torch
-from tracking.utils import weighted_categorical_crossentropy_v2
+from torch_tracking.utils import weighted_categorical_crossentropy_v2
 from torch import nn
 from torch.nn import functional as F
 

@@ -5,13 +5,13 @@ import torch
 import torch.nn as nn
 
 # Import all components (assumes they're in separate modules)
-from tracking.layers import Unmerge, TemporalMerge
-from tracking.encoders import (
+from torch_tracking.layers import Unmerge, TemporalMerge
+from torch_tracking.encoders import (
     AppearanceEncoder, MorphologyEncoder, CentroidEncoder,
     DeltaEncoder, NeighborhoodEncoder
 )
-from tracking.decoder import TrackingDecoder
-from tracking.branches import TrainingBranch, InferenceBranch
+from torch_tracking.decoder import TrackingDecoder
+from torch_tracking.branches import TrainingBranch, InferenceBranch
 
 class GNNTrackingModel(nn.Module):
     """Complete GNN-based tracking model for single cell tracking.
