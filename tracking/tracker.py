@@ -111,10 +111,11 @@ class CellTracker:
             checkpoint_dir = sorted(
                 glob.glob(str(canonical_path / "torch-tracking*.pt"))
             )[-1]
-            
-        self.tracking_model.load_state_dict(torch.load(checkpoint_dir)['model_state_dict'])  
-        self.tracking_model = self.tracking_model.to(self.device)
-        self.tracking_model.eval()
+
+        checkpoint = torch.load(checkpoint_dir, map_location=self.device)['model_state_dict']
+
+        self.tracking_model.load_state_dict(checkpoint)  
+        self.tracking_model.eval().to(self.device)
 
         ## Setup placeholder values
         self.X = None
