@@ -83,7 +83,7 @@ platforms = [
 ]
 
 [tool.setuptools.dynamic.version]
-attr = 'tracking.__version__'
+attr = 'torch_tracking.__version__'
 
 # [tool.setuptools.package-data]
 # tracking = ['tests/*.py']
