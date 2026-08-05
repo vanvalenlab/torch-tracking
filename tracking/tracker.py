@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import pandas as pd
+import glob
 
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
@@ -56,7 +57,7 @@ class CellTracker:
     def __init__(
         self,
         checkpoint_dir = None,
-        device: str = 'cuda',
+        device = None,
         distance_threshold: int = 64,
         death: float = 0.999,
         birth: float = 0.999,
@@ -67,7 +68,11 @@ class CellTracker:
     ):
         
         # Store model and config
-        self.device = device
+        if device is None:
+            self.device = 'cpu'
+        else:
+            self.device = device
+        
         self.distance_threshold = distance_threshold
         self.appearance_dim = 32
         self.death = death
@@ -101,13 +106,20 @@ class CellTracker:
                     )
         
         if checkpoint_dir is None:
-            checkpoint = torch.load(Path.home() / '.deepcell/models/tracking/best_model.pt') 
-        else:
-            checkpoint = torch.load(checkpoint_dir)
-            
-        self.tracking_model.load_state_dict(checkpoint['model_state_dict'])  
-        self.tracking_model = self.tracking_model.to(self.device)
-        self.tracking_model.eval()
+            from deepcell_auth import download_torch_tracking_model
+
+            download_torch_tracking_model()
+
+            canonical_path = Path.home() / ".deepcell/models"
+            # Use latest version
+            checkpoint_dir = sorted(
+                glob.glob(str(canonical_path / "torch-tracking*.pt"))
+            )[-1]
+
+        checkpoint = torch.load(checkpoint_dir, map_location=self.device)['model_state_dict']
+
+        self.tracking_model.load_state_dict(checkpoint)  
+        self.tracking_model.eval().to(self.device)
 
         ## Setup placeholder values
         self.X = None
