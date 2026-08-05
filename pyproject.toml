@@ -43,7 +43,7 @@ dependencies = [
     "torch",
     "torchvision",
     "tqdm",
-    "pytorch-geometric",
+    "torch-geometric",
     "pandas",
     "zarr",
     "numcodecs",
