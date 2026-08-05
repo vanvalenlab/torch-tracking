@@ -3,7 +3,7 @@
 import pandas as pd
 
 import numpy as np
-from tracking.tracker import CellTracker
+from torch_tracking.tracker import CellTracker
 import zarr
 import json
 import tqdm
@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import matplotlib.animation as animation
 
-from tracking.metrics import TrackingMetrics
+from torch_tracking.metrics import TrackingMetrics
 
 def build_indices(X):
 

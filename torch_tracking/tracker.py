@@ -11,9 +11,9 @@ import glob
 
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
-from tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
+from torch_tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
 
-from tracking.model import GNNTrackingModel
+from torch_tracking.model import GNNTrackingModel
 
 class CellTracker:
     """

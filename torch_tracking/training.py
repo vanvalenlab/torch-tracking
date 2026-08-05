@@ -9,10 +9,10 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Dict
 
-from tracking.model import GNNTrackingModel
-from tracking.loader import create_trk_dataloaders
-from tracking.loss import TrackingLoss
-from tracking.utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
+from torch_tracking.model import GNNTrackingModel
+from torch_tracking.loader import create_trk_dataloaders
+from torch_tracking.loss import TrackingLoss
+from torch_tracking.utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
 
 
 class Trainer:

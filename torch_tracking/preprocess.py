@@ -4,7 +4,7 @@ import json
 import tarfile
 import zarr
 
-from tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization, resize
+from torch_tracking.utils import relabel_sequential_lineage, get_image_features, histogram_normalization, resize
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
 from pathlib import Path

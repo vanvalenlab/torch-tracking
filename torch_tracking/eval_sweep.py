@@ -2,14 +2,14 @@
 
 import pandas as pd
 import numpy as np
-from tracking.tracker import CellTracker
+from torch_tracking.tracker import CellTracker
 import zarr
 import json
 import tqdm
 import itertools
 from pathlib import Path
 
-from tracking.metrics import TrackingMetrics
+from torch_tracking.metrics import TrackingMetrics
 
 def build_indices(X):
 
