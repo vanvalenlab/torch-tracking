@@ -112,7 +112,7 @@ class CellTracker:
                 glob.glob(str(canonical_path / "torch-tracking*.pt"))
             )[-1]
             
-        self.tracking_model.load_state_dict(checkpoint_dir)  
+        self.tracking_model.load_state_dict(torch.load(checkpoint_dir)['model_state_dict'])  
         self.tracking_model = self.tracking_model.to(self.device)
         self.tracking_model.eval()
 
