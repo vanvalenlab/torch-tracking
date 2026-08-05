@@ -109,7 +109,7 @@ class CellTracker:
             canonical_path = Path.home() / ".deepcell/models"
             # Use latest version
             checkpoint_dir = sorted(
-                glob.glob(str(canonical_path / "torch-tracking*.pth"))
+                glob.glob(str(canonical_path / "torch-tracking*.pt"))
             )[-1]
             
         self.tracking_model.load_state_dict(checkpoint_dir)  
