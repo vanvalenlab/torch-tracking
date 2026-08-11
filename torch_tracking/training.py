@@ -33,18 +33,18 @@ class TrainingConfig:
     n_layers: int = 2
     clipnorm: float = 1.0
     batch_size: int = 8
-    learning_rate: float = 0.001,
-    patience: int = 10
+    learning_rate: float = 0.001
+    patience: int = 5
     enable_early_stopping: bool = False
     log_and_save: bool = True
-    class_weights: list = None
+    class_weights: list[float] = field(default_factory=lambda: [1, 10, 100])
     loss: str = 'wcce'
     stopping_metric: str = 'loss'
-    gamma: float = 0.1
+    gamma: float = 1.0
     truncate_dataset: int = None
     data_precision: str = 'bfloat16'
     label_smoothing: bool = False
-    dropout: float = 0.1
+    dropout: float = 0
     crop_size: int = 32
     decay: float = 0.99
     weight_decay: float = 0.0
@@ -423,36 +423,9 @@ class Trainer:
 # Example usage
 if __name__ == "__main__":
 
-    # Make config dictionary
-
-    config_dict = {
-        "optimizer": "radam",
-        "learning_rate": 0.001,
-        "weight_decay": 0,
-        "decay": 0.99,
-        "scheduler": "reduce_on_plateau",
-        "max_epochs": 50,
-        "batch_size": 8,
-        "n_layers": 2,
-        "num_workers": 4,
-        "clipnorm": 1.0,
-        "step_size": 5,
-        "crop_mode": "fixed",
-        "patience": 5,
-        "log_and_save": True,
-        "enable_early_stopping": False,
-        "crop_size": 32,
-        "truncate_dataset": None,
-        "loss": "wcce",
-        "dropout": 0,
-        "device": "cuda:3",
-        "label_smoothing": False,
-        "stopping_metric": "loss",
-        'data_precision': 'bfloat16',
-        'gamma': 1.0
-    }
-
-    config = TrainingConfig(**config_dict)
+    # Make config object with default params
+    config = TrainingConfig()
+    config.device='cuda:3'
 
     # Initialize model
 
