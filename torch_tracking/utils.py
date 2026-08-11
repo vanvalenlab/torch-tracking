@@ -780,31 +780,20 @@ class EarlyStopping:
 def create_optimizer(model, config):
     """Create optimizer based on config."""
 
-    optimizer_name = config.get('optimizer', 'radam').lower()
-    lr = config.get('learning_rate', 1e-3)
-    weight_decay = config.get('weight_decay', 0)
+    optimizer_name = config.optimizer
     
     if optimizer_name == 'radam':
         optimizer = optim.RAdam(
             model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
             decoupled_weight_decay=False
         )
 
     elif optimizer_name == 'adamw':
         optimizer = optim.AdamW(
             model.parameters(),
-            lr=lr,
-        )
-
-    elif optimizer_name == 'sgd':
-        momentum = config.get('momentum', 0.9)
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay
+            lr=config.learning_rate,
         )
 
     else:
@@ -816,57 +805,40 @@ def create_optimizer(model, config):
 def create_scheduler(optimizer, config):
     """Create learning rate scheduler."""
 
-    scheduler_name = config.get('scheduler', 'reduce_on_plateau').lower()
+    scheduler_name = config.scheduler
 
     
     if scheduler_name == 'reduce_on_plateau':
-        patience = config.get('patience', 5)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.2,
-            patience=patience
+            patience=config.patience
             )
         
     elif scheduler_name == 'cosine':
-        T_max = config.get('max_epochs', 100)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=T_max,
+            T_max=config.max_epochs,
             eta_min=1e-6
         )
 
     elif scheduler_name == 'step':
         step_size = config.get('step_size', 30)
-        gamma = config.get('gamma', 0.1)
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
             step_size=step_size,
-            gamma=gamma
+            gamma=config.gamma
         )
 
     elif scheduler_name == 'exp':
-        decay = config.get('decay', 0.99)
         scheduler = optim.lr_scheduler.ExponentialLR(
             optimizer,
-            gamma=decay
+            gamma=config.decay
         )
 
     elif scheduler_name == 'none':
         scheduler = None
 
-    elif scheduler_name == 'caliban': 
-        step_size = config.get('step_size', 30)
-        decay = config.get('decay', 0.99)
-        scheduler=[        
-            optim.lr_scheduler.ExponentialLR(
-                optimizer,
-                gamma=decay
-            ),
-            optim.lr_scheduler.ExponentialLR(
-                optimizer,
-                gamma=decay
-            )
-        ]
         
     return scheduler
