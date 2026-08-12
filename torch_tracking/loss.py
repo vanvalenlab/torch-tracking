@@ -67,7 +67,7 @@ class TrackingLoss(nn.Module):
                 # Inverse frequency: rare classes get higher weight
                 class_weights = total_sum / (class_sum.clamp(min=1.0) * C)  # (1, C)
 
-                # # Normalize so the most-frequent class has weight=1
+                # Normalize so the most-frequent class has weight=1
                 # class_weights = inv_freq / inv_freq.min()
             else:
                 class_weights = torch.tensor(self.class_weights).to(total_sum.device)
