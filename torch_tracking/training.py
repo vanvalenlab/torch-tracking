@@ -2,6 +2,8 @@ import torch
 import time
 import datetime
 import json
+from dataclasses import dataclass, field
+from typing import Any
 
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -13,6 +15,69 @@ from torch_tracking.model import GNNTrackingModel
 from torch_tracking.loader import create_trk_dataloaders
 from torch_tracking.loss import TrackingLoss
 from torch_tracking.utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
+
+@dataclass
+class TrainingConfig:
+    model: nn.Module = None
+    train_loader: torch.utils.data.DataLoader = None
+    val_loader: torch.utils.data.DataLoader = None
+    optimizer: str = 'radam'
+    scheduler: str = 'reduce_on_plateau'
+    crop_mode: str = 'fixed'
+    device: str = 'cuda'
+    checkpoint_dir: str = './checkpoints/'
+    log_dir: str = './logs/'
+    step_size: int = 5
+    max_epochs: int = 50
+    num_workers: int = 4
+    n_layers: int = 2
+    clipnorm: float = 1.0
+    batch_size: int = 8
+    learning_rate: float = 0.001
+    patience: int = 5
+    enable_early_stopping: bool = False
+    log_and_save: bool = True
+    class_weights: list[float] = field(default_factory=lambda: [1, 10, 100])
+    loss: str = 'wcce'
+    stopping_metric: str = 'loss'
+    gamma: float = 1.0
+    truncate_dataset: int = None
+    data_precision: str = 'bfloat16'
+    label_smoothing: bool = False
+    dropout: float = 0
+    crop_size: int = 32
+    decay: float = 0.99
+    weight_decay: float = 0.0
+
+    def to_dict(self):
+        return {
+        "log_dir": self.log_dir,
+        "optimizer": self.optimizer,
+        "learning_rate": self.learning_rate,
+        "weight_decay": self.weight_decay,
+        "decay": self.decay,
+        "checkpoint_dir": self.checkpoint_dir,
+        "scheduler": self.scheduler,
+        "max_epochs": self.max_epochs,
+        "batch_size": self.batch_size,
+        "n_layers": self.n_layers,
+        "num_workers": self.num_workers,
+        "clipnorm": self.clipnorm,
+        "step_size": self.step_size,
+        "crop_mode": self.crop_mode,
+        "patience": self.patience,
+        "log_and_save": self.log_and_save,
+        "enable_early_stopping": self.enable_early_stopping,
+        "crop_size": self.crop_size,
+        "truncate_dataset": self.truncate_dataset,
+        "loss": self.loss,
+        "dropout": self.dropout,
+        "device": self.device,
+        "label_smoothing": self.label_smoothing,
+        "stopping_metric": self.stopping_metric,
+        'data_precision': self.data_precision,
+        'gamma': self.gamma
+    }
 
 
 class Trainer:
@@ -37,62 +102,48 @@ class Trainer:
         model: nn.Module,
         train_loader,
         val_loader,
-        optimizer,
-        scheduler=None,
-        device='cuda',
-        checkpoint_dir='./checkpoints/',
-        log_dir='./logs/',
-        max_epochs=50,
-        gradient_clip=1.0,
-        early_stopping_patience=10,
-        enable_early_stopping=False,
-        log_and_save=True,
-        config=None,
-        class_weights=None,
-        loss='wcce',
-        stopping_metric = 'loss',
-        gamma=0.1,
-        data_precision = 'bfloat16'
+        config: TrainingConfig
     ):
+        self.config = config
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.device = device
-        self.max_epochs = max_epochs
-        self.gradient_clip = gradient_clip
-        self.enable_early_stopping = enable_early_stopping
-        self.log_and_save = log_and_save
-        self.config=config
-        self.loss=loss
-        self.stopping_metric = stopping_metric
+        self.optimizer = create_optimizer(self.model, config)
+        self.scheduler = create_scheduler(self.optimizer, config)
+        self.device = self.config.device
+        self.max_epochs = self.config.max_epochs
+        self.gradient_clip = self.config.clipnorm
+        self.enable_early_stopping = self.config.enable_early_stopping
+        self.patience = self.config.patience
+        self.log_and_save = self.config.log_and_save
+        self.loss=self.config.loss
+        self.stopping_metric = self.config.stopping_metric
         self.return_logits = False
-        self.gamma = gamma
+        self.gamma = self.config.gamma
         self.metrics_tracker = MetricsTracker()
         curr_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.class_weights = class_weights
+        self.class_weights = self.config.class_weights
 
         self.log_suffix = curr_time
-        self.log_dir = Path(log_dir +  self.log_suffix)
-        self.checkpoint_dir = Path(checkpoint_dir + self.log_suffix)
+        self.log_dir = Path(self.config.log_dir +  self.log_suffix)
+        self.checkpoint_dir = Path(self.config.checkpoint_dir + self.log_suffix)
 
         self.loss_fn = TrackingLoss(loss=self.loss, gamma=self.gamma, class_weights=self.class_weights)
         
         # Move to device
-        self.model = self.model.to(device)
-        self.loss_fn = self.loss_fn.to(device)
+        self.model = self.model.to(self.device)
+        self.loss_fn = self.loss_fn.to(self.device)
 
         # Altering data precision values
-        if data_precision == 'bfloat16':
+        if self.config.data_precision == 'bfloat16':
             self.autocast = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
             self.scaler = torch.amp.GradScaler()
 
-        elif data_precision == 'float32':
+        elif self.config.data_precision == 'float32':
             self.autocast = torch.amp.autocast(device_type='cuda', dtype=torch.float32)
             self.scaler = torch.amp.GradScaler(enabled=False)
 
-        elif data_precision == 'float16':
+        elif self.config.data_precision == 'float16':
             self.autocast = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
             self.scaler = torch.amp.GradScaler()
 
@@ -103,14 +154,14 @@ class Trainer:
             self.log_dir.mkdir(parents=True, exist_ok=True)
 
             with open(f"{self.checkpoint_dir}/config.json", 'w') as f:
-                json.dump(self.config, f, indent=4)
+                json.dump(self.config.to_dict(), f, indent=4)
         
         else:
             self.writer = None
         
         # Early stopping
         self.early_stopping = EarlyStopping(
-            patience=early_stopping_patience,
+            patience=self.patience,
             mode='min'
         )
         
@@ -155,14 +206,14 @@ class Trainer:
 
             if torch.isnan(loss):
                 print(f"NaN loss detected at epoch {self.current_epoch}, skipping batch")
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 continue
 
             if torch.isnan(loss) or torch.isinf(loss):
                 # Log which batch and what the probs looked like
                 print(f"  min prob: {predictions.min().item():.2e}")
                 print(f"  max prob: {predictions.max().item():.2e}")
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 continue
 
             # Gradient clipping
@@ -286,7 +337,6 @@ class Trainer:
         print(f"Loaded checkpoint from epoch {self.current_epoch}")
     
     def train(self):
-        """Main training loop."""
         print("="*70)
         print("Starting Training")
         print("="*70)
@@ -373,34 +423,9 @@ class Trainer:
 # Example usage
 if __name__ == "__main__":
 
-    # Make config dictionary
-
-    config = {
-        "optimizer": "radam",
-        "learning_rate": 0.001,
-        "weight_decay": 0,
-        "decay": 0.99,
-        "scheduler": "reduce_on_plateau",
-        "max_epochs": 50,
-        "batch_size": 8,
-        "n_layers": 2,
-        "num_workers": 4,
-        "clipnorm": 1.0,
-        "step_size": 5,
-        "crop_mode": "fixed",
-        "patience": 5,
-        "log_and_save": True,
-        "enable_early_stopping": False,
-        "crop_size": 32,
-        "truncate_dataset": None,
-        "loss": "wcce",
-        "dropout": 0,
-        "device": "cuda:0",
-        "label_smoothing": False,
-        "stopping_metric": "loss",
-        'data_precision': 'bfloat16',
-        'gamma': 1.0
-    }
+    # Make config object with default params
+    config = TrainingConfig()
+    config.device='cuda:3'
 
     # Initialize model
 
@@ -408,44 +433,32 @@ if __name__ == "__main__":
         graph_layer='gat', 
         data_format='channels_last',
         encoder_dim=64,
-        n_layers=config['n_layers'],
-        crop_size=config['crop_size'],
-        dropout=config['dropout']
+        n_layers=config.n_layers,
+        crop_size=config.crop_size,
+        dropout=config.dropout
     )
-    
+
+    config.model = model
 
     # Create optimizer and rate scheduler
     
     train_loader, val_loader, _ = create_trk_dataloaders(
         train_path=Path.home() / '.deepcell/tracking/train_proc.zarr',
         val_path=Path.home() / '.deepcell/tracking/val_proc.zarr',
-        batch_size=config['batch_size'],
+        batch_size=config.batch_size,
         distance_threshold=64,
-        num_workers=config['num_workers'],
-        truncate_dataset = config['truncate_dataset'],
+        num_workers=config.num_workers,
+        truncate_dataset = config.truncate_dataset,
     )
 
-    optimizer = create_optimizer(model, config)
-    scheduler = create_scheduler(optimizer, config)
+    config.train_loader = train_loader
+    config.val_loader = val_loader
     
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=config['device'],
-        checkpoint_dir='./checkpoints/',
-        max_epochs=config['max_epochs'],
-        gradient_clip=config['clipnorm'],
-        enable_early_stopping=config['enable_early_stopping'],
-        log_and_save = True,
-        config=config,
-        loss=config['loss'],
-        stopping_metric = config['stopping_metric'],
-        data_precision=config['data_precision'],
-        gamma=config['gamma'],
-        class_weights=[1,10,100]
+        config=config
     )   
 
     trainer.train()

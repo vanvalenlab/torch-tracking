@@ -45,8 +45,9 @@ dependencies = [
     "tqdm",
     "torch-geometric",
     "pandas",
-    "zarr",
+    "zarr>=3",
     "numcodecs",
+    "tensorboard",
     "deepcell_auth@git+https://github.com/vanvalenlab/deepcell-auth.git"
 ]
 

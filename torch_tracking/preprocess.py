@@ -100,7 +100,7 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
         print("Preprocessing whole image with CLAHE...")
         X = histogram_normalization(X, data_format='channels_last')
 
-    for batch in tqdm(range(B), desc="Processing batches"):
+    for batch in tqdm(range(B), desc="Processing movie batches"):
         
         new_size = (int(0.55/mpps[batch]*H), int(0.55/mpps[batch]*W)) # resizing image so that crops are standardized to MPP of 0.55
 
@@ -191,10 +191,6 @@ def load_trks(filename):
         lineages = json.loads(trks.extractfile(trk_data).read().decode())
         lineages = lineages if isinstance(lineages, list) else [lineages]
 
-        # JSON only allows strings as keys, so convert them back to ints
-        # for i, tracks in enumerate(lineages):
-        #     lineages[i] = {str(k): v for k, v in tracks.items()}
-
     return {'lineages': lineages, 'X': raw, 'y': tracked}
 
 def correct_lineages(X, y, lineages):
@@ -202,8 +198,7 @@ def correct_lineages(X, y, lineages):
     new_X = []
     new_y = []
     new_lineages = []
-    for batch in tqdm(range(y.shape[0])):
-        # if is_valid_lineage(self.y[batch], self.lineages[batch]):
+    for batch in tqdm(range(y.shape[0]), desc="Validating lineages"):
 
         y_relabel, new_lineage = relabel_sequential_lineage(
             y[batch], lineages[batch])
@@ -211,8 +206,6 @@ def correct_lineages(X, y, lineages):
         new_X.append(X[batch])
         new_y.append(y_relabel)
         new_lineages.append(new_lineage)
-        # else:
-        #     print('Invalid lineage detected.')
 
     X = np.stack(new_X, axis=0)
     y = np.stack(new_y, axis=0)
