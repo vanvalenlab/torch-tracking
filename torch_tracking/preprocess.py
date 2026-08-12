@@ -257,7 +257,7 @@ def convert_trk_to_zarr(filename, out_dir=None):
     z_proc = zarr.open(processed_file, mode='w')
 
     for k, v in features.items():
-        z_proc[k]=v
+        z_proc.create_array(k, data=v)
     
 
 if __name__ == "__main__":
