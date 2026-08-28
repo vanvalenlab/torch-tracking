@@ -48,7 +48,7 @@ dependencies = [
     "zarr>=3",
     "numcodecs",
     "tensorboard",
-    "deepcell_auth@git+https://github.com/vanvalenlab/deepcell-auth.git"
+    "huggingface_hub"
 ]
 
 [[project.authors]]
