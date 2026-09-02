@@ -82,7 +82,7 @@ class CellTracker:
         self.track_length = track_length
         self.tracks = {}
         self.model_mpp = 0.55
-        self.scale_factor = self.model_mpp/mpp
+        self.scale_factor = mpp/self.model_mpp
         self.verbose = verbose
 
         # Tracking state
