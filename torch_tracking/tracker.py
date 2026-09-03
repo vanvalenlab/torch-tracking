@@ -211,6 +211,7 @@ class CellTracker:
         self.tensors = None
         self.id_to_idx = {}
         self.idx_to_id = {}
+        torch.cuda.empty_cache()
         
     def _clean_labels(self, annotation):
         self.y = copy.copy(annotation)
