@@ -175,6 +175,9 @@ class CellTracker:
         self.X = copy.copy(movie)
         self._clean_labels(annotation)
 
+        # Keep a copy of the cleaned labels at original resolution, before resizing
+        self.y_original = copy.copy(self.y)
+
         # Rescale if needed
         new_shape = (int(self.X.shape[1]*self.scale_factor), int(self.X.shape[2] * self.scale_factor))
         self.X = resize(self.X, new_shape)
@@ -376,7 +379,8 @@ class CellTracker:
             )
         
         self.y[frame][self.y[frame] == old_label] = new_label
-    
+        self.y_original[frame][self.y_original[frame] == old_label] = new_label 
+
     def _initialize_tracks(self):
         """Initialize tracks from first frame."""
         frame = 0
@@ -386,8 +390,8 @@ class CellTracker:
             self._create_new_track(frame, cell_id)
         
         # Start tracked label array
-        self.y_tracked = self.y[[frame]].astype('int32')
-    
+        self.y_tracked = self.y_original[[frame]].astype('int32')    
+
     def _fetch_tracked_features(
         self,
         before_frame: Optional[int] = None,
@@ -570,7 +574,7 @@ class CellTracker:
         
         # Initialize tracked labels for this frame
         y_tracked_update = np.zeros(
-            (1, self.y.shape[1], self.y.shape[2], 1), dtype='int32'
+            (1, self.y_original.shape[1], self.y_original.shape[2], 1), dtype='int32'
         )
         
         self.assignments.append(assignments)
@@ -603,12 +607,14 @@ class CellTracker:
                 
                 # Update labels
                 track_label = track_idx + 1
-                y_tracked_update[self.y[[frame]] == cell_id] = track_label
+                y_tracked_update[self.y_original[[frame]] == cell_id] = track_label
                 self.y[frame][self.y[frame] == cell_id] = track_label
+                self.y_original[frame][self.y_original[frame] == cell_id] = track_label
+
             
             else:
                 # Create new track (birth)
-                self._create_new_track(frame, cell_id)
+                self._create_new_track(frame, cell_id)   # already relabels y_original now
                 new_track_id = max(self.tracks)
                 new_label = new_track_id + 1
                 
@@ -622,9 +628,9 @@ class CellTracker:
                 else:
                     self.tracks[new_track_id]['parent'] = None
                 
-                # Update labels
-                y_tracked_update[self.y[[frame]] == new_label] = new_track_id + 1
+                y_tracked_update[self.y_original[[frame]] == new_label] = new_track_id + 1
                 self.y[frame][self.y[frame] == new_label] = new_track_id + 1
+                self.y_original[frame][self.y_original[frame] == new_label] = new_track_id + 1
         
         # Handle divided cells that were incorrectly assigned
         for track_id in list(self.tracks):
@@ -663,8 +669,9 @@ class CellTracker:
             
             # Update labels
             old_track_label = self.tracks[track_id]['label']
-            y_tracked_update[self.y[[frame]] == old_track_label] = new_label
+            y_tracked_update[self.y_original[[frame]] == old_track_label] = new_label
             self.y[frame][self.y[frame] == old_track_label] = new_label
+            self.y_original[frame][self.y_original[frame] == old_track_label] = new_label
         
         # Append to tracked labels
         self.y_tracked = np.concatenate([self.y_tracked, y_tracked_update], axis=0)
