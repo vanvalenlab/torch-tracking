@@ -198,6 +198,19 @@ class CellTracker:
 
         if self.verbose:
             print('Embeddings generated. Ready to track.')
+
+    def reset_state(self):
+        self.tracks = {}
+        self.a_matrix = []
+        self.c_matrix = []
+        self.assignments = []
+        self.X = None
+        self.y = None
+        self.y_tracked = None
+        self.features = None
+        self.tensors = None
+        self.id_to_idx = {}
+        self.idx_to_id = {}
         
     def _clean_labels(self, annotation):
         self.y = copy.copy(annotation)
