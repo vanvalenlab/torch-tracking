@@ -82,7 +82,7 @@ class CellTracker:
         self.track_length = track_length
         self.tracks = {}
         self.model_mpp = 0.55
-        self.scale_factor = self.model_mpp/mpp
+        self.scale_factor = mpp/self.model_mpp
         self.verbose = verbose
 
         # Tracking state
@@ -127,6 +127,7 @@ class CellTracker:
         self.y_tracked = None
         self.features = None
         self.tensors = None
+        self.relabel_map: Dict[int, Dict[int, int]] = {}
 
         # ID mappings (accounting for 0-indexing vs 1-based labels)
         self.id_to_idx = {}  # cell_id -> index in feature arrays
@@ -175,6 +176,9 @@ class CellTracker:
         self.X = copy.copy(movie)
         self._clean_labels(annotation)
 
+        # Keep a copy of the cleaned labels at original resolution, before resizing
+        self.y_original = copy.copy(self.y)
+
         # Rescale if needed
         new_shape = (int(self.X.shape[1]*self.scale_factor), int(self.X.shape[2] * self.scale_factor))
         self.X = resize(self.X, new_shape)
@@ -195,6 +199,21 @@ class CellTracker:
 
         if self.verbose:
             print('Embeddings generated. Ready to track.')
+
+    def reset_state(self):
+        self.tracks = {}
+        self.a_matrix = []
+        self.c_matrix = []
+        self.assignments = []
+        self.X = None
+        self.y = None
+        self.y_tracked = None
+        self.features = None
+        self.tensors = None
+        self.id_to_idx = {}
+        self.idx_to_id = {}
+        self.relabel_map: Dict[int, Dict[int, int]] = {}
+        torch.cuda.empty_cache()
         
     def _clean_labels(self, annotation):
         self.y = copy.copy(annotation)
@@ -344,19 +363,14 @@ class CellTracker:
         return frame_features
     
     def _create_new_track(self, frame: int, old_label: int):
-        """Create a new track for a cell."""
         track_id = len(self.tracks)
         new_label = track_id + 1
-        
-        # Get features
+
         embedding = self._get_feature(frame, old_label, feature_name='embedding')
         centroid = self._get_feature(frame, old_label, feature_name='centroid')
-        
-        # Add dimension for temporal axis
         embedding = np.expand_dims(embedding, axis=0)
         centroid = np.expand_dims(centroid, axis=0)
-        
-        # Initialize track
+
         self.tracks[track_id] = {
             'label': new_label,
             'frames': [frame],
@@ -368,15 +382,9 @@ class CellTracker:
             'embedding': embedding,
             'centroid': centroid
         }
-        
-        # Sanity check
-        if frame > 0 and np.any(self._get_frame(self.y, frame) == new_label):
-            raise ValueError(
-                f'new_label {new_label} already in annotated frame {frame} (frame > 0)'
-            )
-        
-        self.y[frame][self.y[frame] == old_label] = new_label
-    
+
+        self.relabel_map.setdefault(frame, {})[old_label] = new_label
+
     def _initialize_tracks(self):
         """Initialize tracks from first frame."""
         frame = 0
@@ -385,9 +393,6 @@ class CellTracker:
         for cell_id in cell_ids:
             self._create_new_track(frame, cell_id)
         
-        # Start tracked label array
-        self.y_tracked = self.y[[frame]].astype('int32')
-    
     def _fetch_tracked_features(
         self,
         before_frame: Optional[int] = None,
@@ -568,11 +573,6 @@ class CellTracker:
         """
         cells_in_frame = self._get_cells_in_frame(frame)
         
-        # Initialize tracked labels for this frame
-        y_tracked_update = np.zeros(
-            (1, self.y.shape[1], self.y.shape[2], 1), dtype='int32'
-        )
-        
         self.assignments.append(assignments)
         
         # Process each assignment
@@ -603,14 +603,14 @@ class CellTracker:
                 
                 # Update labels
                 track_label = track_idx + 1
-                y_tracked_update[self.y[[frame]] == cell_id] = track_label
-                self.y[frame][self.y[frame] == cell_id] = track_label
+                self.relabel_map.setdefault(frame, {})[cell_id] = track_label
+
+
             
             else:
                 # Create new track (birth)
-                self._create_new_track(frame, cell_id)
+                self._create_new_track(frame, cell_id)   # already relabels y_original now
                 new_track_id = max(self.tracks)
-                new_label = new_track_id + 1
                 
                 
                 # Check for parent (division detection)
@@ -621,11 +621,7 @@ class CellTracker:
                     self.tracks[parent]['daughters'].append(new_track_id)
                 else:
                     self.tracks[new_track_id]['parent'] = None
-                
-                # Update labels
-                y_tracked_update[self.y[[frame]] == new_label] = new_track_id + 1
-                self.y[frame][self.y[frame] == new_label] = new_track_id + 1
-        
+                        
         # Handle divided cells that were incorrectly assigned
         for track_id in list(self.tracks):
             if not self.tracks[track_id]['daughters']:
@@ -644,7 +640,6 @@ class CellTracker:
             
             # Create new track for this cell
             new_track_id = len(self.tracks)
-            new_label = new_track_id + 1
             old_label = self.tracks[track_id]['frame_labels'][-1]
             
             self._create_new_track(frame, old_label)
@@ -661,13 +656,23 @@ class CellTracker:
             )
             self.tracks[track_id]['daughters'].append(new_track_id)
             
-            # Update labels
-            old_track_label = self.tracks[track_id]['label']
-            y_tracked_update[self.y[[frame]] == old_track_label] = new_label
-            self.y[frame][self.y[frame] == old_track_label] = new_label
-        
-        # Append to tracked labels
-        self.y_tracked = np.concatenate([self.y_tracked, y_tracked_update], axis=0)
+
+    def _apply_relabel_map(self, y_raw: np.ndarray) -> np.ndarray:
+        """Relabel a (T, H, W, 1) raw-label volume using self.relabel_map."""
+        y_final = np.zeros_like(y_raw)
+        for frame in range(y_raw.shape[0]):
+            mapping = self.relabel_map.get(frame, {})
+            frame_arr = y_raw[frame, ..., 0]
+            if not mapping:
+                y_final[frame, ..., 0] = frame_arr
+                continue
+            max_label = int(frame_arr.max())
+            lut = np.arange(max_label + 1, dtype=frame_arr.dtype)
+            for old, new in mapping.items():
+                if old <= max_label:
+                    lut[old] = new
+            y_final[frame, ..., 0] = lut[frame_arr]
+        return y_final
 
     def _get_parent(self, frame: int, cell_id: int, predictions: Dict) -> Optional[int]:
         """Find parent track for a cell (division detection).
@@ -730,6 +735,11 @@ class CellTracker:
         for frame in tqdm(range(1, num_frames), leave=False):
             self._track_frame(frame)
         
+        # single relabel pass at the very end
+        self.y_tracked = self._apply_relabel_map(self.y_original).astype('int32')
+        self.y = self._apply_relabel_map(self.y)
+        self.y_original = self._apply_relabel_map(self.y_original)
+
     def _track_review_dict(self) -> Dict:
         """Create dictionary for review/export."""
         def process(key, track_item):
