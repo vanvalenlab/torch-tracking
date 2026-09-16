@@ -9,6 +9,7 @@ import torch
 import pandas as pd
 import glob
 
+from huggingface_hub import hf_hub_download
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from torch_tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
@@ -106,15 +107,11 @@ class CellTracker:
                     )
         
         if checkpoint_dir is None:
-            from deepcell_auth import download_torch_tracking_model
-
-            download_torch_tracking_model()
-
-            canonical_path = Path.home() / ".deepcell/models"
-            # Use latest version
-            checkpoint_dir = sorted(
-                glob.glob(str(canonical_path / "torch-tracking*.pt"))
-            )[-1]
+            
+            hf_hub_download(repo_id='vanvalenlab/torch-tracking', 
+                            filename='torch-tracking_2026-07-30.pt',
+                            local_dir=Path.home() / '.deepcell/models')
+            checkpoint_dir = Path.home() / '.deepcell/models/torch-tracking_2026-07-30.pt'
 
         checkpoint = torch.load(checkpoint_dir, map_location=self.device)['model_state_dict']
 
