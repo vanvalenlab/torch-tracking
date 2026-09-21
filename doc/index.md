@@ -1,5 +1,12 @@
 # torch-tracking documentation
 
+```{toctree}
+---
+hidden: true
+---
+model_access
+```
+
 Welcome to the `torch-tracking` documentation!
 
 `torch-tracking` is deep-learning library for cell tracking in live cell images.
