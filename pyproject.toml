@@ -72,6 +72,7 @@ test = [
 docs = [
     "sphinx",
     "pydata-sphinx-theme",
+    "myst-nb",
 ]
 
 [tool.setuptools]
