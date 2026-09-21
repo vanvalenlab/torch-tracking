@@ -69,6 +69,10 @@ email = 'vanvalenlab@gmail.com'
 test = [
     "pytest"
 ]
+docs = [
+    "sphinx",
+    "pydata-sphinx-theme",
+]
 
 [tool.setuptools]
 include-package-data = false
