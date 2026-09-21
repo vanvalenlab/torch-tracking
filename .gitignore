@@ -9,3 +9,6 @@ movies/
 notebooks/
 *.ipynb
 *.csv
+
+# Docs cruft
+doc/_build
