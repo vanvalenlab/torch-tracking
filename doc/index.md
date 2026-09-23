@@ -5,6 +5,8 @@
 hidden: true
 ---
 model_access
+model
+tutorial
 ```
 
 Welcome to the `torch-tracking` documentation!
