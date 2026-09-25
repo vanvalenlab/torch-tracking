@@ -17,23 +17,48 @@ warnings.filterwarnings("ignore")
 
 class TrkDataset(Dataset):
     """PyTorch Dataset for .trk format cell tracking data.
-    
-    Loads data from .trk files containing:
-    - X: raw fluorescent nuclear data (B, T, Y, X, C)
-    - y: nuclear segmentation masks (B, T, Y, X, C)
-    - lineages: lineage records with cell id, frames, divisions
-    
-    Args:
-        trk_path (str or Path): Path to .trk file (train.trk, val.trk, etc.)
-        track_length (int): Number of consecutive frames per sample
-        max_cells (int): Maximum number of cells per frame
-        crop_size (int): Size of appearance crops (will be crop_size x crop_size)
-        stride (int): Stride for temporal sampling (1 = every frame)
-        appearance_shape (tuple): Output shape for crops (H, W, C)
-        data_format (str): 'channels_first' or 'channels_last'
-        mode (str): 'training' or 'inference'
-        normalize_images (bool): Whether to normalize raw images
-        distance_threshold (float): Distance for adjacency matrix generation
+
+    Loads pre-extracted, zarr-backed features from a .trk file containing,
+    per batch element: appearance crops, morphology features, centroids,
+    and pairwise-linkage labels, and slices them into fixed-length temporal
+    samples for training or inference.
+
+    Parameters
+    ----------
+    trk_path : str or Path
+        Path to the .trk (zarr) file (e.g. ``train.trk``, ``val.trk``).
+    track_length : int, optional
+        Number of consecutive frames per sample. Default is 8.
+    stride : int, optional
+        Stride for temporal sampling of sample windows (1 = every frame).
+        Default is 1.
+    data_format : str, optional
+        Either ``channels_first`` or ``channels_last``. Default is
+        ``channels_first``.
+    distance_threshold : float, optional
+        Distance threshold (in pixels) used to build the adjacency matrix
+        between cell centroids. Default is 64.
+    augment : bool, optional
+        Whether to apply random rotation and translation augmentation to
+        appearances and centroids. Default is True.
+    rotation_range : int, optional
+        Maximum absolute rotation angle, in degrees, used when ``augment``
+        is True. Default is 180.
+    translation_range : float, optional
+        Maximum absolute translation, in pixels, used when ``augment`` is
+        True. Default is 512.
+    truncate_dataset : int or None, optional
+        If given, only the first ``truncate_dataset`` batch elements are
+        loaded from the zarr store. Default is None (load everything).
+    t_direction : str, optional
+        Either ``forward`` or ``backward``. If ``backward``, each sample's
+        temporal features and labels are flipped along the time axis.
+        Default is ``forward``.
+
+    Returns
+    -------
+    TrkDataset
+        An initialized ``TrkDataset`` object.
     """
     def __init__(
         self,
@@ -106,7 +131,14 @@ class TrkDataset(Dataset):
         return samples
     
     def __len__(self) -> int:
-        return len(self.samples)      
+        """Return the number of samples in the dataset.
+
+        Returns
+        -------
+        int
+            The number of temporal samples built from the underlying data.
+        """
+        return len(self.samples)
 
     def _apply_augmentation(self, appearances, centroids):
         
@@ -192,15 +224,24 @@ class TrkDataset(Dataset):
         return tensors
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Load a single sample.
-        
-        Returns:
+        """Load a single sample, applying augmentation if enabled.
+
+        Parameters
+        ----------
+        idx : int
+            Index of the sample to load.
+
+        Returns
+        -------
+        dict of str to torch.Tensor
             Dictionary containing:
-            - appearances: (track_length, max_cells, H, W, C) or channels_first
-            - morphologies: (track_length, max_cells, 3)
-            - centroids: (track_length, max_cells, 2)
-            - adj_matrices: (track_length, max_cells, max_cells)
-            - labels (optional): (track_length-1, max_cells, max_cells)
+
+            - ``appearances`` : shape ``(track_length, max_cells, H, W, C)``
+              (or channels-first equivalent).
+            - ``morphologies`` : shape ``(track_length, max_cells, 3)``.
+            - ``centroids`` : shape ``(track_length, max_cells, 2)``.
+            - ``adj_matrices`` : shape ``(track_length, max_cells, max_cells)``.
+            - ``labels`` : shape ``(track_length - 1, max_cells, max_cells)``.
         """
 
         sample_info = self.samples[idx]
@@ -242,23 +283,36 @@ def create_trk_dataloaders(
     **dataset_kwargs
 ) -> Tuple[DataLoader, ...]:
     
-    """Create dataloaders for .trk format data.
-    
-    Args:
-        train_path: Path to train.trk
-        val_path: Path to val.trk (optional)
-        test_path: Path to test.trk (optional)
-        batch_size: Batch size
-        num_workers: Number of data loading workers
-        track_length: Number of frames per sequence
-        max_cells: Maximum cells per frame
-        crop_size: Size of appearance crops
-        stride: Temporal stride for sampling
-        **dataset_kwargs: Additional arguments for TrkDataset
-    
-    Returns:
-        Tuple of DataLoaders (train_loader, val_loader, test_loader)
-        None for loaders where path not provided
+    """Create train, validation, and test dataloaders for .trk format data.
+
+    Parameters
+    ----------
+    train_path : str or Path or None, optional
+        Path to the training .trk file. If None, no training loader is
+        created.
+    val_path : str or Path or None, optional
+        Path to the validation .trk file. If None, no validation loader is
+        created. Validation datasets are built with ``augment=False``.
+    test_path : str or Path or None, optional
+        Path to the test .trk file. If None, no test loader is created.
+    batch_size : int, optional
+        Batch size used by all created loaders. Default is 4.
+    num_workers : int, optional
+        Number of data loading worker processes. Default is 4.
+    track_length : int, optional
+        Number of frames per sequence, forwarded to ``TrkDataset``. Default
+        is 8.
+    stride : int, optional
+        Temporal stride for sampling, forwarded to ``TrkDataset``. Default
+        is 1.
+    **dataset_kwargs : dict, optional
+        Additional keyword arguments forwarded to ``TrkDataset``.
+
+    Returns
+    -------
+    tuple of torch.utils.data.DataLoader or None
+        A ``(train_loader, val_loader, test_loader)`` tuple. Any entry
+        whose corresponding path was not provided is ``None``.
     """
 
     loaders = []

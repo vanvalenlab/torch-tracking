@@ -10,28 +10,31 @@ from matplotlib.patches import FancyArrowPatch
 from scipy import ndimage
 
 class PositionAnimationBuilder:
+    """Build a scatter-point animation incrementally by adding frames during iteration.
+
+    Parameters
+    ----------
+    marker_size : int, optional
+        Size of the scatter markers. Default is 50.
+    title : str, optional
+        Plot title. Default is ``"Position Animation"``.
+    xlim : tuple, optional
+        ``(min, max)`` for the x-axis. Auto-determined from the added
+        frames if None.
+    ylim : tuple, optional
+        ``(min, max)`` for the y-axis. Auto-determined from the added
+        frames if None.
+    figsize : tuple, optional
+        Figure size ``(width, height)``. Default is ``(8, 6)``.
+
+    Returns
+    -------
+    PositionAnimationBuilder
+        An initialized ``PositionAnimationBuilder`` object.
     """
-    Build an animation incrementally by adding frames during iteration.
-    """
-    
-    def __init__(self, marker_size=50, title="Position Animation", 
+
+    def __init__(self, marker_size=50, title="Position Animation",
                  xlim=None, ylim=None, figsize=(8, 6)):
-        """
-        Initialize the animation builder.
-        
-        Parameters:
-        -----------
-        marker_size : int
-            Size of scatter markers
-        title : str
-            Plot title
-        xlim : tuple, optional
-            (min, max) for x-axis. Auto-determined if None
-        ylim : tuple, optional
-            (min, max) for y-axis. Auto-determined if None
-        figsize : tuple
-            Figure size (width, height)
-        """
         self.frames = []  # Store (x_positions, y_positions) for each frame
         self.images = []
         self.marker_size = marker_size
@@ -41,15 +44,26 @@ class PositionAnimationBuilder:
         self.figsize = figsize
     
     def add_frame(self, x_positions, y_positions, image=None):
-        """
-        Add a new frame to the animation.
-        
-        Parameters:
-        -----------
+        """Add a new frame of point positions to the animation.
+
+        Points where ``x_positions`` equals 0 are treated as invalid and
+        dropped before storing.
+
+        Parameters
+        ----------
         x_positions : array-like
-            X coordinates for this timestep
+            X coordinates for this timestep.
         y_positions : array-like
-            Y coordinates for this timestep
+            Y coordinates for this timestep.
+        image : array-like, optional
+            Optional per-point image stack, indexed the same way as
+            ``x_positions``/``y_positions``, stored alongside the frame.
+
+        Returns
+        -------
+        None
+            Appends the filtered positions (and optional images) to
+            ``self.frames`` in place.
         """
         x_positions = np.array(x_positions)
         y_positions = np.array(y_positions)
@@ -64,17 +78,18 @@ class PositionAnimationBuilder:
         
     
     def show(self, interval=50):
-        """
-        Generate and display the animation.
-        
-        Parameters:
-        -----------
-        interval : int
-            Delay between frames in milliseconds
-        
-        Returns:
-        --------
-        HTML object with embedded animation
+        """Generate and display the animation.
+
+        Parameters
+        ----------
+        interval : int, optional
+            Delay between frames in milliseconds. Default is 50.
+
+        Returns
+        -------
+        IPython.display.HTML or None
+            An HTML5-video embedding of the animation, or None if no
+            frames have been added.
         """
         if not self.frames:
             print("No frames to animate!")
@@ -133,28 +148,31 @@ class PositionAnimationBuilder:
         return HTML(anim.to_html5_video())
 
 class CellAnimationBuilder:
+    """Build a cell-position animation incrementally by adding frames during iteration.
+
+    Parameters
+    ----------
+    marker_size : int, optional
+        Size of the scatter markers. Default is 50.
+    title : str, optional
+        Plot title. Default is ``"Position Animation"``.
+    xlim : tuple, optional
+        ``(min, max)`` for the x-axis. Auto-determined from the added
+        frames if None.
+    ylim : tuple, optional
+        ``(min, max)`` for the y-axis. Auto-determined from the added
+        frames if None.
+    figsize : tuple, optional
+        Figure size ``(width, height)``. Default is ``(8, 6)``.
+
+    Returns
+    -------
+    CellAnimationBuilder
+        An initialized ``CellAnimationBuilder`` object.
     """
-    Build an animation incrementally by adding frames during iteration.
-    """
-    
-    def __init__(self, marker_size=50, title="Position Animation", 
+
+    def __init__(self, marker_size=50, title="Position Animation",
                  xlim=None, ylim=None, figsize=(8, 6)):
-        """
-        Initialize the animation builder.
-        
-        Parameters:
-        -----------
-        marker_size : int
-            Size of scatter markers
-        title : str
-            Plot title
-        xlim : tuple, optional
-            (min, max) for x-axis. Auto-determined if None
-        ylim : tuple, optional
-            (min, max) for y-axis. Auto-determined if None
-        figsize : tuple
-            Figure size (width, height)
-        """
         self.frames = []  # Store (x_positions, y_positions) for each frame
         self.images = []
         self.marker_size = marker_size
@@ -164,15 +182,26 @@ class CellAnimationBuilder:
         self.figsize = figsize
     
     def add_frame(self, x_positions, y_positions, image=None):
-        """
-        Add a new frame to the animation.
-        
-        Parameters:
-        -----------
+        """Add a new frame of point positions to the animation.
+
+        Points where ``x_positions`` equals 0 are treated as invalid and
+        dropped before storing.
+
+        Parameters
+        ----------
         x_positions : array-like
-            X coordinates for this timestep
+            X coordinates for this timestep.
         y_positions : array-like
-            Y coordinates for this timestep
+            Y coordinates for this timestep.
+        image : array-like, optional
+            Optional per-point image stack, indexed the same way as
+            ``x_positions``/``y_positions``, stored alongside the frame.
+
+        Returns
+        -------
+        None
+            Appends the filtered positions (and optional images) to
+            ``self.frames`` in place.
         """
         x_positions = np.array(x_positions)
         y_positions = np.array(y_positions)
@@ -187,17 +216,18 @@ class CellAnimationBuilder:
         
     
     def show(self, interval=50):
-        """
-        Generate and display the animation.
-        
-        Parameters:
-        -----------
-        interval : int
-            Delay between frames in milliseconds
-        
-        Returns:
-        --------
-        HTML object with embedded animation
+        """Generate and display the animation.
+
+        Parameters
+        ----------
+        interval : int, optional
+            Delay between frames in milliseconds. Default is 50.
+
+        Returns
+        -------
+        IPython.display.HTML or None
+            An HTML5-video embedding of the animation, or None if no
+            frames have been added.
         """
         if not self.frames:
             print("No frames to animate!")
@@ -258,14 +288,24 @@ class CellAnimationBuilder:
 
 
 def get_cell_centroids(label_frame):
-    """
-    Compute the (row, col) centroid for each labeled cell in a 2D label image.
-    
-    A label image has integer pixel values: 0 = background, 1,2,3... = cell IDs.
-    ndimage.center_of_mass computes the weighted average position of all pixels
-    belonging to each label.
-    
-    Returns a dict: {cell_label: (row, col)}
+    """Compute the (row, col) centroid for each labeled cell in a 2D label image.
+
+    A label image has integer pixel values: 0 is background, 1, 2, 3, ...
+    are cell IDs. ``scipy.ndimage.center_of_mass`` computes the weighted
+    average position of all pixels belonging to each label.
+
+    Parameters
+    ----------
+    label_frame : ndarray
+        Label image of shape ``(H, W)`` or ``(H, W, C)``. If 3D, only the
+        first channel is used.
+
+    Returns
+    -------
+    dict
+        Mapping of ``{cell_label: (row, col)}`` for each non-background
+        label found in ``label_frame``. Empty if no labeled cells are
+        present.
     """
     # label_frame may be (H, W, C) — take the first channel which holds labels
     if label_frame.ndim == 3:
@@ -285,15 +325,28 @@ def get_cell_centroids(label_frame):
 
 
 def classify_cells_in_frame(frame_idx, lineage):
-    """
-    For a given frame, classify each cell as:
-      - 'dividing'  : this cell will divide in the NEXT frame
-                      (i.e. its last frame is current frame and it has daughters)
-      - 'daughter'  : this cell was just born (its first frame is current frame
-                      and it has a parent)
-      - 'normal'    : everything else
-    
-    Returns a dict: {cell_label: 'dividing' | 'daughter' | 'normal'}
+    """Classify every cell present in a frame as dividing, a daughter, or normal.
+
+    A cell is ``'dividing'`` if its last tracked frame is ``frame_idx`` and
+    it has daughters (i.e. it divides in the next frame). A cell is
+    ``'daughter'`` if its first tracked frame is ``frame_idx`` and it has a
+    parent (i.e. it was just born). All other cells present in the frame
+    are ``'normal'``.
+
+    Parameters
+    ----------
+    frame_idx : int
+        Index of the frame to classify cells in.
+    lineage : dict
+        Lineage dict keyed by cell label, where each value is a dict with
+        ``'frames'`` (list of int), ``'daughters'`` (list of int), and
+        ``'parent'`` (int or None).
+
+    Returns
+    -------
+    dict
+        Mapping of ``{cell_label: 'dividing' | 'daughter' | 'normal'}`` for
+        every cell present in ``frame_idx``.
     """
     classifications = {}
     
@@ -322,15 +375,29 @@ def classify_cells_in_frame(frame_idx, lineage):
 
 
 def build_division_arrows(frame_idx, lineage, centroids_curr, centroids_next):
-    """
-    Build a list of (mother_centroid, daughter_centroid) pairs for drawing arrows.
-    
-    We draw arrows from the mother cell's position in `frame_idx` to each
-    daughter cell's position in `frame_idx + 1`. This visually shows the
-    "split" happening between frames.
-    
-    centroids_curr: dict {cell_label: (row, col)} for frame_idx
-    centroids_next: dict {cell_label: (row, col)} for frame_idx + 1
+    """Build mother-to-daughter centroid pairs for drawing division arrows.
+
+    Arrows point from the mother cell's position in ``frame_idx`` to each
+    daughter cell's position in ``frame_idx + 1``, visually showing the
+    split happening between frames.
+
+    Parameters
+    ----------
+    frame_idx : int
+        Index of the frame in which the division occurs.
+    lineage : dict
+        Lineage dict keyed by cell label, where each value is a dict with
+        ``'frames'`` (list of int) and ``'daughters'`` (list of int).
+    centroids_curr : dict
+        Mapping of ``{cell_label: (row, col)}`` for ``frame_idx``.
+    centroids_next : dict
+        Mapping of ``{cell_label: (row, col)}`` for ``frame_idx + 1``.
+
+    Returns
+    -------
+    list of tuple
+        A list of ``(mother_centroid, daughter_centroid)`` pairs, where
+        each centroid is a ``(row, col)`` tuple.
     """
     arrows = []
     
@@ -356,20 +423,42 @@ def build_division_arrows(frame_idx, lineage, centroids_curr, centroids_next):
 def draw_lineage_overlay(ax, label_frame, classifications, arrows,
                          dividing_color='orange', daughter_color='cyan',
                          arrow_color='yellow', alpha=0.4):
-    """
-    Draw colored overlays on top of an existing imshow axis:
-    - A semi-transparent colored mask over dividing and daughter cells
-    - Arrows from mother centroids to daughter centroids
-    
-    This works by creating an RGBA overlay image (same H x W as the label frame)
-    and painting colors onto it wherever the cell label matches.
-    
-    Parameters:
-    -----------
-    ax : matplotlib axis (already has imshow plotted on it)
-    label_frame : (H, W) or (H, W, C) integer label array
-    classifications : dict {cell_label: 'dividing'|'daughter'|'normal'}
-    arrows : list of ((r0,c0), (r1,c1)) tuples
+    """Draw colored cell overlays and division arrows on an existing imshow axis.
+
+    Paints a semi-transparent colored mask over dividing and daughter
+    cells by building an RGBA overlay image (same ``H x W`` as
+    ``label_frame``) and coloring it wherever the cell label matches, then
+    draws arrows from mother centroids to daughter centroids.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis that already has an image plotted on it via ``imshow``.
+    label_frame : ndarray
+        Integer label array of shape ``(H, W)`` or ``(H, W, C)``. If 3D,
+        only the first channel is used.
+    classifications : dict
+        Mapping of ``{cell_label: 'dividing' | 'daughter' | 'normal'}``,
+        as produced by :func:`classify_cells_in_frame`.
+    arrows : list of tuple
+        A list of ``((r0, c0), (r1, c1))`` centroid pairs, as produced by
+        :func:`build_division_arrows`.
+    dividing_color : str, optional
+        Overlay color for dividing cells. Default is ``'orange'``.
+    daughter_color : str, optional
+        Overlay color for daughter cells. Default is ``'cyan'``.
+    arrow_color : str, optional
+        Color of the division arrows. Default is ``'yellow'``.
+    alpha : float, optional
+        Transparency of the cell color overlays, from 0 (invisible) to 1
+        (opaque). Default is 0.4.
+
+    Returns
+    -------
+    tuple
+        A 2-tuple of ``(patch, arrow_artists)`` where ``patch`` is the
+        ``AxesImage`` for the color overlay and ``arrow_artists`` is a
+        list of the ``Annotation`` artists drawn for each arrow.
     """
     # Extract 2D label map
     if label_frame.ndim == 3:
@@ -426,39 +515,54 @@ def create_timelapse_gif_with_lineage(
     arrow_color='yellow',
     overlay_alpha=0.4
 ):
-    """
-    Create a GIF from a time lapse image with two channels, with lineage overlays.
-    
-    For each frame:
-      - Cells about to divide are highlighted in `dividing_color`
-      - Newly born daughter cells are highlighted in `daughter_color`
-      - Arrows are drawn from mother centroids → daughter centroids at division frames
-    
-    Parameters:
-    -----------
-    im1, im2 : numpy.ndarray
-        Time lapse label images of shape (T, H, W, C).
-        Pixel values are integer cell labels (0 = background).
-    lineage1, lineage2 : dict or None
-        Lineage dicts for im1 and im2 respectively. Format:
-            {cell_label: {'frames': [...], 'daughters': [...], 'parent': int or None}}
+    """Create a side-by-side timelapse GIF of two label movies with lineage overlays.
+
+    For each frame, cells about to divide are highlighted in
+    ``dividing_color``, newly born daughter cells are highlighted in
+    ``daughter_color``, and arrows are drawn from mother centroids to
+    daughter centroids at division frames. The GIF is written to
+    ``output_path``.
+
+    Parameters
+    ----------
+    im1 : numpy.ndarray
+        Time-lapse label image of shape ``(T, H, W, C)`` for the left
+        panel. Pixel values are integer cell labels (0 = background).
+    im2 : numpy.ndarray
+        Time-lapse label image of shape ``(T, H, W, C)`` for the right
+        panel, same format as ``im1``.
+    lineage1 : dict or None, optional
+        Lineage dict for ``im1``, keyed by cell label with values
+        ``{'frames': [...], 'daughters': [...], 'parent': int or None}``.
         If None, no lineage overlay is drawn for that panel.
-    output_path : str
-        Path to save the output GIF.
-    fps : int
-        Frames per second for the GIF.
-    titles : tuple
-        Titles for the two subplots.
-    cmap : str
-        Colormap for displaying the images.
-    dividing_color : str
-        Color highlight for cells that are about to divide.
-    daughter_color : str
+    lineage2 : dict or None, optional
+        Lineage dict for ``im2``, same format as ``lineage1``. If None, no
+        lineage overlay is drawn for that panel.
+    output_path : str, optional
+        Path to save the output GIF. Default is ``'timelapse.gif'``.
+    fps : int, optional
+        Frames per second for the GIF. Default is 5.
+    titles : tuple, optional
+        Titles for the two subplots. Default is ``('Predicted', 'True')``.
+    cmap : str, optional
+        Colormap for displaying the images. Default is ``'gray'``.
+    dividing_color : str, optional
+        Color highlight for cells that are about to divide. Default is
+        ``'orange'``.
+    daughter_color : str, optional
         Color highlight for cells that were just born from division.
-    arrow_color : str
-        Color of arrows drawn from mother → daughter.
-    overlay_alpha : float
-        Transparency of the cell color overlays (0=invisible, 1=opaque).
+        Default is ``'cyan'``.
+    arrow_color : str, optional
+        Color of arrows drawn from mother to daughter. Default is
+        ``'yellow'``.
+    overlay_alpha : float, optional
+        Transparency of the cell color overlays, from 0 (invisible) to 1
+        (opaque). Default is 0.4.
+
+    Returns
+    -------
+    None
+        Writes the animation to ``output_path`` as a side effect.
     """
 
     T, H, W, C = im1.shape

@@ -17,43 +17,44 @@ from torch_tracking.utils import get_max_cells, get_image_features, resize, clea
 from torch_tracking.model import GNNTrackingModel
 
 class CellTracker:
-    """
-    Args:
-        checkpoint_dir (str or None): The directory of the model weight file
+    """Track cells across frames of a time-lapse movie using a GNN-based model.
 
-        device (str, optional): The device that you want to use for inference.
-            Default is `cuda`, can also be `cpu` or `mps`
-            If you have a multi-GPU device, specify using `cuda:<N>` where N is the GPU ID
+    Parameters
+    ----------
+    checkpoint_dir : str or None, optional
+        The directory of the model weight file. If None, the default
+        checkpoint is downloaded from the Hugging Face Hub.
+    device : str or None, optional
+        The device to use for inference. Default is ``cuda``, can also be
+        ``cpu`` or ``mps``. If you have a multi-GPU device, specify using
+        ``cuda:<N>`` where ``N`` is the GPU ID.
+    distance_threshold : int, optional
+        The distance threshold (in pixels) by which cells are considered
+        "connected" in the GNN. Default is 64.
+    death : float, optional
+        The threshold probability for a linkage to be considered a "death".
+        Default is 0.999.
+    birth : float, optional
+        The threshold probability for a linkage to be considered a new
+        cell, or "birth". Default is 0.99.
+    division : float, optional
+        The threshold probability for a linkage to be considered a
+        mitosis. Default is 0.5.
+    track_length : int, optional
+        The number of frames of the movie used to make an educated guess
+        on the next frame. Default is 8.
+    mpp : float, optional
+        The microns per pixel of the movie, used to resize the input
+        image to match the input resolution of the model. Default is
+        0.55 microns per pixel.
+    verbose : bool, optional
+        Whether to print progress messages during initialization and
+        preprocessing. Default is True.
 
-
-        distance_threshold (int, optional): The distance threshold by which cells are 
-            considered "connected" in the GNN in pixels
-            Default is 64 pixels
-
-            
-        death (float, optional): The threshold probability for a 
-            linkage to be considered a "death"
-            Default is 0.999
-
-
-        birth (float, optional): The threshold probability for a 
-            linkage to be considered a new cell, or "birth"
-            Default is 0.99
-
-        division (float, optional): The threshold probability for a 
-            linkage to be considered a mitosis
-            Default is 0.05
-
-        track_length (int, optional): The frames of the movie used to 
-            make an educated guess on the next frame
-            Default is 8.
-
-        mpp (float, optional): The microns per pixel of the movie, 
-            used to resize the input image to
-            match the input resolution of the model.
-            Default is 0.55 microns per pixel
-
-    Returns: Initialized `CellTracker` object
+    Returns
+    -------
+    CellTracker
+        An initialized ``CellTracker`` object.
     """
     def __init__(
         self,
@@ -137,21 +138,30 @@ class CellTracker:
     def preprocess_movie(self,
                          movie,
                          annotation):
-        """Ingest the movie, resize, extract features, and embeddings.
+        """Ingest the movie, resize it, and extract features and embeddings.
 
-        Args:
-            movie (ndarray[np.float32]): Time lapse image with shape (T, H, W, C) 
-                where T is the frames dimension
-                H and W are the spatial dimension
-                C is the number of channels (should always be 1)
+        Parameters
+        ----------
+        movie : ndarray of np.float32
+            Time-lapse image with shape ``(T, H, W, C)`` where ``T`` is the
+            frames dimension, ``H`` and ``W`` are the spatial dimensions, and
+            ``C`` is the number of channels (should always be 1).
+        annotation : ndarray of int
+            Time-lapse image of the corresponding nuclear masks for the input
+            movie. Must have the same shape as ``movie`` except for the final
+            (channel) dimension.
 
-            annotation (ndarray[np.int]): Time lapse image of the 
-                corresponding nuclear masks to the input movie
-                Must be the same shape as the time lapse image 
-                except for the final dimension.
+        Returns
+        -------
+        None
+            Populates ``self.X``, ``self.y``, ``self.y_original``, and
+            ``self.features`` in place.
 
-        Returns:
-            None
+        Raises
+        ------
+        ValueError
+            If ``movie`` or ``annotation`` is not rank 4, or if their shapes
+            (excluding the channel dimension) do not match.
         """
         # Validate inputs
         if len(movie.shape) != 4 or len(annotation.shape) != 4:
@@ -198,6 +208,17 @@ class CellTracker:
             print('Embeddings generated. Ready to track.')
 
     def reset_state(self):
+        """Reset all tracking state, clearing loaded data and computed tracks.
+
+        Clears ``self.tracks``, the stored cost/assignment matrices, the
+        loaded movie/annotation/feature arrays, and the ID mapping
+        dictionaries, and empties the CUDA cache. Use this before processing
+        a new movie with the same ``CellTracker`` instance.
+
+        Returns
+        -------
+        None
+        """        
         self.tracks = {}
         self.a_matrix = []
         self.c_matrix = []
@@ -722,7 +743,21 @@ class CellTracker:
         self._update_tracks(assignments, frame, predictions)
     
     def track_cells(self):
-        """Track all cells across all frames."""        
+
+        """Track all cells across all frames of the preprocessed movie.
+
+        Initializes tracks from the first frame, then iteratively links cells
+        in each subsequent frame to existing tracks (or starts new tracks/
+        divisions) using the GNN model and a linear assignment solution.
+
+        Returns
+        -------
+        None
+            Populates ``self.tracks`` with the resulting lineage and sets
+            ``self.y_tracked``, ``self.y``, and ``self.y_original`` to their
+            final relabeled versions.
+        """
+
         # Initialize from first frame
         self._initialize_tracks()
         
@@ -759,14 +794,27 @@ class CellTracker:
             'y_tracked': self.y_tracked
         }
     
-    def dataframe(self, **kwargs) -> pd.DataFrame:
-        """Export tracks to pandas DataFrame.
-        
-        Args:
-            **kwargs: Optional columns (cell_type, set, part, montage)
-        
-        Returns:
-            DataFrame with track information
+    def dataframe(self, **kwargs):
+        """Export tracked lineages to a pandas DataFrame.
+
+        Parameters
+        ----------
+        **kwargs : dict, optional
+            Additional metadata columns to attach to every row. Accepted
+            keys are ``cell_type``, ``set``, ``part``, and ``montage``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            A DataFrame with one row per track, containing any requested
+            metadata columns plus ``label``, ``daughters`` (daughter track
+            labels), and ``frame_div``.
+
+        Raises
+        ------
+        ValueError
+            If a key in ``kwargs`` is not one of the accepted metadata
+            columns.
         """
         extra_columns = ['cell_type', 'set', 'part', 'montage']
         track_columns = ['label', 'daughters', 'frame_div']
@@ -822,8 +870,23 @@ class CellTracker:
             assignment_matrix[(idx,), :frame.shape[0], :frame.shape[1]] = frame
         return assignment_matrix
     
-    def get_lineage_dict(self) -> Dict:
-        """Export lineage in standard format for .trk files."""
+    def get_lineage_dict(self):
+        """Export the tracked lineage in the standard format used by ``.trk`` files.
+
+        Returns
+        -------
+        dict
+            A dictionary keyed by track label, where each value is a dict
+            with the following keys:
+
+            - ``label`` : int, the track's label.
+            - ``frames`` : list of int, frame indices in which the track appears.
+            - ``parent`` : int or None, the 1-indexed label of the parent
+            track, or ``None`` if the track has no parent.
+            - ``daughters`` : list of int, labels of daughter tracks.
+            - ``frame_div`` : int or None, the frame at which division occurred.
+            - ``capped`` : bool, whether the track has already divided.
+        """
         lineage = {}
         
         for _, track in self.tracks.items():

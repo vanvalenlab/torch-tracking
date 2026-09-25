@@ -18,6 +18,94 @@ from torch_tracking.utils import MetricsTracker, EarlyStopping, create_optimizer
 
 @dataclass
 class TrainingConfig:
+    """Configuration for a :class:`Trainer` run.
+
+    Parameters
+    ----------
+    model : torch.nn.Module or None, optional
+        The model to train. Default is None.
+    train_loader : torch.utils.data.DataLoader or None, optional
+        DataLoader providing training batches. Default is None.
+    val_loader : torch.utils.data.DataLoader or None, optional
+        DataLoader providing validation batches. Default is None.
+    optimizer : str, optional
+        Name of the optimizer to build via ``create_optimizer``. Default is
+        ``'radam'``.
+    scheduler : str, optional
+        Name of the learning rate scheduler to build via
+        ``create_scheduler``. Default is ``'reduce_on_plateau'``.
+    crop_mode : str, optional
+        Cropping mode used when extracting appearance features. Default is
+        ``'fixed'``.
+    device : str, optional
+        Device to train on. Default is ``'cuda'``.
+    checkpoint_dir : str, optional
+        Base directory in which checkpoints are saved. A timestamped
+        subdirectory is created under this path for each run. Default is
+        ``'./checkpoints/'``.
+    log_dir : str, optional
+        Base directory for TensorBoard logs. A timestamped subdirectory is
+        created under this path for each run. Default is ``'./logs/'``.
+    step_size : int, optional
+        Step size (in epochs) for step-based learning rate schedulers.
+        Default is 5.
+    max_epochs : int, optional
+        Maximum number of training epochs. Default is 50.
+    num_workers : int, optional
+        Number of worker processes for data loading. Default is 4.
+    n_layers : int, optional
+        Number of GNN layers in the model. Default is 2.
+    clipnorm : float, optional
+        Maximum gradient norm used for gradient clipping. Default is 1.0.
+    batch_size : int, optional
+        Number of samples per training batch. Default is 8.
+    learning_rate : float, optional
+        Initial learning rate. Default is 0.001.
+    patience : int, optional
+        Number of epochs with no improvement before early stopping
+        triggers. Default is 5.
+    enable_early_stopping : bool, optional
+        Whether to stop training early when the stopping metric stops
+        improving. Default is False.
+    log_and_save : bool, optional
+        Whether to write TensorBoard logs and save checkpoints/config to
+        disk. Default is True.
+    class_weights : list of float, optional
+        Per-class weights used by the loss function. Default is
+        ``[1, 10, 100]``.
+    loss : str, optional
+        Name of the loss function used by :class:`~torch_tracking.loss.TrackingLoss`.
+        Default is ``'wcce'``.
+    stopping_metric : str, optional
+        Key into the validation metrics dict used to select the best
+        checkpoint and drive early stopping/scheduling. Default is
+        ``'loss'``.
+    gamma : float, optional
+        Focal loss focusing parameter, passed to
+        :class:`~torch_tracking.loss.TrackingLoss`. Default is 1.0.
+    truncate_dataset : int or None, optional
+        If set, limits the dataset to this many samples. Default is None.
+    data_precision : str, optional
+        Floating point precision used for autocast/gradient scaling.
+        One of ``'bfloat16'``, ``'float32'``, or ``'float16'``. Default is
+        ``'bfloat16'``.
+    label_smoothing : bool, optional
+        Whether to apply label smoothing in the loss function. Default is
+        False.
+    dropout : float, optional
+        Dropout probability used in the model. Default is 0.
+    crop_size : int, optional
+        Size of the appearance crop fed to the model. Default is 32.
+    decay : float, optional
+        Decay factor used by the optimizer/scheduler. Default is 0.99.
+    weight_decay : float, optional
+        Weight decay (L2 penalty) used by the optimizer. Default is 0.0.
+
+    Returns
+    -------
+    TrainingConfig
+        An initialized ``TrainingConfig`` object.
+    """
     model: nn.Module = None
     train_loader: torch.utils.data.DataLoader = None
     val_loader: torch.utils.data.DataLoader = None
@@ -50,6 +138,17 @@ class TrainingConfig:
     weight_decay: float = 0.0
 
     def to_dict(self):
+        """Serialize the config's scalar training settings to a dictionary.
+
+        Excludes non-serializable fields (``model``, ``train_loader``,
+        ``val_loader``) and ``class_weights``. Used to persist the run
+        configuration alongside checkpoints.
+
+        Returns
+        -------
+        dict
+            A JSON-serializable dictionary of training hyperparameters.
+        """
         return {
         "log_dir": self.log_dir,
         "optimizer": self.optimizer,
@@ -81,21 +180,28 @@ class TrainingConfig:
 
 
 class Trainer:
-    """Main trainer class for GNN tracking model.
-    
-    Args:
-        model: GNNTrackingModel instance
-        train_loader: Training DataLoader
-        val_loader: Validation DataLoader
-        optimizer: PyTorch optimizer
-        scheduler: Learning rate scheduler (optional)
-        loss_fn: Loss function
-        device: Device to train on
-        checkpoint_dir: Directory to save checkpoints
-        log_dir: Directory for tensorboard logs
-        max_epochs: Maximum number of training epochs
-        gradient_clip: Max gradient norm for clipping
-        early_stopping_patience: Patience for early stopping
+    """Train and validate a :class:`~torch_tracking.model.GNNTrackingModel`.
+
+    Handles the training/validation loop, mixed-precision autocast,
+    gradient clipping, learning rate scheduling, early stopping, and
+    checkpoint/TensorBoard logging.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The GNN tracking model to train.
+    train_loader : torch.utils.data.DataLoader
+        DataLoader providing training batches.
+    val_loader : torch.utils.data.DataLoader
+        DataLoader providing validation batches.
+    config : TrainingConfig
+        Training configuration specifying the optimizer, scheduler, device,
+        checkpoint/log directories, and other hyperparameters.
+
+    Returns
+    -------
+    Trainer
+        An initialized ``Trainer`` object.
     """
     def __init__(
         self,
@@ -173,7 +279,20 @@ class Trainer:
 
     
     def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch."""
+        """Run one epoch of training over ``self.train_loader``.
+
+        For each batch, runs the model's training forward pass, computes
+        the loss, backpropagates under mixed precision, clips gradients,
+        steps the optimizer, and updates the running metrics. Batches that
+        produce a NaN or infinite loss are skipped.
+
+        Returns
+        -------
+        dict of str to float
+            The accumulated training metrics for the epoch (as returned by
+            :meth:`~torch_tracking.utils.MetricsTracker.get_metrics`),
+            including ``loss``, ``accuracy``, and per-class F1 scores.
+        """
         self.model.train()
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]', dynamic_ncols=True)
@@ -248,7 +367,19 @@ class Trainer:
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """Validate on validation set."""
+        """Evaluate the model on ``self.val_loader`` without updating weights.
+
+        For each batch, runs the model's training forward pass in
+        evaluation mode, computes the loss, and updates the running
+        metrics. Batches that produce a NaN loss are skipped.
+
+        Returns
+        -------
+        dict of str to float
+            The accumulated validation metrics (as returned by
+            :meth:`~torch_tracking.utils.MetricsTracker.get_metrics`),
+            including ``loss``, ``accuracy``, and per-class F1 scores.
+        """
         self.model.eval()
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch} [Val]', dynamic_ncols=True)
@@ -294,7 +425,23 @@ class Trainer:
         return metrics
     
     def save_checkpoint(self, is_best=False):
-        """Save model checkpoint."""
+        """Save the current model/optimizer state to ``self.checkpoint_dir``.
+
+        If ``is_best`` is True, the checkpoint is written to
+        ``best_model.pt``; otherwise it is written to
+        ``checkpoint_epoch_<N>.pt`` and only the 3 most recent such
+        per-epoch checkpoints are retained on disk.
+
+        Parameters
+        ----------
+        is_best : bool, optional
+            Whether this checkpoint corresponds to the best validation
+            score seen so far. Default is False.
+
+        Returns
+        -------
+        None
+        """
         checkpoint = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
@@ -324,7 +471,21 @@ class Trainer:
                 old_checkpoint.unlink()
     
     def load_checkpoint(self, checkpoint_path):
-        """Load model from checkpoint."""
+        """Restore model, optimizer, and training history from a checkpoint.
+
+        Parameters
+        ----------
+        checkpoint_path : str or pathlib.Path
+            Path to a checkpoint file previously written by
+            :meth:`save_checkpoint`.
+
+        Returns
+        -------
+        None
+            Updates ``self.model``, ``self.optimizer``, ``self.current_epoch``,
+            ``self.best_val_loss``, ``self.train_history``, and
+            ``self.val_history`` in place.
+        """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -337,6 +498,19 @@ class Trainer:
         print(f"Loaded checkpoint from epoch {self.current_epoch}")
     
     def train(self):
+        """Run the full training loop from ``self.current_epoch`` to ``max_epochs``.
+
+        For each epoch, trains and validates the model, steps the
+        scheduler, saves a checkpoint whenever the stopping metric
+        improves, logs metrics to TensorBoard (if enabled), and applies
+        early stopping (if enabled). Writes the combined train/validation
+        history to ``training_history.json`` in ``self.checkpoint_dir``
+        when training completes.
+
+        Returns
+        -------
+        None
+        """
         print("="*70)
         print("Starting Training")
         print("="*70)

@@ -12,15 +12,20 @@ import pandas as pd
 import networkx as nx
 
 def compute_overlap_vectorized(boxes, query_boxes):
-    """
-    Vectorized computation of IoU overlaps.
-    
-    Args
-        boxes: (N, 4) ndarray of float - format [x1, y1, x2, y2]
-        query_boxes: (K, 4) ndarray of float - format [x1, y1, x2, y2]
+    """Compute a vectorized matrix of IoU overlaps between two sets of boxes.
+
+    Parameters
+    ----------
+    boxes : ndarray
+        Array of shape ``(N, 4)`` with boxes in ``[x1, y1, x2, y2]`` format.
+    query_boxes : ndarray
+        Array of shape ``(K, 4)`` with boxes in ``[x1, y1, x2, y2]`` format.
 
     Returns
-        overlaps: (N, K) ndarray of overlap between boxes and query_boxes
+    -------
+    ndarray
+        Array of shape ``(N, K)`` giving the IoU overlap between each box
+        in ``boxes`` and each box in ``query_boxes``.
     """
     N = boxes.shape[0]
     K = query_boxes.shape[0]
@@ -52,19 +57,23 @@ def compute_overlap_vectorized(boxes, query_boxes):
 def match_nodes(gt, res, threshold=1):
     """Relabel predicted track to match GT track labels.
 
-    Args:
-        gt (np arr): label movie (y) from ground truth .trk file.
-        res (np arr): label movie (y) from predicted results .trk file
-        threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
-            If segmentations are identical, 1 works well.
-            For imperfect segmentations try 0.6-0.8 to get better matching
+    Parameters
+    ----------
+    gt : ndarray
+        Label movie (``y``) from the ground truth ``.trk`` file.
+    res : ndarray
+        Label movie (``y``) from the predicted results ``.trk`` file.
+    threshold : float, optional
+        Threshold value for IoU to count as the same cell. Default is 1.
+        If segmentations are identical, 1 works well. For imperfect
+        segmentations, try 0.6-0.8 to get better matching.
 
-    Returns:
-        gtcells (np arr): Array of overlapping ids in the gt movie.
-        rescells (np arr): Array of overlapping ids in the res movie.
-
-    Raises:
-        ValueError: If .
+    Returns
+    -------
+    gtcells : ndarray
+        Array of matched cell ids in the gt movie.
+    rescells : ndarray
+        Array of correspondingly matched cell ids in the res movie.
     """
     num_frames = gt.shape[0]
     iou = np.zeros((num_frames, np.max(gt) + 1, np.max(res) + 1))
@@ -108,14 +117,24 @@ def match_nodes(gt, res, threshold=1):
 
 
 def trk_to_graph(lineage, node_key=None):
-    """Converts a lineage dictionary into a graph representation of the lineages
+    """Convert a lineage dictionary into a graph representation of the lineages.
 
-    Args:
-        lineage (dict): Dictionary of lineage data
-        node_key (dict): Map between gt nodes and result nodes
+    Parameters
+    ----------
+    lineage : dict
+        Dictionary of lineage data, keyed by cell id, where each value is a
+        dict with ``frames`` (list of int) and ``daughters`` (list of ids).
+    node_key : dict, optional
+        Map between ground truth cell ids and result cell ids, used to
+        relabel nodes before building the graph. Default is None.
 
-    Returns:
-        networkx.Graph: Graph representation of the lineage data.
+    Returns
+    -------
+    networkx.DiGraph
+        Directed graph representation of the lineage data, with nodes named
+        ``"{cell_id}_{frame}"`` and edges linking consecutive frames of the
+        same cell as well as parent-to-daughter divisions. Division nodes
+        carry a ``division=True`` attribute.
     """
     edges = []
 
@@ -172,13 +191,24 @@ def trk_to_graph(lineage, node_key=None):
 
 
 def map_node(gt_node, G_res, cells_gt, cells_res):
-    """Finds the res node that matches the gt_node submitted
+    """Find the results node that matches the given ground truth node.
 
-    Args:
-        gt_node (str): String matching form '{cell id}_{frame}'
-        G_res (networkx.graph): Graph of the results
-        cells_gt (np.array): Array containing ground truth cell ids corresponding to res ids
-        cells_res (np.array): Array containing corresponding res ids
+    Parameters
+    ----------
+    gt_node : str
+        Ground truth node name in the form ``"{cell_id}_{frame}"``.
+    G_res : networkx.DiGraph
+        Graph of the results lineage.
+    cells_gt : ndarray
+        Array containing ground truth cell ids, aligned with ``cells_res``.
+    cells_res : ndarray
+        Array containing result cell ids corresponding to ``cells_gt``.
+
+    Returns
+    -------
+    str
+        The matching node name in ``G_res``, or ``gt_node`` itself if no
+        matching results node can be found.
     """
     idx = int(gt_node.split('_')[0])
     frame = int(gt_node.split('_')[1])
@@ -201,22 +231,45 @@ def map_node(gt_node, G_res, cells_gt, cells_res):
 def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[], verbose=True):
     """Compare two graphs and calculate the cell division confusion matrix.
 
-    WARNING: This function will only work if the labels underlying both
-    graphs are the same. E.G. the parents only match if the same label
-    splits in the same frame - but each movie isn't guaranteed to be labeled
-    in the same way (with the same order). Should be used with match_nodes
+    .. warning::
+        This function will only work if the labels underlying both graphs
+        are the same, e.g. the parents only match if the same label splits
+        in the same frame - but each movie isn't guaranteed to be labeled
+        in the same way (with the same order). Should be used with
+        ``match_nodes``.
 
-    Args:
-        G_gt (networkx.Graph): Ground truth cell lineage graph.
-        G_res (networkx.Graph): Predicted cell lineage graph.
-        cells_gt (np.ndarray): List of ground truth cell ids from `match_nodes`
-        cells_res (np.ndarray): List of result cell ids from `match_nodes`
+    Parameters
+    ----------
+    G_gt : networkx.DiGraph
+        Ground truth cell lineage graph.
+    G_res : networkx.DiGraph
+        Predicted cell lineage graph.
+    cells_gt : ndarray, optional
+        List of ground truth cell ids from ``match_nodes``. Default is [].
+    cells_res : ndarray, optional
+        List of result cell ids from ``match_nodes``. Default is [].
+    verbose : bool, optional
+        Whether to print details about missed or incorrect divisions.
+        Default is True.
 
-    Returns:
-        dict: Diciontary of all division statistics
+    Returns
+    -------
+    dict
+        Dictionary of division statistics with keys:
 
-    Raises:
-        ValueError: cells_gt and cells_res must be the same length
+        - ``correct_division`` : list of correctly matched division nodes.
+        - ``mismatch_division`` : list of division nodes with mismatched
+          parents/daughters between the two graphs.
+        - ``false_positive_division`` : list of division nodes present in
+          ``G_res`` but not matched to a ground truth division.
+        - ``false_negative_division`` : list of ground truth division nodes
+          that were missed in ``G_res``.
+        - ``total_divisions`` : total number of ground truth divisions.
+
+    Raises
+    ------
+    ValueError
+        If ``cells_gt`` and ``cells_res`` are not the same length.
     """
     if len(cells_gt) != len(cells_res):
         raise ValueError('cells_gt and cells_res must be the same length.')
@@ -315,21 +368,36 @@ def correct_shifted_divisions(
         G_gt, G_res,
         threshold,
         verbose=True):
-    """Correct divisions errors that are shifted by a frame and should be counted as correct
+    """Correct division errors that are shifted by a frame and should be counted as correct.
 
-    Args:
-        false_negative_division (list): List of nodes classifed as a false negative division
-        false_positive_division (list): List of nodes classified as false positive division
-        correct_division (list): List of nodes where divisions were correctly assigned
-        y_gt (np.array): Y mask for the ground truth data
-        y_res (np.array): Y mask for the predicted data
-        G_gt (networkx.graph): Graph of the ground truth
-        G_res (networkx.graph): Graph of the results
-        threshold (float): Value between 0 and 1 used to determine matching cells using IoU
+    Parameters
+    ----------
+    false_negative_division : list
+        List of nodes classified as a false negative division.
+    false_positive_division : list
+        List of nodes classified as a false positive division.
+    correct_division : list
+        List of nodes where divisions were correctly assigned.
+    y_gt : ndarray
+        Label mask for the ground truth data.
+    y_res : ndarray
+        Label mask for the predicted data.
+    G_gt : networkx.DiGraph
+        Graph of the ground truth lineage.
+    G_res : networkx.DiGraph
+        Graph of the results lineage.
+    threshold : float
+        Value between 0 and 1 used to determine matching cells using IoU.
+    verbose : bool, optional
+        Whether to print corrected divisions. Default is True.
 
-    Returns:
-        dict: Dictionary of updated false_negative_division, false_positive_division
-            and correct_division lists
+    Returns
+    -------
+    dict
+        Dictionary with updated ``false_negative_division``,
+        ``false_positive_division``, and ``correct_division`` lists, after
+        moving any frame-shifted matches from the error lists into
+        ``correct_division``.
     """
 
     metrics = {
@@ -421,30 +489,44 @@ def correct_shifted_divisions(
 
 
 def calculate_association_accuracy(lineage_gt, lineage_res, cells_gt=[], cells_res=[]):
-    """Calculate the association accuracy for each ground truth lineage
+    """Calculate the association accuracy for each ground truth lineage.
 
-    Defined as the number of true positive associations between cells divided by
-    the total number of ground truth associations. Associations are equivalent to
-    the edges that connect cells in a graph. As described by:
-        - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
-          Representation of Motion and Position Map for Cell Tracking. In 2020 IEEE/CVF
-          Conference on Computer Vision and Pattern Recognition (CVPR) (IEEE).
-        - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R. (2020).
-          Weakly-Supervised Cell Tracking via Backward-and-Forward Propagation. In
-          Computer Vision - ECCV 2020 Lecture Notes in Computer Science.
+    Defined as the number of true positive associations between cells
+    divided by the total number of ground truth associations. Associations
+    are equivalent to the edges that connect cells in a graph. As described
+    by:
 
-    Args:
-        lineage_gt (dict): Ground truth lineages
-        linage_res (dict): Predicted lineages
-        cells_gt (list): List of ground truth cell ids from `match_nodes`
-        cells_res (list): List of result cell ids from `match_nodes`
+    - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
+      Representation of Motion and Position Map for Cell Tracking. In 2020
+      IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+      (IEEE).
+    - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R.
+      (2020). Weakly-Supervised Cell Tracking via Backward-and-Forward
+      Propagation. In Computer Vision - ECCV 2020 Lecture Notes in Computer
+      Science.
 
-    Returns:
-        int: Number of true positive associations
-        int: Total number of associations
+    Parameters
+    ----------
+    lineage_gt : dict
+        Ground truth lineages.
+    lineage_res : dict
+        Predicted lineages.
+    cells_gt : list, optional
+        List of ground truth cell ids from ``match_nodes``. Default is [].
+    cells_res : list, optional
+        List of result cell ids from ``match_nodes``. Default is [].
 
-    Raises:
-        ValueError: cells_gt and cells_res must be the same length
+    Returns
+    -------
+    true_positive : int
+        Number of true positive associations.
+    total : int
+        Total number of ground truth associations.
+
+    Raises
+    ------
+    ValueError
+        If ``cells_gt`` and ``cells_res`` are not the same length.
     """
     if len(cells_gt) != len(cells_res):
         raise ValueError('cells_gt and cells_res must be the same length.')
@@ -477,31 +559,45 @@ def calculate_association_accuracy(lineage_gt, lineage_res, cells_gt=[], cells_r
 
 
 def calculate_target_effectiveness(lineage_gt, lineage_res, cells_gt=[], cells_res=[]):
-    """Calculate the target effectiveness. Final score can be obtained by dividing
-    true_positive by total
+    """Calculate the target effectiveness.
 
-    The TE measure considers the number of cell instances correctly associated within
-    a track with respect to the total number of cells in a track. Only the best possible
-    true positive score is recorded for each ground truth lineage As described by:
-        - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
-          Representation of Motion and Position Map for Cell Tracking. In 2020 IEEE/CVF
-          Conference on Computer Vision and Pattern Recognition (CVPR) (IEEE).
-        - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R. (2020).
-          Weakly-Supervised Cell Tracking via Backward-and-Forward Propagation. In
-          Computer Vision - ECCV 2020 Lecture Notes in Computer Science.
+    The final score can be obtained by dividing ``true_positive`` by
+    ``total``. The TE measure considers the number of cell instances
+    correctly associated within a track with respect to the total number of
+    cells in a track. Only the best possible true positive score is
+    recorded for each ground truth lineage. As described by:
 
-    Args:
-        lineage_gt (dict): Ground truth lineages
-        linage_res (dict): Predicted lineages
-        cells_gt (list): List of ground truth cell ids from `match_nodes`
-        cells_res (list): List of result cell ids from `match_nodes`
+    - Hayashida, J., Nishimura, K., and Bise, R. (2020). MPM: Joint
+      Representation of Motion and Position Map for Cell Tracking. In 2020
+      IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+      (IEEE).
+    - Nishimura, K., Hayashida, J., Wang, C., Ker, D.F.E., and Bise, R.
+      (2020). Weakly-Supervised Cell Tracking via Backward-and-Forward
+      Propagation. In Computer Vision - ECCV 2020 Lecture Notes in Computer
+      Science.
 
-    Returns:
-        int: Number of true positive assignments of cells to lineages
-        int: Number of cells present in ground truth
+    Parameters
+    ----------
+    lineage_gt : dict
+        Ground truth lineages.
+    lineage_res : dict
+        Predicted lineages.
+    cells_gt : list, optional
+        List of ground truth cell ids from ``match_nodes``. Default is [].
+    cells_res : list, optional
+        List of result cell ids from ``match_nodes``. Default is [].
 
-    Raises:
-        ValueError: cells_gt and cells_res must be the same length
+    Returns
+    -------
+    true_positive : int
+        Number of true positive assignments of cells to lineages.
+    total : int
+        Number of cells present in the ground truth.
+
+    Raises
+    ------
+    ValueError
+        If ``cells_gt`` and ``cells_res`` are not the same length.
     """
     if len(cells_gt) != len(cells_res):
         raise ValueError('cells_gt and cells_res must be the same length.')
@@ -538,21 +634,40 @@ def calculate_summary_stats(correct_division,
                             aa_total, aa_tp,
                             te_total, te_tp,
                             n_digits=2):
-    """Calculate additional summary statistics for tracking performance
-    based on results of classify_divisions
+    """Calculate additional summary statistics for tracking performance.
 
-    Catch ZeroDivisionError and set to 0 instead
+    Computed from the results of ``classify_divisions``. Any
+    ``ZeroDivisionError`` encountered while computing a statistic is caught
+    and the statistic is set to 0 instead.
 
-    Args:
-        correct_division (int): True positive or "correct divisions"
-        false_positive_division (int): False positives
-        false_negative_division (int): False negatives
-        total_divisions (int): Total number of ground truth divisions
-        aa_total (int): Total number of ground truth associations
-        aa_tp (int): True positive associations
-        te_total (int): Total number of target assignments
-        te_tp (int): True positive target assignments
-        n_digits (int, optional): Number of digits to round to. Default 2.
+    Parameters
+    ----------
+    correct_division : int
+        True positive or "correct" divisions.
+    false_positive_division : int
+        False positive divisions.
+    false_negative_division : int
+        False negative divisions.
+    total_divisions : int
+        Total number of ground truth divisions.
+    aa_total : int
+        Total number of ground truth associations.
+    aa_tp : int
+        True positive associations.
+    te_total : int
+        Total number of target assignments.
+    te_tp : int
+        True positive target assignments.
+    n_digits : int, optional
+        Number of digits to round each statistic to. Default is 2.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``Division Recall``, ``Division Precision``,
+        ``Division F1``, ``Mitotic branching correctness``,
+        ``Fraction missed divisions``, ``Association Accuracy``, and
+        ``Target Effectiveness``, each rounded to ``n_digits``.
     """
 
     _round = functools.partial(round, ndigits=n_digits)
@@ -606,26 +721,42 @@ def calculate_summary_stats(correct_division,
 
 
 class TrackingMetrics:
+    """Coordinate the benchmarking of a pair of ``.trk`` files.
+
+    Parameters
+    ----------
+    lineage_gt : dict
+        Ground truth lineages.
+    y_gt : ndarray
+        Label mask for the ground truth data.
+    lineage_res : dict
+        Predicted lineages.
+    y_res : ndarray
+        Label mask for the predicted data.
+    threshold : float, optional
+        Threshold value for IoU to count as the same cell. Default is 1.
+        If segmentations are identical, 1 works well. For imperfect
+        segmentations, try 0.6-0.8 to get better matching.
+    allow_division_shift : bool, optional
+        Allows divisions to be treated as correct if they are off by a
+        single frame. Default is True.
+    verbose : bool, optional
+        Whether to print details about missed, incorrect, or corrected
+        divisions. Default is False.
+
+    Returns
+    -------
+    TrackingMetrics
+        An initialized ``TrackingMetrics`` object, with benchmarking
+        statistics already computed and stored in ``self.stats``.
+    """
+
     def __init__(self,
                  lineage_gt, y_gt,
                  lineage_res, y_res,
                  threshold=1,
                  allow_division_shift=True,
                  verbose=False):
-        """Class to coordinate the benchmarking of a pair of trk files
-
-        Args:
-            lineage_gt (dict): Ground truth lineages
-            linage_res (dict): Predicted lineages
-            y_gt (np.array): Y mask for the ground truth data
-            y_res (np.array): Y mask for the predicted data
-            threshold (optional, float): threshold value for IoU to count as same cell. Default 1.
-                If segmentations are identical, 1 works well.
-                For imperfect segmentations try 0.6-0.8 to get better matching
-            allow_division_shift (optional, bool): Allows divisions to be treated as correct if
-                they are off by a single frame. Default True.
-        """
-
         self.lineage_gt = lineage_gt
         self.lineage_res = lineage_res
         self.y_gt = y_gt
@@ -644,6 +775,18 @@ class TrackingMetrics:
         self.stats = self.calculate_metrics()
 
     def calculate_metrics(self):
+        """Classify division errors and compute benchmarking statistics.
+
+        Returns
+        -------
+        dict
+            Dictionary combining the division statistics from
+            ``classify_divisions`` (as counts rather than node lists, and
+            corrected for frame-shifted divisions if
+            ``self.allow_division_shift`` is True) with association
+            accuracy and target effectiveness counts under the keys
+            ``aa_tp``, ``aa_total``, ``te_tp``, and ``te_total``.
+        """
         # Classify divison errors
         stats = classify_divisions(
             self.G_gt, self.G_res, cells_gt=self.cells_gt, cells_res=self.cells_res, verbose=self.verbose)

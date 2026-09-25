@@ -7,22 +7,41 @@ import torch.nn.functional as F
 
 class TrackingDecoder(nn.Module):
     """Decoder that predicts tracking associations between frames.
-    
+
     Takes embedding comparisons and delta features to predict whether cells
-    across frames should be linked (same cell, different cell, or no link).
-    
+    across frames should be linked (same cell, different cell, or a
+    parent-daughter division).
+
     The decoder processes pairwise comparisons between tracks in consecutive
     frames and outputs a probability distribution over tracking classes.
-    
-    Args:
-        embedding_dim (int): Dimension of embedding features
-        encoder_dim (int): Dimension of delta/position features
-        n_filters (int): Number of hidden units in intermediate layers
-        n_classes (int): Number of output classes (default: 3)
-            - Class 0: No link, different cell
-            - Class 1: Same cell
-            - Class 2: Daughter cell
-        norm_layer (str): 'batch' or 'layer' normalization
+
+    Parameters
+    ----------
+    embedding_dim : int, optional
+        Dimension of the embedding and delta/position features; used to
+        compute the input dimension of the first dense layer. Default is
+        64.
+    n_filters : int, optional
+        Number of hidden units in the intermediate dense layer. Default is
+        64.
+    n_classes : int, optional
+        Number of output classes. Default is 3:
+
+        - 0 : no link, different cell
+        - 1 : same cell
+        - 2 : daughter cell (division)
+    norm_layer : str, optional
+        Normalization applied after the first dense layer, either
+        ``batch`` for ``nn.BatchNorm1d`` or ``layer`` for ``nn.LayerNorm``.
+        Default is ``batch``.
+    dropout : float, optional
+        Dropout probability applied after normalization and activation.
+        Default is 0.1.
+
+    Returns
+    -------
+    TrackingDecoder
+        An initialized ``TrackingDecoder`` object.
     """
     def __init__(
         self,
@@ -55,20 +74,30 @@ class TrackingDecoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, embedding_comparison, deltas, apply_softmax=True):
-        """
-        Args:
-            embedding_comparison: Tensor of shape 
-                (batch, time, tracks_current, tracks_future, 2*embedding_dim)
-                Pairwise comparisons of embeddings
-            deltas: Tensor of shape 
-                (batch, time, tracks_current, tracks_future, 2*encoder_dim)
-                Position delta features
-            apply_softmax: Whether to apply softmax (True for inference, 
-                False for training with CrossEntropyLoss)
-        
-        Returns:
-            Tensor of shape (batch, time, tracks_current, tracks_future, n_classes)
-            Probability distribution over tracking classes for each pair
+        """Predict tracking-association scores for pairs of cells.
+
+        Parameters
+        ----------
+        embedding_comparison : torch.Tensor
+            Pairwise comparisons of embeddings, of shape
+            ``(batch, time, tracks_current, tracks_future, 2 * embedding_dim)``.
+        deltas : torch.Tensor
+            Position delta features, of shape
+            ``(batch, time, tracks_current, tracks_future, 2 * embedding_dim)``.
+        apply_softmax : bool, optional
+            Whether to apply softmax to the output. Use ``True`` for
+            inference and ``False`` when training with a loss function
+            (e.g. ``nn.CrossEntropyLoss``) that expects raw logits. Default
+            is True.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape
+            ``(batch, time, tracks_current, tracks_future, n_classes)``. If
+            ``apply_softmax`` is True, this is a probability distribution
+            over tracking classes for each pair; otherwise it contains raw
+            logits.
         """
         # Concatenate embedding comparisons and deltas
         x = torch.cat([embedding_comparison, deltas], dim=-1)

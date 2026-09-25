@@ -5,11 +5,25 @@ from torch.nn import functional as F
 
 
 def multiclass_focal_loss(probs, targets_one_hot, gamma=2.0):
-    """
-    Args:
-        probs:          (N, C) softmax probabilities from model
-        targets_one_hot:(N, C) one-hot encoded targets (float)
-        gamma:          focusing parameter. 0 = standard CE, 2 is typical default.
+    """Compute the per-sample, per-class multiclass focal loss.
+
+    Parameters
+    ----------
+    probs : torch.Tensor
+        Tensor of shape ``(N, C)`` containing softmax probabilities from
+        the model.
+    targets_one_hot : torch.Tensor
+        Tensor of shape ``(N, C)`` containing one-hot encoded targets
+        (float).
+    gamma : float, optional
+        Focusing parameter. 0 gives standard cross entropy; 2 is a typical
+        default. Default is 2.0.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape ``(N, C)`` containing the focal loss for each
+        sample and class.
     """
     eps = 1e-7
     probs = probs.clamp(eps, 1 - eps)
@@ -23,6 +37,30 @@ def multiclass_focal_loss(probs, targets_one_hot, gamma=2.0):
 
 
 class TrackingLoss(nn.Module):
+    """Loss module for the cell-tracking model's linkage predictions.
+
+    Supports weighted categorical cross entropy, multiclass focal loss, or
+    a combination of the two.
+
+    Parameters
+    ----------
+    loss : str, optional
+        Which loss variant to use, one of ``"wcce"`` (weighted categorical
+        cross entropy), ``"focal"`` (multiclass focal loss), or
+        ``"focal_wcce"`` (focal loss with class weighting). Default is
+        ``"wcce"``.
+    gamma : float, optional
+        Focusing parameter used by the ``"focal"`` and ``"focal_wcce"``
+        variants. Default is 2.0.
+    class_weights : sequence of float or None, optional
+        Fixed per-class weights to use instead of weights computed from
+        class frequency in each batch. Default is None.
+
+    Returns
+    -------
+    TrackingLoss
+        An initialized ``TrackingLoss`` module.
+    """
 
     def __init__(self, loss='wcce', gamma=2.0, class_weights = None):
         super().__init__()
@@ -36,11 +74,26 @@ class TrackingLoss(nn.Module):
         self.class_weights = class_weights
 
     def forward(self, predictions, targets, label_smoothing=0.0):
-        """
-        Args:
-            predictions:     (B, T, N, M, C) softmax probabilities from model
-            targets:         (B, T, N, M) integer class labels [0, 1, 2], -1 = padding
-            label_smoothing: float in [0, 1). 0 = disabled.
+        """Compute the tracking loss between predicted and target linkages.
+
+        Parameters
+        ----------
+        predictions : torch.Tensor
+            Tensor of shape ``(B, T, N, M, C)`` containing softmax
+            probabilities from the model.
+        targets : torch.Tensor
+            Tensor of shape ``(B, T, N, M)`` containing integer class
+            labels (``0``, ``1``, ``2``); a value of ``-1`` marks padding
+            and is excluded from the loss.
+        label_smoothing : float, optional
+            Amount of label smoothing to apply, in ``[0, 1)``. ``0``
+            disables smoothing. Default is 0.0.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar tensor containing the mean loss over all valid
+            (non-padding) entries.
         """
         B, T, N, _, C = predictions.shape
 

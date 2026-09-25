@@ -13,19 +13,27 @@ import torch.optim as optim
 from skimage.measure import regionprops
 
 def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_format = 'channels_last'):
-    """Pre-process images using Contrast Limited Adaptive
-    Histogram Equalization (CLAHE).
+    """Pre-process images using Contrast Limited Adaptive Histogram Equalization (CLAHE).
 
-    If one of the inputs is a constant-value array, it will
-    be normalized as an array of all zeros of the same shape.
+    If one of the inputs is a constant-value array, it will be normalized
+    as an array of all zeros of the same shape.
 
-    Args:
-        image (numpy.array): numpy array of phase image data.
-        kernel_size (integer): Size of kernel for CLAHE,
-            defaults to 1/8 of image size.
+    Parameters
+    ----------
+    image : numpy.typing.ArrayLike
+        Array of phase image data with shape ``(batch, x, y, channel)``
+        (or ``(batch, channel, x, y)`` if ``data_format`` is
+        ``channels_first``).
+    kernel_size : int, optional
+        Size of kernel for CLAHE. Defaults to 1/8 of image size.
+    data_format : str, optional
+        Order of the channel axis, one of ``channels_first`` or
+        ``channels_last``. Default is ``channels_last``.
 
-    Returns:
-        numpy.array: Pre-processed image data with dtype float32.
+    Returns
+    -------
+    numpy.ndarray
+        Pre-processed image data with dtype ``float32``.
     """
 
     image = image.astype('float32')
@@ -58,20 +66,38 @@ def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_f
 def weighted_categorical_crossentropy(y_true, y_pred,
                                       n_classes=3, axis=None,
                                       from_logits=False):
-    """Categorical crossentropy between an output tensor and a target tensor.
-    Automatically computes the class weights from the target image and uses
-    them to weight the cross entropy
+    """Compute weighted categorical crossentropy between two tensors.
 
-    Args:
-        y_true: A tensor of the same shape as ``y_pred``.
-        y_pred: A tensor resulting from a softmax
-            (unless ``from_logits`` is ``True``, in which
-            case ``y_pred`` is expected to be the logits).
-        from_logits: Boolean, whether ``y_pred`` is the
-            result of a softmax, or is a tensor of logits.
+    Automatically computes the class weights from the target tensor and
+    uses them to weight the cross entropy.
 
-    Returns:
-        tensor: Output tensor.
+    Parameters
+    ----------
+    y_true : torch.Tensor
+        A tensor of the same shape as ``y_pred``.
+    y_pred : torch.Tensor
+        A tensor resulting from a softmax (unless ``from_logits`` is
+        ``True``, in which case ``y_pred`` is expected to be the logits).
+    n_classes : int, optional
+        Number of classes used to scale the computed class weights.
+        Default is 3.
+    axis : int or None, optional
+        Axis along which the class probabilities sum to 1. Default is
+        ``None``, which resolves to the last axis.
+    from_logits : bool, optional
+        Whether ``y_pred`` is the result of a softmax, or is a tensor of
+        logits. Default is False.
+
+    Returns
+    -------
+    torch.Tensor
+        Elementwise weighted crossentropy, with the same shape as
+        ``y_true`` and ``y_pred``.
+
+    Raises
+    ------
+    Exception
+        If ``from_logits`` is True, since logits are not supported.
     """
     
     if from_logits:
@@ -104,18 +130,23 @@ def weighted_categorical_crossentropy_v2(
         n_classes=3, 
     ):
 
-    """
-    Weighted categorical cross-entropy with masking for padded values.
-    
-    Args:
-        y_pred: Tensor of shape (N, C) - predictions for each sample and class
-        y_true: Tensor of shape (N, C) - one-hot encoded targets
-        mask: Tensor of shape (N, C) - 1 where included, 0 where excluded (padded)
-        n_classes: Number of classes
-        from_logits: Whether y_pred contains logits (True) or probabilities (False)
-    
-    Returns:
-        Scalar loss value
+    """Compute weighted categorical crossentropy, weighting by inverse class frequency.
+
+    Parameters
+    ----------
+    y_true : torch.Tensor
+        One-hot encoded targets of shape ``(N, C)``.
+    y_pred : torch.Tensor
+        Predicted class probabilities of shape ``(N, C)``.
+    n_classes : int, optional
+        Number of classes used to scale the computed class weights.
+        Default is 3.
+
+    Returns
+    -------
+    torch.Tensor
+        Elementwise weighted crossentropy, with the same shape as
+        ``y_true`` and ``y_pred``.
     """
     eps = 1e-10
     _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
@@ -141,27 +172,34 @@ def normalize_adjacency_symmetric(
     add_self_loops: bool = True,
     eps: float = 1e-12
 ) -> torch.Tensor:
-    """Symmetric normalization: D^(-1/2) @ A @ D^(-1/2)
-    
+    """Apply symmetric normalization to an adjacency matrix: D^(-1/2) @ A @ D^(-1/2).
+
     This is the most common normalization for GCNs (Kipf & Welling, 2017).
-    Results in normalized adjacency where each edge is weighted by the inverse
-    square root of the product of node degrees.
-    
-    Formula: Ã = D^(-1/2) @ A @ D^(-1/2)
-    where D is the degree matrix and A is the adjacency matrix.
-    
-    Args:
-        adj: Adjacency matrices of shape (B, T, N, N)
-        add_self_loops: If True, adds self-connections before normalization
-        eps: Small constant to avoid division by zero
-    
-    Returns:
-        Normalized adjacency matrices of shape (B, T, N, N)
-    
-    Example:
-        >>> adj = torch.rand(2, 8, 39, 39) > 0.5
-        >>> adj = adj.float()
-        >>> adj_norm = normalize_adjacency_symmetric(adj)
+    Results in a normalized adjacency where each edge is weighted by the
+    inverse square root of the product of node degrees, where ``D`` is
+    the degree matrix and ``A`` is the adjacency matrix.
+
+    Parameters
+    ----------
+    adj : torch.Tensor
+        Adjacency matrices of shape ``(T, N, N)`` or, if batched,
+        ``(B, T, N, N)``.
+    add_self_loops : bool, optional
+        If True, adds self-connections before normalization. Default is
+        True.
+    eps : float, optional
+        Small constant to avoid division by zero. Default is 1e-12.
+
+    Returns
+    -------
+    torch.Tensor
+        Normalized adjacency matrices with the same shape as ``adj``.
+
+    Examples
+    --------
+    >>> adj = torch.rand(2, 8, 39, 39) > 0.5
+    >>> adj = adj.float()
+    >>> adj_norm = normalize_adjacency_symmetric(adj)
     """
     with torch.no_grad():
 
@@ -196,12 +234,17 @@ def is_valid_lineage(y, lineage):
 
     Daughter cells must exist in the frame after the parent's final frame.
 
-    Args:
-        y (numpy.array): The 3D label mask.
-        lineage (dict): The cell lineages for a single movie.
+    Parameters
+    ----------
+    y : numpy.ndarray
+        The 3D label mask.
+    lineage : dict
+        The cell lineages for a single movie.
 
-    Returns:
-        bool: Whether or not the lineage is valid.
+    Returns
+    -------
+    bool
+        Whether or not the lineage is valid.
     """
     all_cells = np.unique(y)
     all_cells = set([c for c in all_cells if c])
@@ -295,12 +338,17 @@ def is_valid_lineage(y, lineage):
 def relabel_sequential_lineage(y, lineage):
     """Ensure the lineage information is sequentially labeled.
 
-    Args:
-        y (np.array): Annotated z-stack of image labels.
-        lineage (dict): Lineage data for y.
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Annotated z-stack of image labels.
+    lineage : dict
+        Lineage data for ``y``.
 
-    Returns:
-        tuple(np.array, dict): The relabeled array and corrected lineage.
+    Returns
+    -------
+    tuple of (numpy.ndarray, dict)
+        The relabeled array and the corrected lineage.
     """
     
     y_relabel, fw, _ = relabel_sequential(y)
@@ -347,14 +395,19 @@ def relabel_sequential_lineage(y, lineage):
 
 
 def get_max_cells(y):
-    """Helper function for finding the maximum number of cells in a frame of a movie, across
-    all frames of the movie. Can be used for batches/tracks interchangeably with frames/cells.
+    """Find the maximum number of cells in any frame of a movie.
 
-    Args:
-        y (np.array): Annotated image data
+    Can be used for batches/tracks interchangeably with frames/cells.
 
-    Returns:
-        int: The maximum number of cells in any frame
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Annotated image data of shape ``(frames, x, y)``.
+
+    Returns
+    -------
+    int
+        The maximum number of cells in any frame.
     """
     max_cells = 0
     for frame in range(y.shape[0]):
@@ -365,21 +418,40 @@ def get_max_cells(y):
     return max_cells
 
 def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
-    """Return features for every object in the array.
+    """Return appearance, centroid, morphology, and label features for every object.
 
-    Args:
-        X (np.array): a 3D numpy array of raw data of shape (x, y, c).
-        y (np.array): a 3D numpy array of integer labels of shape (x, y, 1).
-        appearance_dim (int): The resized shape of the appearance feature.
-        crop_mode (str): Whether to do a fixed crop or to crop and resize
-            to create the appearance features
-        norm (bool): Whether to remove non cell features and normalize the
-            foreground pixels by zero-meaning and dividing by the standard
-            deviation. Applies to fixed crop mode only.
+    Parameters
+    ----------
+    X : numpy.ndarray
+        A 3D array of raw image data of shape ``(x, y, c)``.
+    y : numpy.ndarray
+        A 3D array of integer labels of shape ``(x, y, 1)``.
+    appearance_dim : int, optional
+        The resized shape of the appearance feature. Default is 32.
+    crop_mode : {'fixed', 'resize'}, optional
+        Whether to do a fixed crop or to crop and resize to create the
+        appearance features. Default is ``'fixed'``.
+    norm : bool, optional
+        Whether to remove non-cell pixels and normalize the foreground
+        pixels by zero-meaning and dividing by the standard deviation.
+        Applies to fixed crop mode only. Default is True.
 
-    Returns:
-        dict: A dictionary of feature names to np.arrays of shape
-            (n, c) or (n, x, y, c) where n is the number of objects.
+    Returns
+    -------
+    dict
+        A dictionary with the following keys, each mapping to a
+        ``numpy.ndarray`` with one entry per object (``n`` objects total):
+
+        - ``appearances`` : shape ``(n, appearance_dim, appearance_dim, c)``.
+        - ``centroids`` : shape ``(n, 2)``.
+        - ``labels`` : shape ``(n,)``.
+        - ``morphologies`` : shape ``(n, 3)``, containing area, perimeter,
+          and eccentricity.
+
+    Raises
+    ------
+    ValueError
+        If ``crop_mode`` is not one of ``'resize'`` or ``'fixed'``.
     """
     # X must be float32 for the resize norm option to work correctly
     X = X.astype('float32')
@@ -476,25 +548,37 @@ def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
 
 def resize(data, shape, data_format='channels_last', labeled_image=False):
     """Resize the data to the given shape.
+
     Uses openCV to resize the data if the data is a single channel, as it
     is very fast. However, openCV does not support multi-channel resizing,
     so if the data has multiple channels, use skimage.
 
-    Args:
-        data (np.array): data to be reshaped. Must have a channel dimension
-        shape (tuple): shape of the output data in the form (x,y).
-            Batch and channel dimensions are handled automatically and preserved.
-        data_format (str): determines the order of the channel axis,
-            one of 'channels_first' and 'channels_last'.
-        labeled_image (bool): flag to determine how interpolation and floats are handled based
-         on whether the data represents raw images or annotations
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Data to be reshaped. Must have 3 or 4 dimensions and a channel
+        dimension.
+    shape : tuple of int
+        Shape of the output data in the form ``(x, y)``. Batch and
+        channel dimensions are handled automatically and preserved.
+    data_format : str, optional
+        Order of the channel axis, one of ``'channels_first'`` or
+        ``'channels_last'``. Default is ``'channels_last'``.
+    labeled_image : bool, optional
+        Flag to determine how interpolation and floats are handled, based
+        on whether the data represents raw images or annotations. Default
+        is False.
 
-    Raises:
-        ValueError: ndim of data not 3 or 4
-        ValueError: Shape for resize can only have length of 2, e.g. (x,y)
+    Returns
+    -------
+    numpy.ndarray
+        Data reshaped to the new shape.
 
-    Returns:
-        numpy.array: data reshaped to new shape.
+    Raises
+    ------
+    ValueError
+        If ``data`` does not have 3 or 4 dimensions, or if ``shape`` does
+        not have a length of 2.
     """
     if len(data.shape) not in {3, 4}:
         raise ValueError('Data must have 3 or 4 dimensions, e.g. '
@@ -557,16 +641,23 @@ def resize(data, shape, data_format='channels_last', labeled_image=False):
     return resized.astype(original_dtype)
 
 def clean_up_annotations(y, uid=None, data_format='channels_last'):
-    """Relabels every frame in the label matrix.
+    """Relabel every frame in the label matrix with globally unique cell IDs.
 
-    Args:
-        y (np.array): annotations to relabel sequentially.
-        uid (int, optional): starting ID to begin labeling cells.
-        data_format (str): determines the order of the channel axis,
-            one of 'channels_first' and 'channels_last'.
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Annotations to relabel sequentially.
+    uid : int or None, optional
+        Starting ID to begin labeling cells. If ``None``, starts after the
+        total number of unique cell labels across all frames.
+    data_format : str, optional
+        Order of the channel axis, one of ``'channels_first'`` or
+        ``'channels_last'``. Default is ``'channels_last'``.
 
-    Returns:
-        np.array: Cleaned up annotations.
+    Returns
+    -------
+    numpy.ndarray
+        Cleaned up annotations, with dtype ``int32``.
     """
     y = y.astype('int32')
     time_axis = 1 if data_format == 'channels_first' else 0
@@ -593,14 +684,22 @@ def clean_up_annotations(y, uid=None, data_format='channels_last'):
     return y
 
 def trk_to_graph(lineage, node_key=None):
-    """Converts a lineage dictionary into a graph representation of the lineages
+    """Convert a lineage dictionary into a graph representation of the lineages.
 
-    Args:
-        lineage (dict): Dictionary of lineage data
-        node_key (dict): Map between gt nodes and result nodes
+    Parameters
+    ----------
+    lineage : dict
+        Dictionary of lineage data.
+    node_key : dict or None, optional
+        Map between ground-truth node IDs and result node IDs. Default is
+        ``None``, which uses the lineage's own IDs unchanged.
 
-    Returns:
-        networkx.Graph: Graph representation of the lineage data.
+    Returns
+    -------
+    networkx.DiGraph
+        Directed graph representation of the lineage data, with one node
+        per ``(cell_id, frame)`` pair and division nodes flagged via the
+        ``division`` node attribute.
     """
     edges = []
 
@@ -656,12 +755,28 @@ def trk_to_graph(lineage, node_key=None):
     return G
 
 class MetricsTracker:
-    
+    """Accumulate loss and classification metrics across batches.
+
+    Tracks overall accuracy plus per-class recall, precision, and F1 for
+    the 3 linkage classes (no-link, link, division).
+
+    Returns
+    -------
+    MetricsTracker
+        An initialized ``MetricsTracker`` object.
+    """
+
     def __init__(self):
         self.reset()
         self.pad_value = -1
-    
+
     def reset(self):
+        """Reset all accumulated loss and classification counts.
+
+        Returns
+        -------
+        None
+        """
         self.total_loss = 0.0
         self.total_samples = 0
         self.correct = 0
@@ -676,11 +791,21 @@ class MetricsTracker:
 
     
     def update(self, loss, predictions, targets):
-        """
-        Args:
-            loss: scalar loss value
-            predictions: (B, T, N, M, 3) logits
-            targets: (B, T, N, M, 3) one hot encoding of labels
+        """Accumulate loss and classification counts for a batch.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Scalar loss value for the batch.
+        predictions : torch.Tensor
+            Predicted class logits of shape ``(B, T, N, M, 3)``.
+        targets : torch.Tensor
+            Target class indices of shape ``(B, T, N, M)``. Entries less
+            than 0 are treated as padding and excluded from the metrics.
+
+        Returns
+        -------
+        None
         """
 
         batch_size = predictions.shape[0]
@@ -708,7 +833,15 @@ class MetricsTracker:
             self.class_predicted[class_idx] += class_predicted_mask.sum().item()
     
     def get_metrics(self):
-        """Compute and return current metrics."""
+        """Compute the current aggregate and per-class metrics.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``loss``, ``accuracy``, and per-class
+            ``recall_class_{i}``, ``precision_class_{i}``, and
+            ``f1_class_{i}`` for each of the 3 classes.
+        """
         avg_loss = self.total_loss / max(self.total_samples, 1)
         accuracy = self.correct / max(self.total_predictions, 1)
         
@@ -740,15 +873,28 @@ class MetricsTracker:
         return metrics
     
 class EarlyStopping:
-    """Early stopping to prevent overfitting."""
-    
+    """Track a metric across epochs and signal when training should stop.
+
+    Parameters
+    ----------
+    patience : int, optional
+        Number of epochs to wait for an improvement before stopping.
+        Default is 10.
+    min_delta : float, optional
+        Minimum change in the tracked metric to qualify as an
+        improvement. Default is 0.0.
+    mode : {'min', 'max'}, optional
+        Whether lower values are better (``'min'``, e.g. for loss) or
+        higher values are better (``'max'``, e.g. for accuracy). Default
+        is ``'min'``.
+
+    Returns
+    -------
+    EarlyStopping
+        An initialized ``EarlyStopping`` object.
+    """
+
     def __init__(self, patience=10, min_delta=0.0, mode='min'):
-        """
-        Args:
-            patience: Number of epochs to wait before stopping
-            min_delta: Minimum change to qualify as improvement
-            mode: 'min' for loss, 'max' for accuracy
-        """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -757,6 +903,19 @@ class EarlyStopping:
         self.should_stop = False
     
     def __call__(self, metric_value):
+        """Update the tracked best value and check the stopping condition.
+
+        Parameters
+        ----------
+        metric_value : float
+            The metric value observed for the current epoch.
+
+        Returns
+        -------
+        bool
+            ``True`` if training should stop (no improvement for
+            ``patience`` consecutive calls), ``False`` otherwise.
+        """
         if self.best_value is None:
             self.best_value = metric_value
             return False
@@ -778,7 +937,27 @@ class EarlyStopping:
     
 
 def create_optimizer(model, config):
-    """Create optimizer based on config."""
+    """Create an optimizer based on a training config.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model whose parameters will be optimized.
+    config : object
+        Config object with an ``optimizer`` attribute (one of
+        ``'radam'`` or ``'adamw'``) and the ``learning_rate`` and
+        ``weight_decay`` attributes required by the chosen optimizer.
+
+    Returns
+    -------
+    torch.optim.Optimizer
+        The constructed optimizer.
+
+    Raises
+    ------
+    ValueError
+        If ``config.optimizer`` is not a recognized optimizer name.
+    """
 
     optimizer_name = config.optimizer
     
@@ -803,7 +982,24 @@ def create_optimizer(model, config):
 
 
 def create_scheduler(optimizer, config):
-    """Create learning rate scheduler."""
+    """Create a learning rate scheduler based on a training config.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        The optimizer to schedule.
+    config : object
+        Config object with a ``scheduler`` attribute, one of
+        ``'reduce_on_plateau'``, ``'cosine'``, ``'step'``, ``'exp'``, or
+        ``'none'``, plus whichever of ``patience``, ``max_epochs``,
+        ``step_size``, or ``decay`` are required by the chosen scheduler.
+
+    Returns
+    -------
+    torch.optim.lr_scheduler.LRScheduler or None
+        The constructed scheduler, or ``None`` if ``config.scheduler`` is
+        ``'none'``.
+    """
 
     scheduler_name = config.scheduler
 

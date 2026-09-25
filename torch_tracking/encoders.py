@@ -7,25 +7,43 @@ from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data, Batch
 from torch_tracking.utils import normalize_adjacency_symmetric
 
-# Import custom layers (assumes they're in the same directory)
 from torch_tracking.layers import ImageNormalization2D
 
 
 class AppearanceEncoder(nn.Module):
-    """Encoder for cell appearance images using 3D convolutions.
-    
-    CRITICAL: Uses Conv3D with kernel (1, 3, 3) to match TensorFlow architecture.
-    - Input shape is (B*T, N, H, W, C)
-    - Conv3D treats N as "time" dimension but with kernel_size=1 (no mixing between cells)
-    - This is semantically correct: cells are a separate dimension, not part of batch
-    
-    Args:
-        appearance_shape (tuple): Shape of appearance input (H, W, C)
-        n_filters (int): Number of convolutional filters
-        encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
-        appearance_norm (bool): Whether to apply input normalization
-        data_format (str): 'channels_first' or 'channels_last'
+    """Encode cell appearance image crops using 3D convolutions.
+
+    Uses ``Conv3d`` with kernel ``(1, 3, 3)`` so the cell dimension ``N`` is
+    treated as a pseudo-temporal axis with no mixing between cells, while
+    the spatial dimensions are convolved and pooled normally.
+
+    Parameters
+    ----------
+    appearance_shape : tuple of int, optional
+        Shape of a single appearance crop, ``(H, W, C)``. Default is
+        ``(32, 32, 1)``.
+    n_filters : int, optional
+        Number of convolutional filters in each block. Default is 64.
+    encoder_dim : int, optional
+        Dimension of the output embedding. Default is 64.
+    norm_layer : str, optional
+        Normalization type. Currently unused; the module always applies
+        ``BatchNorm3d``/``BatchNorm1d``. Default is ``'batch'``.
+    appearance_norm : bool, optional
+        Whether to apply per-cell whole-image normalization to the input
+        before convolving. Default is True.
+    data_format : str, optional
+        Layout of the input tensor passed to ``forward``, either
+        ``'channels_first'`` or ``'channels_last'``. Default is
+        ``'channels_first'``.
+    dropout : float, optional
+        Dropout probability. Currently stored but not applied within this
+        module. Default is 0.1.
+
+    Returns
+    -------
+    AppearanceEncoder
+        An initialized ``AppearanceEncoder`` module.
     """
     def __init__(
         self,
@@ -85,13 +103,20 @@ class AppearanceEncoder(nn.Module):
         self.final_activation = nn.ReLU()
 
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (B*T, N, H, W, C) for channels_last
-               or (B*T, N, C, H, W) for channels_first
-        
-        Returns:
-            Tensor of shape (B*T, N, encoder_dim)
+        """Encode a batch of cell appearance crops into embeddings.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Appearance crops with shape ``(B*T, N, H, W, C)`` if
+            ``data_format`` is ``'channels_last'``, or ``(B*T, N, C, H, W)``
+            if ``'channels_first'``, where ``B*T`` is the flattened
+            batch/time dimension and ``N`` is the number of cells.
+
+        Returns
+        -------
+        torch.Tensor
+            Appearance embeddings with shape ``(B*T, N, encoder_dim)``.
         """
         BT, N = x.shape[:2]
         
@@ -145,20 +170,26 @@ class AppearanceEncoder(nn.Module):
 
 
 class MorphologyEncoder(nn.Module):
-    """Encoder for cell morphology features.
-    
-    Uses Conv1D with kernel_size=1 to match the architectural pattern:
-    - Preserves cell dimension throughout processing
-    - Consistent with Conv3D in AppearanceEncoder
-    - Semantically correct: applies same transformation to each cell
-    
-    Input shape: (B*T, N, 3) where N is the cell dimension
-    Output shape: (B*T, N, encoder_dim)
-    
-    Args:
-        input_dim (int): Dimension of morphology features (default: 3)
-        encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
+    """Encode per-cell morphology features with a shared 1x1 convolution.
+
+    Applies a ``Conv1d`` with ``kernel_size=1`` across the cell dimension,
+    which is equivalent to a dense layer applied independently to each
+    cell, preserving the cell dimension throughout processing.
+
+    Parameters
+    ----------
+    input_dim : int, optional
+        Dimension of the input morphology features. Default is 3.
+    encoder_dim : int, optional
+        Dimension of the output embedding. Default is 64.
+    norm_layer : str, optional
+        Normalization type. Currently unused; the module always applies
+        ``BatchNorm1d``. Default is ``'batch'``.
+
+    Returns
+    -------
+    MorphologyEncoder
+        An initialized ``MorphologyEncoder`` module.
     """
     def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
         super().__init__()
@@ -172,12 +203,17 @@ class MorphologyEncoder(nn.Module):
         self.activation = nn.ReLU()
 
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (B*T, N, input_dim)
-        
-        Returns:
-            Tensor of shape (B*T, N, encoder_dim)
+        """Encode per-cell morphology features.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Morphology features with shape ``(B*T, N, input_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Morphology embeddings with shape ``(B*T, N, encoder_dim)``.
         """
         # Conv1d expects (batch, channels, sequence)
         # Permute: (B*T, N, 3) -> (B*T, 3, N)
@@ -197,20 +233,26 @@ class MorphologyEncoder(nn.Module):
 
 
 class CentroidEncoder(nn.Module):
-    """Encoder for cell centroid positions.
-    
-    Uses Conv1D with kernel_size=1 to match the architectural pattern:
-    - Preserves cell dimension throughout processing
-    - Consistent with Conv3D in AppearanceEncoder
-    - Semantically correct: applies same transformation to each cell
-    
-    Input shape: (B*T, N, 2) where N is the cell dimension
-    Output shape: (B*T, N, encoder_dim)
-    
-    Args:
-        input_dim (int): Dimension of centroid features (default: 2 for x,y)
-        encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
+    """Encode per-cell centroid positions with a shared 1x1 convolution.
+
+    Applies a ``Conv1d`` with ``kernel_size=1`` across the cell dimension,
+    which is equivalent to a dense layer applied independently to each
+    cell, preserving the cell dimension throughout processing.
+
+    Parameters
+    ----------
+    input_dim : int, optional
+        Dimension of the input centroid features. Default is 2 (x, y).
+    encoder_dim : int, optional
+        Dimension of the output embedding. Default is 64.
+    norm_layer : str, optional
+        Normalization type. Currently unused; the module always applies
+        ``BatchNorm1d``. Default is ``'batch'``.
+
+    Returns
+    -------
+    CentroidEncoder
+        An initialized ``CentroidEncoder`` module.
     """
     def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
         super().__init__()
@@ -224,12 +266,17 @@ class CentroidEncoder(nn.Module):
         self.activation = nn.ReLU()
 
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (B*T, N, input_dim)
-        
-        Returns:
-            Tensor of shape (B*T, N, encoder_dim)
+        """Encode per-cell centroid positions.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Centroid positions with shape ``(B*T, N, input_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Centroid embeddings with shape ``(B*T, N, encoder_dim)``.
         """
         # Conv1d expects (batch, channels, sequence)
         # Permute: (B*T, N, 2) -> (B*T, 2, N)
@@ -249,15 +296,28 @@ class CentroidEncoder(nn.Module):
 
 
 class DeltaEncoder(nn.Module):
-    """Encoder for position deltas.
-    
-    Encodes changes in position between time steps or between tracks.
-    Shared weights for both delta types.
-    
-    Args:
-        input_dim (int): Dimension of delta features (default: 2)
-        encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
+    """Encode position deltas shared across time-steps and track pairs.
+
+    Encodes changes in position between time steps or between tracks using
+    a single dense layer with shared weights for both delta types.
+
+    Parameters
+    ----------
+    input_dim : int, optional
+        Dimension of the input delta features. Default is 2.
+    encoder_dim : int, optional
+        Dimension of the output embedding. Default is 64.
+    norm_layer : str, optional
+        Normalization applied after the dense layer: ``'batch'`` for
+        ``BatchNorm1d``, or any other value for ``LayerNorm``. Default is
+        ``'batch'``.
+    dropout : float, optional
+        Dropout probability applied after normalization. Default is 0.1.
+
+    Returns
+    -------
+    DeltaEncoder
+        An initialized ``DeltaEncoder`` module.
     """
     def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
         super().__init__()
@@ -269,13 +329,19 @@ class DeltaEncoder(nn.Module):
 
 
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (batch, time, tracks, input_dim) 
-               or (batch, time, tracks_1, tracks_2, input_dim)
-        
-        Returns:
-            Tensor of same shape but with encoder_dim in last dimension
+        """Encode delta features with a shared dense layer.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Delta features with shape ``(batch, time, tracks, input_dim)``
+            or ``(batch, time, tracks_1, tracks_2, input_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Encoded deltas with the same leading dimensions as ``x`` but
+            with ``encoder_dim`` in the final dimension.
         """
         original_shape = x.shape
         
@@ -304,20 +370,51 @@ class DeltaEncoder(nn.Module):
 
 
 class NeighborhoodEncoder(nn.Module):
-    """Encoder that integrates appearance, morphology, and spatial context using GNNs.
-    
-    Combines multiple feature types and applies graph convolutions to capture
-    neighborhood relationships between cells.
-    
-    Args:
-        appearance_encoder (nn.Module): Appearance encoder module
-        morphology_encoder (nn.Module): Morphology encoder module
-        centroid_encoder (nn.Module): Centroid encoder module
-        n_filters (int): Number of filters for GNN layers
-        embedding_dim (int): Final embedding dimension
-        n_layers (int): Number of GNN layers
-        graph_layer (str): Type of graph layer ('gcn', 'gat', etc.)
-        norm_layer (str): 'batch' or 'layer' normalization
+    """Combine appearance, morphology, and centroid embeddings with a GNN.
+
+    Concatenates the outputs of the appearance, morphology, and centroid
+    encoders, projects them to a shared dimension, and applies a stack of
+    graph layers over the cell adjacency graph to produce embeddings that
+    incorporate neighborhood context.
+
+    Parameters
+    ----------
+    appearance_encoder : nn.Module
+        Encoder module used to embed appearance crops (e.g.
+        ``AppearanceEncoder``).
+    morphology_encoder : nn.Module
+        Encoder module used to embed morphology features (e.g.
+        ``MorphologyEncoder``).
+    centroid_encoder : nn.Module
+        Encoder module used to embed centroid positions (e.g.
+        ``CentroidEncoder``).
+    n_filters : int, optional
+        Number of channels used in the initial projection and graph
+        layers. Default is 64.
+    embedding_dim : int, optional
+        Dimension of the final output embedding. Default is 64.
+    n_layers : int, optional
+        Number of stacked graph layers. Default is 3.
+    graph_layer : str, optional
+        Type of graph layer to use, ``'gcn'`` or ``'gat'`` (optionally
+        suffixed, e.g. ``'gat-2'``; only the prefix before ``'-'`` is
+        used). Default is ``'gcn'``.
+    norm_layer : str, optional
+        Normalization type: ``'batch'`` for ``BatchNorm1d``, or any other
+        value for ``LayerNorm``. Default is ``'batch'``.
+    dropout : float, optional
+        Dropout probability applied after each graph layer. Default is
+        0.1.
+
+    Returns
+    -------
+    NeighborhoodEncoder
+        An initialized ``NeighborhoodEncoder`` module.
+
+    Raises
+    ------
+    ValueError
+        If ``graph_layer`` is not ``'gcn'`` or ``'gat'``.
     """
     def __init__(
         self,
@@ -406,20 +503,35 @@ class NeighborhoodEncoder(nn.Module):
             return out
 
     def forward(self, appearance, morphology, centroids, adj_matrix):
-        """
+        """Compute neighborhood-aware embeddings for a batch of cell graphs.
 
-        Args:
-            appearance: (batch * time * max_cells, height, width, channels)
-            morphology: (batch * time * max_cells, 3)
-            centroids: (batch * time * max_cells, 2)
-            adj_matrix: (batch * time, max_cells, max_cells)
-            batch_size: (int) size of batch
-            n_frames: (int) number of frames in batch
-            max_cells: (int) max cells in training batch
-        
-        Returns:
-            node_features: (batch * time, max_cells, embedding_dim)
-            centroids: (batch * time, max_cells, 2) - passed through only reshaped
+        Parameters
+        ----------
+        appearance : torch.Tensor
+            Appearance crops with shape
+            ``(batch * time * max_cells, height, width, channels)`` (or the
+            ``channels_first`` equivalent), passed to
+            ``appearance_encoder``.
+        morphology : torch.Tensor
+            Morphology features with shape
+            ``(batch * time * max_cells, 3)``, passed to
+            ``morphology_encoder``.
+        centroids : torch.Tensor
+            Centroid positions with shape
+            ``(batch * time * max_cells, 2)``, passed to
+            ``centroid_encoder``.
+        adj_matrix : torch.Tensor
+            Adjacency matrices with shape
+            ``(batch * time, max_cells, max_cells)``.
+
+        Returns
+        -------
+        node_features : torch.Tensor
+            Neighborhood-aware node embeddings with shape
+            ``(batch * time, max_cells, embedding_dim)``.
+        centroids : torch.Tensor
+            The input centroids, reshaped only, with shape
+            ``(batch * time, max_cells, 2)``.
         """
 
         BT, N, _ = adj_matrix.shape  # (B*T, max_cells, max_cells)

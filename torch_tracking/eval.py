@@ -15,7 +15,20 @@ import matplotlib.animation as animation
 from torch_tracking.metrics import TrackingMetrics
 
 def build_indices(X):
+    """Find the last populated (non-zero) frame index for each batch element.
 
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Batch of time-lapse label/image arrays with shape
+        ``(B, T, H, W, C)``, where trailing all-zero frames indicate
+        padding beyond the true movie length.
+
+    Returns
+    -------
+    list of int
+        For each batch element, the index of the last non-zero frame.
+    """
     samples = []
 
     for batch in range(X.shape[0]):
@@ -26,7 +39,21 @@ def build_indices(X):
     return samples
 
 def pretty_print(df):
-    
+    """Print aggregate division precision, recall, and F1 for a results DataFrame.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the columns ``correct_division``,
+        ``false_positive_division``, and ``false_negative_division``,
+        typically produced by summing per-movie
+        :class:`~torch_tracking.metrics.TrackingMetrics` results.
+
+    Returns
+    -------
+    None
+        Prints the computed precision, recall, and F1 score to stdout.
+    """
     print()
     print('='*25)
     print('Results')
@@ -50,23 +77,29 @@ def pretty_print(df):
 def create_timelapse_gif(im1, im2, output_path='timelapse.gif', fps=10, 
                          titles=('Predicted', 'True'), 
                          cmap='gray'):
-    """
-    Create a GIF from a time lapse image with two channels.
-    
-    Parameters:
-    -----------
-    image : numpy.ndarray
-        Time lapse image of shape (T, H, W, 2)
-    output_path : str
-        Path to save the output GIF
-    fps : int
-        Frames per second for the GIF
-    titles : tuple
-        Titles for the two subplots
-    cmap : str
-        Colormap to use for display
-    vmin, vmax : float, optional
-        Min/max values for intensity scaling. If None, uses data min/max
+    """Create a side-by-side GIF comparing two time-lapse image sequences.
+
+    Parameters
+    ----------
+    im1 : numpy.ndarray
+        Time-lapse image with shape ``(T, H, W, C)``, displayed in the
+        left subplot.
+    im2 : numpy.ndarray
+        Time-lapse image with shape ``(T, H, W, C)``, displayed in the
+        right subplot.
+    output_path : str, optional
+        Path to save the output GIF. Default is ``timelapse.gif``.
+    fps : int, optional
+        Frames per second for the GIF. Default is 10.
+    titles : tuple of str, optional
+        Titles for the two subplots. Default is ``('Predicted', 'True')``.
+    cmap : str, optional
+        Colormap to use for display. Default is ``gray``.
+
+    Returns
+    -------
+    None
+        Writes the animation to ``output_path`` as a side effect.
     """
 
     T, H, W, C = im1.shape

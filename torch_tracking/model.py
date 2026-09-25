@@ -15,38 +15,65 @@ from torch_tracking.branches import TrainingBranch, InferenceBranch
 
 class GNNTrackingModel(nn.Module):
     """Complete GNN-based tracking model for single cell tracking.
-    
+
     This model uses Graph Neural Networks to track cells across video frames
     by learning appearance, morphology, and spatial relationships.
-    
-    Args:
-        max_cells (int): Maximum number of tracks per frame
-        track_length (int): Length of track sequences
-        n_filters (int): Number of convolutional/GNN filters
-        encoder_dim (int): Dimension of feature encoders
-        embedding_dim (int): Dimension of final embeddings
-        n_layers (int): Number of GNN layers
-        graph_layer (str): Type of graph layer ('gcn', 'gat', 'gcs')
-        appearance_shape (tuple): Shape of appearance crops (time, H, W, C)
-        norm_layer (str): Normalization type ('batch' or 'layer')
-        appearance_norm (bool): Whether to normalize input images
-        n_classes (int): Number of tracking classes (default: 3)
-        data_format (str): 'channels_first' or 'channels_last'
-    
-    Example:
-        >>> model = GNNTrackingModel(
-        ...     max_cells=39,
-        ...     track_length=8,
-        ...     appearance_shape=(1, 32, 32, 1)
-        ... )
-        >>> 
-        >>> # Training
-        >>> logits = model.training_forward(appearances, morphologies, 
-        ...                                  centroids, adj_matrices)
-        >>> 
-        >>> # Inference
-        >>> probs = model.inference_forward(current_emb, current_cent,
-        ...                                  future_emb, future_cent)
+
+    Parameters
+    ----------
+    track_length : int, optional
+        Length of track sequences. Default is 8.
+    n_filters : int, optional
+        Number of convolutional/GNN filters. Default is 64.
+    encoder_dim : int, optional
+        Dimension of the feature encoders. Default is 64.
+    n_layers : int, optional
+        Number of GNN layers. Default is 3.
+    graph_layer : str, optional
+        Type of graph layer, one of ``gcn``, ``gat``, or ``gcs``. Default is
+        ``gcn``.
+    norm_layer : str, optional
+        Normalization type, either ``batch`` or ``layer``. Default is
+        ``batch``.
+    appearance_norm : bool, optional
+        Whether to normalize input images. Default is True.
+    n_classes : int, optional
+        Number of tracking classes. Default is 3.
+    crop_size : int, optional
+        Spatial size (height and width) of the appearance crops. Must be a
+        power of 2. Default is 16.
+    data_format : str, optional
+        Either ``channels_first`` or ``channels_last``. Default is
+        ``channels_first``.
+    dropout : float, optional
+        Dropout rate used in the tracking decoder. Default is 0.1.
+
+    Returns
+    -------
+    GNNTrackingModel
+        An initialized ``GNNTrackingModel`` object.
+
+    Raises
+    ------
+    ValueError
+        If ``appearance_shape`` does not have square spatial dimensions that
+        are a power of 2, if ``graph_layer`` is not one of ``gcn``, ``gat``,
+        or ``gcs``, or if ``norm_layer`` is not ``batch`` or ``layer``.
+
+    Examples
+    --------
+    >>> model = GNNTrackingModel(
+    ...     track_length=8,
+    ...     crop_size=32,
+    ... )
+    >>>
+    >>> # Training
+    >>> logits = model.training_forward(appearances, morphologies,
+    ...                                  centroids, adj_matrices)
+    >>>
+    >>> # Inference
+    >>> probs = model.inference_forward(current_emb, current_cent,
+    ...                                  future_emb, future_cent)
     """
     def __init__(
         self,
@@ -214,17 +241,29 @@ class GNNTrackingModel(nn.Module):
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
                         return_logits=True):
-        """Forward pass for training.
-        
-        Args:
-            appearances: (batch, track_length, max_cells, H, W, C) or channels_first
-            morphologies: (batch, track_length, max_cells, 3)
-            centroids: (batch, track_length, max_cells, 2)
-            adj_matrices: (batch, track_length, max_cells, max_cells)
-            return_logits: If True, return logits; if False, return probabilities
-        
-        Returns:
-            Tensor of shape (batch, track_length-1, max_cells, max_cells, n_classes)
+        """Run a forward pass through the training branch of the model.
+
+        Parameters
+        ----------
+        appearances : torch.Tensor
+            Appearance crops with shape ``(batch, track_length, max_cells, H, W, C)``
+            (or the channels-first equivalent).
+        morphologies : torch.Tensor
+            Morphology features with shape ``(batch, track_length, max_cells, 3)``.
+        centroids : torch.Tensor
+            Centroid coordinates with shape ``(batch, track_length, max_cells, 2)``.
+        adj_matrices : torch.Tensor
+            Spatial adjacency matrices with shape
+            ``(batch, track_length, max_cells, max_cells)``.
+        return_logits : bool, optional
+            If True, return raw logits; if False, return softmax
+            probabilities. Default is True.
+
+        Returns
+        -------
+        torch.Tensor
+            Predictions with shape
+            ``(batch, track_length - 1, max_cells, max_cells, n_classes)``.
         """
 
         # Get features from training branch
@@ -243,17 +282,31 @@ class GNNTrackingModel(nn.Module):
     def inference_forward(self, current_embeddings, current_centroids,
                          future_embeddings, future_centroids,
                          return_logits=False):
-        """Forward pass for inference/tracking.
-        
-        Args:
-            current_embeddings: (batch, time_history, num_tracks, embedding_dim)
-            current_centroids: (batch, time_history, num_tracks, 2)
-            future_embeddings: (batch, 1, num_detections, embedding_dim)
-            future_centroids: (batch, 1, num_detections, 2)
-            return_logits: If True, return logits; if False, return probabilities
-        
-        Returns:
-            Tensor of shape (batch, 1, num_tracks, num_detections, n_classes)
+        """Run a forward pass through the inference branch of the model.
+
+        Parameters
+        ----------
+        current_embeddings : torch.Tensor
+            Embeddings of existing tracks with shape
+            ``(batch, time_history, num_tracks, embedding_dim)``.
+        current_centroids : torch.Tensor
+            Centroids of existing tracks with shape
+            ``(batch, time_history, num_tracks, 2)``.
+        future_embeddings : torch.Tensor
+            Embeddings of the new frame's detections with shape
+            ``(batch, 1, num_detections, embedding_dim)``.
+        future_centroids : torch.Tensor
+            Centroids of the new frame's detections with shape
+            ``(batch, 1, num_detections, 2)``.
+        return_logits : bool, optional
+            If True, return raw logits; if False, return softmax
+            probabilities. Default is False.
+
+        Returns
+        -------
+        torch.Tensor
+            Predictions with shape
+            ``(batch, 1, num_tracks, num_detections, n_classes)``.
         """
         # Get features from inference branch
         with torch.no_grad():
@@ -271,14 +324,29 @@ class GNNTrackingModel(nn.Module):
         return output
     
     def forward(self, *args, mode='training', **kwargs):
-        """Unified forward pass.
-        
-        Args:
-            mode: 'training' or 'inference'
-            *args, **kwargs: Arguments for respective forward method
-        
-        Returns:
-            Model outputs based on mode
+        """Run a forward pass, dispatching to the training or inference branch.
+
+        Parameters
+        ----------
+        *args
+            Positional arguments forwarded to ``training_forward`` or
+            ``inference_forward``, depending on ``mode``.
+        mode : str, optional
+            Either ``training`` or ``inference``. Default is ``training``.
+        **kwargs
+            Keyword arguments forwarded to ``training_forward`` or
+            ``inference_forward``, depending on ``mode``.
+
+        Returns
+        -------
+        torch.Tensor
+            The output of ``training_forward`` or ``inference_forward``,
+            depending on ``mode``.
+
+        Raises
+        ------
+        ValueError
+            If ``mode`` is not ``training`` or ``inference``.
         """
         if mode == 'training':
             return self.training_forward(*args, **kwargs)
@@ -288,17 +356,28 @@ class GNNTrackingModel(nn.Module):
             raise ValueError(f"mode must be 'training' or 'inference', got {mode}")
     
     def get_embeddings(self, appearances, morphologies, centroids, adj_matrices):
-        """Extract embeddings for cells (useful for inference setup).
-        
-        Args:
-            appearances: (batch, time, max_cells, H, W, C) or channels_first
-            morphologies: (batch, time, max_cells, 3)
-            centroids: (batch, time, max_cells, 2)
-            adj_matrices: (batch, time, max_cells, max_cells)
-        
-        Returns:
-            embeddings: (batch, time, max_cells, embedding_dim)
-            centroids: (batch, time, max_cells, 2)
+        """Extract per-cell embeddings, useful for setting up inference.
+
+        Parameters
+        ----------
+        appearances : torch.Tensor
+            Appearance crops with shape ``(batch, time, max_cells, H, W, C)``
+            (or the channels-first equivalent).
+        morphologies : torch.Tensor
+            Morphology features with shape ``(batch, time, max_cells, 3)``.
+        centroids : torch.Tensor
+            Centroid coordinates with shape ``(batch, time, max_cells, 2)``.
+        adj_matrices : torch.Tensor
+            Spatial adjacency matrices with shape
+            ``(batch, time, max_cells, max_cells)``.
+
+        Returns
+        -------
+        embeddings : torch.Tensor
+            Encoded embeddings with shape
+            ``(batch, time, max_cells, embedding_dim)``.
+        centroids : torch.Tensor
+            Centroid coordinates with shape ``(batch, time, max_cells, 2)``.
         """
         batch_size = appearances.shape[0]
         time_steps = appearances.shape[1]
@@ -326,7 +405,13 @@ class GNNTrackingModel(nn.Module):
         return embeddings, centroids_out
     
     def count_parameters(self):
-        """Count total trainable parameters."""
+        """Count the total number of trainable parameters in the model.
+
+        Returns
+        -------
+        int
+            The number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
