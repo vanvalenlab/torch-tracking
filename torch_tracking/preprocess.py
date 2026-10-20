@@ -12,7 +12,33 @@ from pathlib import Path
 import numpy as np
 
 def get_temporal_adjacency(lineage, max_frames, max_cells):
-    
+    """Build the frame-to-frame temporal adjacency matrix for a lineage.
+
+    Encodes, for each pair of frames, which cells persist (self-links),
+    which cells divide (parent-to-daughter links), and which cells are
+    padding, so the result can be used as the target for the temporal
+    linkage task.
+
+    Parameters
+    ----------
+    lineage : dict
+        Mapping of track index to track info, where each value is a dict
+        with at least ``label`` (1-indexed track label), ``frames`` (list
+        of frame indices the track appears in), and ``daughters`` (list of
+        1-indexed daughter track labels, if any).
+    max_frames : int
+        The number of frames in the movie.
+    max_cells : int
+        The maximum number of cells/tracks per frame.
+
+    Returns
+    -------
+    ndarray
+        Adjacency array of shape ``(max_frames - 1, max_cells, max_cells)``
+        where a value of 1 marks a self-link between consecutive frames, 2
+        marks a parent-to-daughter division link, 0 marks "no link", and -1
+        marks padding beyond the valid cells/frames.
+    """
     adjacency = np.full((max_frames, max_cells, max_cells), 0)
 
     frame_list = []
@@ -74,9 +100,49 @@ def get_temporal_adjacency(lineage, max_frames, max_cells):
     return adjacency
 
 
-def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1), 
+def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
                  crop_mode='fixed', clahe=False, distance_threshold=64, mpps=None):
-    
+    """Extract per-cell appearance, morphology, centroid, and adjacency features.
+
+    For every batch and frame, resizes the raw and labeled images to a
+    standardized microns-per-pixel, crops per-cell appearances, computes
+    morphology and centroid features, and builds both a spatial (distance
+    based) adjacency matrix per frame and a temporal adjacency matrix across
+    frames.
+
+    Parameters
+    ----------
+    X : ndarray
+        Raw image batches with shape ``(B, T, H, W, C)``.
+    y : ndarray
+        Labeled (segmentation) image batches with shape ``(B, T, H, W, C)``.
+    lineages : list of dict
+        One lineage dict per batch, as consumed by ``get_temporal_adjacency``.
+    max_cells : int
+        The maximum number of cells/tracks per frame.
+    appearance_shape : tuple, optional
+        Shape ``(H, W, C)`` of the per-cell appearance crops. Default is
+        ``(32, 32, 1)``.
+    crop_mode : str, optional
+        Cropping mode passed to ``get_image_features``. Default is
+        ``fixed``.
+    clahe : bool, optional
+        Whether to apply CLAHE histogram normalization to the whole image
+        before processing. Default is False.
+    distance_threshold : int, optional
+        Distance (in pixels) below which two cells are considered spatially
+        adjacent. Default is 64.
+    mpps : sequence of float, optional
+        Microns-per-pixel for each batch, used to resize images to a
+        standardized resolution of 0.55 microns per pixel.
+
+    Returns
+    -------
+    dict
+        A dictionary with keys ``appearances``, ``morphologies``,
+        ``centroids``, ``labels`` (the temporal adjacency matrix), and
+        ``track_length``.
+    """
     B, T, H, W, C = X.shape
 
     max_tracks = max_cells
@@ -151,14 +217,24 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
     return features 
 
 def load_trks(filename):
-    """Load a trk/trks file.
+    """Load a ``.trk``/``.trks`` file.
 
-    Args:
-        filename (str or BytesIO): full path to the file including .trk/.trks
-            or BytesIO object with trk file data
+    Parameters
+    ----------
+    filename : str or io.BytesIO
+        Full path to the file, including the ``.trk``/``.trks`` extension,
+        or a ``BytesIO`` object containing trk file data.
 
-    Returns:
-        dict: A dictionary with raw, tracked, and lineage data.
+    Returns
+    -------
+    dict
+        A dictionary with keys ``lineages`` (list of lineage dicts), ``X``
+        (raw image array), and ``y`` (tracked/labeled image array).
+
+    Raises
+    ------
+    ValueError
+        If the file does not contain lineage data.
     """
 
     if isinstance(filename, io.BytesIO):
@@ -194,7 +270,26 @@ def load_trks(filename):
     return {'lineages': lineages, 'X': raw, 'y': tracked}
 
 def correct_lineages(X, y, lineages):
-    """Ensure valid lineages and sequential labels for all batches"""
+    """Ensure valid lineages and sequential labels for all batches.
+
+    Parameters
+    ----------
+    X : ndarray
+        Raw image batches with shape ``(B, ...)``.
+    y : ndarray
+        Labeled (segmentation) image batches with shape ``(B, ...)``.
+    lineages : list of dict
+        One lineage dict per batch.
+
+    Returns
+    -------
+    X : ndarray
+        The input ``X``, stacked back into a single array.
+    y : ndarray
+        The relabeled ``y``, with sequential labels per batch.
+    lineages : list of dict
+        The corrected lineages, matching the relabeled ``y``.
+    """
     new_X = []
     new_y = []
     new_lineages = []
@@ -214,7 +309,29 @@ def correct_lineages(X, y, lineages):
     return X, y, lineages
 
 def convert_trk_to_zarr(filename, out_dir=None):
+    """Convert a ``.trk`` file to Zarr, writing both raw and processed outputs.
 
+    Loads the trk file and its associated ``data-source.npz`` metadata,
+    corrects the lineages, and writes two Zarr stores next to the source
+    file: one with the raw ``X``/``y`` arrays, and one (suffixed
+    ``_proc``) with the extracted per-cell features from ``get_features``.
+    Also writes the corrected lineages to a JSON file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the ``.trk`` file to convert. A sibling ``data-source.npz``
+        file must exist in the same directory.
+    out_dir : str, optional
+        Currently unused; the processed Zarr store is always written next to
+        the source file. Default is None.
+
+    Returns
+    -------
+    None
+        Writes ``<name>.json``, ``<name>.zarr``, and ``<name>_proc.zarr`` to
+        the source file's directory.
+    """
     data = load_trks(filename)
     dir = os.path.dirname(filename)
 

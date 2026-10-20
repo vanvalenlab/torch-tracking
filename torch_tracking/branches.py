@@ -12,24 +12,35 @@ from torch_tracking.encoders import NeighborhoodEncoder, AppearanceEncoder, Morp
 
 class TrainingBranch(nn.Module):
     """Training branch that processes full sequences of tracked cells.
-    
-    Takes complete tracks across multiple frames and prepares features
-    for the tracking decoder by:
-    1. Encoding appearance, morphology, and spatial features
-    2. Extracting temporal patterns with LSTM
-    3. Computing pairwise comparisons between consecutive frames
-    4. Encoding position deltas
-    
-    Args:
-        neighborhood_encoder (nn.Module): Encodes node features with GNN
-        embedding_temporal_merge (nn.Module): LSTM for temporal embeddings
-        delta_temporal_merge (nn.Module): LSTM for temporal deltas
-        delta_encoder (nn.Module): Encodes within-frame position deltas
-        delta_across_frames_encoder (nn.Module): Encodes cross-frame deltas
-        track_length (int): Number of frames in each track
-        max_cells (int): Maximum number of cells per frame
-        embedding_dim (int): Dimension of embeddings
-        encoder_dim (int): Dimension of encoder features
+
+    Takes complete tracks across multiple frames and prepares features for
+    the tracking decoder by encoding appearance, morphology, and spatial
+    features; extracting temporal patterns with an LSTM; computing pairwise
+    comparisons between consecutive frames; and encoding position deltas.
+
+    Parameters
+    ----------
+    neighborhood_encoder : nn.Module
+        Encodes per-cell appearance, morphology, and centroid features
+        together with the adjacency matrix into a neighborhood-aware
+        embedding.
+    embedding_temporal_merge : nn.Module
+        LSTM-based module that merges embeddings across the temporal
+        dimension.
+    delta_temporal_merge : nn.Module
+        LSTM-based module that merges within-frame position deltas across
+        the temporal dimension.
+    delta_encoder : nn.Module
+        Encodes within-frame position deltas.
+    delta_across_frames_encoder : nn.Module
+        Encodes pairwise position deltas between cells across frames.
+    track_length : int
+        Number of frames in each track.
+
+    Returns
+    -------
+    TrainingBranch
+        An initialized ``TrainingBranch`` object.
     """
     def __init__(
         self,
@@ -56,16 +67,29 @@ class TrainingBranch(nn.Module):
         self.comparison = Comparison()
 
     def forward(self, appearances, morphologies, centroids, adj_matrices):
-        """
-        Args:
-            appearances: (batch, time, height, width, channels) or channels_first
-            morphologies: (batch, time, 3)
-            centroids: (batch, time, 2)
-            adj_matrices: (batch, time, max_cells, max_cells)
-        
-        Returns:
-            embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
-            deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
+        """Compute pairwise embedding comparisons and position deltas for a batch of tracks.
+
+        Parameters
+        ----------
+        appearances : torch.Tensor
+            Appearance crops of shape
+            ``(batch, time, max_cells, height, width, channels)``.
+        morphologies : torch.Tensor
+            Morphology features of shape ``(batch, time, max_cells, 3)``.
+        centroids : torch.Tensor
+            Cell centroid coordinates of shape ``(batch, time, max_cells, 2)``.
+        adj_matrices : torch.Tensor
+            Adjacency matrices of shape
+            ``(batch, time, max_cells, max_cells)``.
+
+        Returns
+        -------
+        embedding_comparisons : torch.Tensor
+            Pairwise embedding comparisons of shape
+            ``(batch, time - 1, max_cells, max_cells, 2 * embedding_dim)``.
+        deltas : torch.Tensor
+            Encoded position deltas of shape
+            ``(batch, time - 1, max_cells, max_cells, 2 * encoder_dim)``.
         """
 
         batch_size, time_steps, max_cells, H, W, C = appearances.shape
@@ -132,17 +156,28 @@ class TrainingBranch(nn.Module):
 
 class InferenceBranch(nn.Module):
     """Inference branch for online tracking of new frames.
-    
+
     Processes partial tracks (current history) and a new frame to predict
     which cells in the new frame correspond to existing tracks.
-    
-    Args:
-        embedding_temporal_merge (nn.Module): LSTM for temporal embeddings
-        delta_temporal_merge (nn.Module): LSTM for temporal deltas
-        delta_encoder (nn.Module): Encodes within-frame position deltas
-        delta_across_frames_encoder (nn.Module): Encodes cross-frame deltas
-        embedding_dim (int): Dimension of embeddings
-        encoder_dim (int): Dimension of encoder features
+
+    Parameters
+    ----------
+    embedding_temporal_merge : nn.Module
+        LSTM-based module that merges embeddings across the temporal
+        dimension.
+    delta_temporal_merge : nn.Module
+        LSTM-based module that merges within-frame position deltas across
+        the temporal dimension.
+    delta_encoder : nn.Module
+        Encodes within-frame position deltas.
+    delta_across_frames_encoder : nn.Module
+        Encodes pairwise position deltas between existing tracks and new
+        detections.
+
+    Returns
+    -------
+    InferenceBranch
+        An initialized ``InferenceBranch`` object.
     """
     def __init__(
         self,
@@ -161,18 +196,33 @@ class InferenceBranch(nn.Module):
         self.comparison = Comparison()
         self.delta_reshape = DeltaReshape()
 
-    def forward(self, current_embeddings, current_centroids, 
+    def forward(self, current_embeddings, current_centroids,
                 future_embeddings, future_centroids):
-        """
-        Args:
-            current_embeddings: (batch, time_history, num_tracks, embedding_dim)
-            current_centroids: (batch, time_history, num_tracks, 2)
-            future_embeddings: (batch, 1, num_detections, embedding_dim)
-            future_centroids: (batch, 1, num_detections, 2)
-        
-        Returns:
-            embedding_comparisons: (batch, 1, num_tracks, num_detections, 2*embedding_dim)
-            deltas: (batch, 1, num_tracks, num_detections, 2*encoder_dim)
+        """Compare existing tracks against new detections to predict associations.
+
+        Parameters
+        ----------
+        current_embeddings : torch.Tensor
+            Embedding history of existing tracks, of shape
+            ``(batch, time_history, num_tracks, embedding_dim)``.
+        current_centroids : torch.Tensor
+            Centroid history of existing tracks, of shape
+            ``(batch, time_history, num_tracks, 2)``.
+        future_embeddings : torch.Tensor
+            Embeddings of the detections in the new frame, of shape
+            ``(batch, 1, num_detections, embedding_dim)``.
+        future_centroids : torch.Tensor
+            Centroids of the detections in the new frame, of shape
+            ``(batch, 1, num_detections, 2)``.
+
+        Returns
+        -------
+        embedding_comparisons : torch.Tensor
+            Pairwise embedding comparisons of shape
+            ``(batch, 1, num_tracks, num_detections, 2 * embedding_dim)``.
+        deltas : torch.Tensor
+            Encoded position deltas of shape
+            ``(batch, 1, num_tracks, num_detections, 2 * encoder_dim)``.
         """
         # Process current embeddings with temporal merge
         embeddings_current = self.embedding_temporal_merge(current_embeddings)

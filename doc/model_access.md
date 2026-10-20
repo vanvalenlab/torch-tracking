@@ -1,4 +1,4 @@
-Model and Datasets
+Model and Dataset Access
 ==================
 
 Pre-trained model weights for all deepcell models are available on
@@ -41,6 +41,8 @@ in your OS environment:
 export HF_TOKEN="<your-token-here>"
 ```
 
+Alternatively, you can add this token variable to your `.bashrc` or `.zshrc`.
+
 [hf-token]: https://huggingface.co/docs/hub/en/security-tokens
 [hf-create]: https://huggingface.co/docs/hub/main/en/security-tokens#what-are-user-access-tokens
 
@@ -56,3 +58,8 @@ Specific model versions can be downloaded with the [huggingface CLI][hf-cli].
 
 [hf-versions]: https://huggingface.co/vanvalenlab/torch-tracking/tree/main
 [hf-cli]: https://huggingface.co/docs/huggingface_hub/en/guides/cli
+
+Dataset
+------
+
+We have not yet published the DynamicNuclearNet dataset to huggingface, but we plan to. When we do, you will be able to download it with the [huggingface CLI][hf-cli].

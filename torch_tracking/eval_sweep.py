@@ -12,7 +12,20 @@ from pathlib import Path
 from torch_tracking.metrics import TrackingMetrics
 
 def build_indices(X):
+    """Find the last populated (non-zero) frame index for each batch element.
 
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Batch of time-lapse label/image arrays with shape
+        ``(B, T, H, W, C)``, where trailing all-zero frames indicate
+        padding beyond the true movie length.
+
+    Returns
+    -------
+    list of int
+        For each batch element, the index of the last non-zero frame.
+    """
     samples = []
 
     for batch in range(X.shape[0]):

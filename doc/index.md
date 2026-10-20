@@ -5,6 +5,9 @@
 hidden: true
 ---
 model_access
+model
+inference_api
+tutorial
 ```
 
 Welcome to the `torch-tracking` documentation!

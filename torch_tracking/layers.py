@@ -6,14 +6,24 @@ import torch.nn.functional as F
 
 
 class ImageNormalization2D(nn.Module):
-    """Image Normalization layer for 2D data.
-    
-    Args:
-        norm_method (str): Normalization method to use, one of:
-            "std", "max", "whole_image", None.
-        filter_size (int): The length of the convolution window (not used in current impl).
-        data_format (str): 'channels_first' or 'channels_last'.
-            PyTorch default is 'channels_first'.
+    """Normalize 2D image tensors using a per-image statistic.
+
+    Parameters
+    ----------
+    norm_method : str or None, optional
+        Normalization method to use, one of ``"std"``, ``"max"``,
+        ``"whole_image"``, or ``None``. Default is ``"std"``.
+    filter_size : int, optional
+        The length of the convolution window (not used in the current
+        implementation). Default is 61.
+    data_format : str, optional
+        ``"channels_first"`` or ``"channels_last"``. Default is
+        ``"channels_first"``.
+
+    Returns
+    -------
+    ImageNormalization2D
+        An initialized ``ImageNormalization2D`` layer.
     """
     def __init__(
         self,
@@ -35,7 +45,19 @@ class ImageNormalization2D(nn.Module):
         self.channel_axis = 1 if data_format == 'channels_first' else -1
 
     def forward(self, x):
-        """Apply normalization to input tensor."""
+        """Apply normalization to the input tensor.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Image tensor with shape ``(B, C, H, W)`` or ``(B, H, W, C)``
+            depending on ``self.data_format``.
+
+        Returns
+        -------
+        torch.Tensor
+            The normalized tensor, with the same shape and layout as ``x``.
+        """
         if self.norm_method is None:
             return x
         
@@ -73,19 +95,32 @@ class ImageNormalization2D(nn.Module):
 
 class Comparison(nn.Module):
     """Layer for comparing two sequences of inputs.
-    
-    Expands and tiles x and y to create pairwise comparisons,
+
+    Expands and tiles ``x`` and ``y`` to create pairwise comparisons,
     then concatenates them along the last dimension.
-    
-    Input shapes:
-        x: (batch, time, tracks_x, features)
-        y: (batch, time, tracks_y, features)
-    
-    Output shape:
-        (batch, time, tracks_x, tracks_y, features * 2)
+
+    Returns
+    -------
+    Comparison
+        An initialized ``Comparison`` layer.
     """
     def forward(self, x, y):
+        """Compute pairwise concatenated features between ``x`` and ``y``.
 
+        Parameters
+        ----------
+        x : torch.Tensor
+            Tensor of shape ``(batch, time, tracks_x, features)``.
+        y : torch.Tensor
+            Tensor of shape ``(batch, time, tracks_y, features)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(batch, time, tracks_x, tracks_y, features * 2)``
+            containing the pairwise concatenation of ``x`` and ``y`` along
+            the feature dimension.
+        """
         # (B, T, X, F) -> (B, T, X, 1, F)
         x = x.unsqueeze(3)
 
@@ -104,17 +139,32 @@ class Comparison(nn.Module):
 
 class DeltaReshape(nn.Module):
     """Reshape changes between current and future frames.
-    
-    Takes current embeddings and tiles them to match the shape of future frame.
-    
-    Input shapes:
-        current: (batch, time, tracks, features)
-        future: (batch, time, tracks_future, features)
-    
-    Output shape:
-        (batch, time, tracks, tracks_future, features)
+
+    Takes current embeddings and tiles them to match the shape of the
+    future frame.
+
+    Returns
+    -------
+    DeltaReshape
+        An initialized ``DeltaReshape`` layer.
     """
     def forward(self, current, future):
+        """Tile ``current`` along a new axis to match ``future``'s track count.
+
+        Parameters
+        ----------
+        current : torch.Tensor
+            Tensor of shape ``(batch, time, tracks, features)``.
+        future : torch.Tensor
+            Tensor of shape ``(batch, time, tracks_future, features)``. Only
+            its size along the tracks dimension is used.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(batch, time, tracks, tracks_future, features)``,
+            with ``current`` broadcast along the new ``tracks_future`` axis.
+        """
         # Add dimension: (B, T, X, F) -> (B, T, X, 1, F)
         current = current.unsqueeze(3)
         # Tile to match future tracks: (B, T, X, 1, F) -> (B, T, X, Y, F)
@@ -124,39 +174,59 @@ class DeltaReshape(nn.Module):
 
 class Unmerge(nn.Module):
     """Unmerge temporal inputs by reshaping.
-    
-    Reshapes from (batch, merged_temporal_tracks, features)
-    to (batch, track_length, max_cells, features).
-    
-    Args:
-        track_length (int): Length of each track sequence.
-        max_cells (int): Maximum number of cells/tracks per frame.
-        embedding_dim (int): Dimension of embeddings.
+
+    Reshapes from ``(batch, merged_temporal_tracks, features)`` to
+    ``(batch, track_length, max_cells, features)``.
+
+    Returns
+    -------
+    Unmerge
+        An initialized ``Unmerge`` layer.
     """
     def __init__(self):
         super().__init__()
 
     def forward(self, x, batch_size, track_length, max_cells):
+        """Reshape a merged temporal tensor back into separate time and track axes.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Tensor of shape ``(batch, track_length * max_cells, features)``.
+        batch_size : int
+            The batch size.
+        track_length : int
+            Length of each track sequence (the desired time dimension).
+        max_cells : int
+            Maximum number of cells/tracks per frame.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(batch_size, track_length, max_cells, features)``.
+        """
         return x.view(batch_size, track_length, max_cells, -1)
 
 
 class TemporalMerge(nn.Module):
-    """Layer for merging the time dimension of a Tensor using LSTM.
-    
-    Processes temporal sequences at each spatial location independently.
-    Initialized to match Keras LSTM defaults:
-        - Glorot Uniform for input weights
-        - Orthogonal for recurrent weights
-        - Zero biases with forget gate bias set to 1.0
-    
-    Args:
-        encoder_dim (int): Desired encoder dimension and LSTM hidden size.
-    
-    Input shape:
-        (batch, time, tracks, encoder_dim)
-    
-    Output shape:
-        (batch, time, tracks, encoder_dim)
+    """Merge the time dimension of a tensor using an LSTM.
+
+    Processes temporal sequences at each spatial location (track)
+    independently. Weights are initialized to match Keras LSTM defaults:
+
+    - Glorot Uniform for input weights
+    - Orthogonal for recurrent weights
+    - Zero biases, with the forget gate bias set to 1.0
+
+    Parameters
+    ----------
+    encoder_dim : int, optional
+        Desired encoder dimension and LSTM hidden size. Default is 64.
+
+    Returns
+    -------
+    TemporalMerge
+        An initialized ``TemporalMerge`` layer.
     """
     def __init__(self, encoder_dim=64):
         super().__init__()
@@ -188,6 +258,19 @@ class TemporalMerge(nn.Module):
                     param.data[hidden_size:hidden_size * 2].fill_(1.0)
 
     def forward(self, x):
+        """Run the LSTM over the time axis independently for each track.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Tensor of shape ``(batch, time, tracks, encoder_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(batch, time, tracks, encoder_dim)`` containing
+            the LSTM hidden states at each time step.
+        """
         # x shape: (batch, time, tracks, encoder_dim)
         batch_size, time_steps, num_tracks, features = x.shape
         
@@ -208,12 +291,17 @@ class TemporalMerge(nn.Module):
 # Utility functions to replace Lambda layers
 def compute_deltas(x):
     """Compute deltas between consecutive time steps.
-    
-    Args:
-        x: Tensor of shape (batch, time, ..., features)
-    
-    Returns:
-        Tensor of same shape with deltas, padded at start.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Tensor of shape ``(batch, time, ..., features)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of the same shape as ``x`` containing ``x[:, t] - x[:, t-1]``
+        for each time step, zero-padded at the first time step.
     """
     # Compute differences: x[t] - x[t-1]
     deltas = x[:, 1:] - x[:, :-1]
@@ -227,13 +315,18 @@ def compute_deltas(x):
 
 def compute_deltas_across_frames(centroids):
     """Find deltas across frames between all pairs of tracks.
-    
-    Args:
-        centroids: Tensor of shape (batch, time, tracks, 2)
-    
-    Returns:
-        Tensor of shape (batch, time-1, tracks_current, tracks_future, 2)
-        representing differences between all pairs across consecutive frames.
+
+    Parameters
+    ----------
+    centroids : torch.Tensor
+        Tensor of shape ``(batch, time, tracks, 2)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape ``(batch, time - 1, tracks, tracks, 2)`` giving the
+        pairwise centroid differences (``future - current``) between every
+        pair of tracks across each pair of consecutive frames.
     """
     # Split into current and future frames
     centroid_current = centroids[:, :-1]  # (B, T-1, N, 2)
