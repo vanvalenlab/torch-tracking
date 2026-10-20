@@ -51,6 +51,41 @@ class CellTracker:
         Whether to print progress messages during initialization and
         preprocessing. Default is True.
 
+    Attributes
+    ----------
+    device : str
+        The device used for inference.
+    distance_threshold : int
+        The distance threshold (in pixels) used to connect cells in the GNN.
+    death : float
+        The threshold probability for a linkage to be considered a "death".
+    birth : float
+        The threshold probability for a linkage to be considered a new
+        cell, or "birth".
+    division : float
+        The threshold probability for a linkage to be considered a mitosis.
+    track_length : int
+        The number of frames of history used to predict the next frame.
+    verbose : bool
+        Whether progress messages are printed during initialization and
+        preprocessing.
+    tracking_model : GNNTrackingModel
+        The loaded GNN model used for inference.
+    tracks : dict
+        Mapping of track ID to track metadata (label, frames, daughters,
+        etc.), populated by :meth:`track_cells`.
+    X : ndarray or None
+        The preprocessed movie, set by :meth:`preprocess_movie`.
+    y : ndarray or None
+        The current (possibly relabeled) annotation, set by
+        :meth:`preprocess_movie` and updated by :meth:`track_cells`.
+    y_tracked : ndarray or None
+        The final relabeled annotation after tracking, set by
+        :meth:`track_cells`.
+    features : dict or None
+        Extracted ``embedding`` and ``centroid`` features, set by
+        :meth:`preprocess_movie`.
+
     Returns
     -------
     CellTracker

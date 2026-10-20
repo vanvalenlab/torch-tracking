@@ -6,6 +6,7 @@ hidden: true
 ---
 model_access
 model
+inference_api
 tutorial
 ```
 

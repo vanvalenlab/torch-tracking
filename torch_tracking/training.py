@@ -20,7 +20,7 @@ from torch_tracking.utils import MetricsTracker, EarlyStopping, create_optimizer
 class TrainingConfig:
     """Configuration for a :class:`Trainer` run.
 
-    Parameters
+    Attributes
     ----------
     model : torch.nn.Module or None, optional
         The model to train. Default is None.

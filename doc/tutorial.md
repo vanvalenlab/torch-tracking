@@ -1,5 +1,17 @@
-# Tutorial
+---
+jupytext:
+  text_representation:
+    extension: .md
+    format_name: myst
+    format_version: 0.13
+    jupytext_version: 1.16.7
+kernelspec:
+  display_name: Python 3 (ipykernel)
+  language: python
+  name: python3
+---
 
-## Introduction
+Tutorial
+=
 
-This tutorial provides a summary of the cell tracking model, how it works, and a walkthrough for tracking nuclei in an example time-lapse microscopy image. If you want to learn the basics of the pipeline, read this tutorial from start to finish. Otherwise, feel free to jump to the example implementation.
+Coming soon!
