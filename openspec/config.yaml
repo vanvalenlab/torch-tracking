@@ -1,0 +1,67 @@
+schema: spec-driven
+
+# Durable project constraints. Figures deliberately live in VISION.md and
+# metrics/PROVENANCE.md, not here, so that retraining the model does not
+# require editing workflow configuration.
+context: |
+  This package is the tracking half of the Caliban pipeline, and the successor to
+  deepcell-tracking. It does NOT perform segmentation: callers supply masks. Keep the
+  names distinct - "Caliban" is the full segmentation + tracking pipeline;
+  "DynamicNuclearNet" is a segmentation model that is not part of this repository;
+  "DynamicNuclearNet-tracking" is the tracking dataset used here. Proposing segmentation
+  is a change of project scope, not a feature.
+
+  Six constraints bind every change. VISION.md states them in full.
+
+  1. Determinism is a feature. The same movie, mask, checkpoint and parameters must
+     produce byte-identical output. Do not introduce nondeterminism into the inference
+     path; reproducibility of published results depends on it.
+  2. Accuracy is a contract. Any change touching tracking output must report its effect
+     on division F1, association accuracy and target effectiveness against the recorded
+     baseline. Regressions require justification. See the note below on who can satisfy
+     this today.
+  3. Reference parity is the floor. Compare only against the "Caliban - GT" row of
+     metrics/benchmarks.csv, never "Caliban - Caliban", which includes segmentation error
+     from a model this package does not contain.
+  4. Lineage shape is a compatibility surface. The .trk format and the lineage dictionary
+     are the interop boundary with the DeepCell ecosystem. Changing either is a breaking
+     change and must be called out as one.
+  5. CPU inference stays supported. Tests run on CPU; do not make a GPU mandatory.
+  6. Trained weights never leave the HuggingFace vanvalenlab org. Never commit a trained
+     checkpoint, attach one to a release, or otherwise redistribute it. Reference weights
+     by repository, revision and hash. The only tracked .pt file is the untrained test
+     fixture under tests/data/, which is not a model.
+
+  Constraint 2 is currently conditional on dataset access. Producing eval deltas requires
+  DynamicNuclearNet-tracking, whose distribution is mid-migration from the DeepCell auth
+  system to HuggingFace, so an outside contributor cannot obtain it. Until that lands, the
+  obligation falls on whoever reviews a change, not whoever writes it. Do not ask a
+  contributor to produce numbers they have no way to generate; say what evidence is missing
+  and let review supply it.
+
+  Specify current behavior, not intended behavior. Where documentation and code disagree,
+  or two parts of the repository contradict each other, record the divergence explicitly
+  and assign it to a capability rather than fixing it inline. The divergence register in
+  openspec/changes/seed-spec-campaign-groundwork/design.md is the running list.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

@@ -18,5 +18,15 @@ library from the TensorFlow-based [`deepcell-tf`][dc-tf] package.
 [`deepcell-tf`][dc-tf] is no longer maintained - users are encouraged to use this package instead.
 ```
 
+```{note}
+This package performs **tracking only** - you supply the segmentation masks. It is the
+tracking half of the Caliban pipeline; the DynamicNuclearNet segmentation model is not
+included here.
+
+See [VISION.md][vision] for the project's scope, how it compares to the TensorFlow
+reference implementation, and the constraints that govern changes to it.
+```
+
 [dc-tracking]: https://github.com/vanvalenlab/deepcell-tracking
 [dc-tf]: https://github.com/vanvalenlab/deepcell-tf
+[vision]: https://github.com/vanvalenlab/torch-tracking/blob/main/VISION.md

@@ -4,6 +4,10 @@ A PyTorch implementation of a graph neural network (GNN) cell tracker for live-c
 
 This is a PyTorch port of the cell tracking model from [Caliban](https://www.biorxiv.org/content/10.1101/803205v3), originally implemented in TensorFlow.
 
+> **Note:** this package performs tracking only — you supply the segmentation masks. See
+> [VISION.md](VISION.md) for the project's scope, how it compares to the TensorFlow
+> reference, and the constraints that govern changes to it.
+
 ---
 
 ## Table of Contents
@@ -35,7 +39,13 @@ pip install .
 pip install -r requirements.txt
 ```
 
-Default model weights are downloaded from DeepCell's model zoo. You must first generate an API key from [DeepCell.org](users.deepcell.org) and add it to your terminal's config file. Once you do this, you can import the tracker from the package and instantiate a tracking instance using `CellTracker()`. This will download the model weights from DeepCell and move them to the canonical `.deepcell` folder in your home directory.
+Default model weights are downloaded from [Hugging Face](https://huggingface.co/vanvalenlab). Access is gated: you must join the `vanvalenlab` organization, accept the license terms, and create a Read token exposed as `HF_TOKEN` in your environment.
+
+```bash
+export HF_TOKEN="<your-token-here>"
+```
+
+With that set, `CellTracker()` downloads the weights on first use and caches them under `.deepcell` in your home directory. **See [doc/model_access.md](doc/model_access.md) for the authoritative instructions**, including license terms — use of the pre-trained weights is restricted to non-commercial academic purposes.
 
 >[!note]
 If you plan to use a GPU for inference (which we suggest), you will have to make sure the PyTorch version installed is compatible with the CUDA version on your GPUs. If you are having problems with installation, check out [this page](https://pytorch.org/get-started/previous-versions/) to make sure you installed the correct PyTorch version that is compatible with your system's CUDA version. If you find that there is a version mismatch, follow the instructions on the page to `pip` install the correct PyTorch version.
@@ -66,7 +76,7 @@ The tracker internally rescales images to a resolution of **0.55 µm/pixel**. If
 Training data must be converted from `.trk`/`.trks` files (a tar-based format from Caliban) to Zarr arrays before training. Run:
 
 ```bash
-python -m tracking.preprocess
+python -m torch_tracking.preprocess
 ```
 
 By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file it produces:
@@ -75,7 +85,7 @@ By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file 
 - `<split>_proc.zarr` — pre-extracted features ready for the dataloader
 - `<split>.json` — ground-truth lineage records
 
-The `convert_trk_to_zarr` function in [tracking/preprocess.py](tracking/preprocess.py) can also be called directly:
+The `convert_trk_to_zarr` function in [torch_tracking/preprocess.py](torch_tracking/preprocess.py) can also be called directly:
 
 ```python
 from torch_tracking.preprocess import convert_trk_to_zarr
@@ -272,7 +282,7 @@ These are set on the `CellTracker` object and control the post-processing decisi
 
 **Tuning guidance:**
 
-- `division` is the most impactful parameter. Run `tracking/eval_sweep.py` to sweep over values (e.g. `0.3`–`0.8`) and pick the threshold that maximizes division F1 on a held-out set.
+- `division` is the most impactful parameter. Run `torch_tracking/eval_sweep.py` to sweep over values (e.g. `0.3`–`0.8`) and pick the threshold that maximizes division F1 on a held-out set.
 - `birth` and `death` rarely need to be changed from `0.999` unless you see many spurious track births or premature track terminations.
 - `mpp` must be set correctly for your microscope. An incorrect value shifts the spatial scale of appearance crops and degrades accuracy.
 
@@ -283,7 +293,7 @@ These are set on the `CellTracker` object and control the post-processing decisi
 To evaluate on a test set and produce metrics:
 
 ```bash
-python -m tracking.eval
+python -m torch_tracking.eval
 ```
 
 This reads `~/.deepcell/tracking/test.zarr` and `~/.deepcell/tracking/test.json` and writes results to `eval_results.csv`. Reported metrics include:
@@ -295,7 +305,7 @@ This reads `~/.deepcell/tracking/test.zarr` and `~/.deepcell/tracking/test.json`
 To sweep over post-processing thresholds and find the best combination:
 
 ```bash
-python -m tracking.eval_sweep
+python -m torch_tracking.eval_sweep
 ```
 
 Results are saved to `metrics/postprocess_sweep.csv`.

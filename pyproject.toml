@@ -90,6 +90,16 @@ platforms = [
 [tool.setuptools.dynamic.version]
 attr = 'torch_tracking.__version__'
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "l0: pure functions, no model and no torch forward pass. Needs nothing.",
+    "l1: model structural contracts using randomly initialized weights. Needs torch only.",
+    "l2: end-to-end tracking on the synthetic fixture with the untrained checkpoint. Needs nothing beyond the repository.",
+    "l3: accuracy guardrails against real weights and the real dataset. Needs an HF_TOKEN and DynamicNuclearNet-tracking; skipped when absent.",
+]
+
 [tool.ruff]
 line-length = 110
 target-version="py310"
