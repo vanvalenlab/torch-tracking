@@ -39,10 +39,25 @@ context: |
   contributor to produce numbers they have no way to generate; say what evidence is missing
   and let review supply it.
 
-  Specify current behavior, not intended behavior. Where documentation and code disagree,
-  or two parts of the repository contradict each other, record the divergence explicitly
-  and assign it to a capability rather than fixing it inline. The divergence register in
-  openspec/DIVERGENCES.md is the running list.
+  Specify intended behavior. A capability spec states the behavior the system is meant to
+  have, not the behavior it happens to have today. Where documentation and code disagree,
+  or two parts of the repository contradict each other, the change that touches that area
+  rewrites the affected requirement and corrects the code together, in one change.
+
+  No fix lands unspecified. Correcting a divergence requires a written requirement
+  covering the corrected behavior; a change that repairs code without specifying it has
+  not finished. Where a fix cannot be made yet - because it is blocked, or because making
+  it alone would leave the system worse - say so in the requirement itself and name the
+  change that will complete it, rather than describing the defect as though it were
+  intended.
+
+  The divergence register in openspec/DIVERGENCES.md is the worklist. Its entries are
+  expected to reach Fixed; it is not a place findings accumulate indefinitely. Record new
+  divergences there as they are found, and close them as changes correct them.
+
+  Some requirements are pinned by characterization tests written under the earlier
+  describe-current-behavior stance. A change that fixes a pinned divergence updates the
+  requirement it pinned and deletes that characterization test in the same change.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

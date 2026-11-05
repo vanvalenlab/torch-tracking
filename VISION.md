@@ -112,9 +112,16 @@ that specification work inherits them.
 
 ## How the project is being developed
 
-The codebase is being specified capability by capability, describing current behavior first
-so that later changes have a meaningful baseline to diff against. Planning artifacts live
-under `openspec/`. Divergences found along the way — places where documentation and code
-disagree, or where two parts of the repository contradict each other — are recorded rather
-than silently fixed, and each is assigned to the capability that will specify the
-surrounding behavior.
+The codebase is being specified capability by capability, toward the behavior each
+capability is meant to have. Planning artifacts live under `openspec/`. Divergences found
+along the way — places where documentation and code disagree, or where two parts of the
+repository contradict each other — are entered in `openspec/DIVERGENCES.md` and tracked to
+closure: the change that specifies a capability also corrects the divergences assigned to
+it, and no correction lands without a written requirement covering it.
+
+The campaign began on a different footing, describing current behavior first so that later
+changes would have a baseline to diff against. That premise was retired once the register
+made clear how much of the recorded behavior was defective rather than merely undocumented,
+including one defect that invalidates the published checkpoint. Specs and tests written
+under the earlier stance are being rewritten as each capability's corrections land; some
+requirements still carry a marker naming the change that will replace or correct them.
