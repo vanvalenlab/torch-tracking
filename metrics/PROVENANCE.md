@@ -7,7 +7,7 @@ the claims rather than take them on faith.
 
 | File | What it holds | Reproducible? |
 | --- | --- | --- |
-| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access and the checkpoint below — regenerated 2026-11-05 |
+| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access and the checkpoint below — regenerated 2026-11-05 by `redesign-feature-extraction` |
 | `benchmarks.csv` | The TF Caliban tracking reference numbers | **No. Permanently irreproducible** — see below |
 
 Other CSVs here (`postprocess_sweep.csv`) remain ignored: they are derived, regenerable, and
@@ -32,25 +32,26 @@ Every number in both files measures *tracking only*, on masks supplied as input.
 
 ## `eval_results.csv`
 
-Regenerated 2026-11-05 by `correct-scale-convention` from a model retrained on corrected
-data. It **replaces wholesale** the figures this file held before; those are kept under
-"Superseded baseline" below only so that the movement can be explained.
+Regenerated 2026-11-05 by `redesign-feature-extraction` from a model retrained on data whose
+appearance crops are an aspect-preserving resize rather than a clipped fixed window. It
+**replaces** the figures `correct-scale-convention` produced earlier the same day, which are
+kept under "Superseded baselines" below so that the movement can be explained.
 
 | Field | Value |
 | --- | --- |
-| Produced by | `checkpoints/20261105-054354/best_model.pt` (local only) |
-| Checkpoint SHA256 | `f1e647dfe987b4366968cc99d373f5d9599b8b5c51d8ee269dc485badc565894` |
+| Produced by | `checkpoints/20261105-101052/best_model.pt` (local only) |
+| Checkpoint SHA256 | `e5f89e9b0bb12d2a66cad7b1784334438444076c1a6924ddc59fc1b45c3858b3` |
 | Published as | **Not yet published.** Weights go to `vanvalenlab/torch-tracking` only after the owner validates them and uploads manually. The HuggingFace filename and revision are added here by the owner after that upload |
 | Dataset | `DynamicNuclearNet-tracking` v1.0, `test` split (12 movies, up to 71 frames, 584×600). Evaluated from `~/.deepcell/tracking/test.zarr`, regenerated 2026-11-04 so that it carries per-movie `mpp` |
-| Training data | The `train` and `val` splits regenerated 2026-11-04 from the `.trks` archives (`train_proc.zarr`, `val_proc.zarr`), converted with the corrected scale rule `mpp/0.55` |
-| Training configuration | `checkpoints/20261105-054354/config.json` and `run_manifest.json`: RAdam, lr 1e-3, `reduce_on_plateau`, 50 epochs (run to completion, no early stopping), batch size 8, 2 layers, `crop_mode=fixed`, `crop_size=32`, `loss=wcce`, bfloat16, `distance_threshold=89` |
+| Training data | The `train` and `val` splits regenerated 2026-11-05 from the `.trks` archives (`train_proc.zarr`, `val_proc.zarr`). Movies are rescaled by `mpp/0.55`; each cell's appearance is its bounding box masked to the cell, normalized by its own non-zero pixels, padded to a square and resized to 32×32 — no cell is clipped. Centroids are in image coordinates, with no `+32` offset |
+| Training configuration | `checkpoints/20261105-101052/config.json` and `run_manifest.json`: RAdam, lr 1e-3, `reduce_on_plateau`, batch size 8, 2 layers, `crop_size=32`, `loss=wcce`, bfloat16, `distance_threshold=89`, 4 data workers. Identical to the previous retrain's configuration apart from the removed `crop_mode` key. **The 50-epoch schedule was stopped manually after epoch 39 (0-indexed)**, because validation loss had not improved for 16 epochs. The evaluated checkpoint is the best by validation loss: **epoch 23, val loss 0.0013**. Early stopping was disabled in the configuration, so this was a manual decision made after seeing the curve, not a rule fixed in advance |
 | Harness | `torch_tracking.eval.evaluate()`, invoked as `python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking --distance-threshold 89` |
 | Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=89`. Each movie's own `mpp` is read from the zarr and passed to its tracker |
 | Retuned parameter | `distance_threshold` 64 → **89 px**. Derived, not swept: it keeps the old physical reach (64 px at the old effective 0.768 µm/px = 49.2 µm = 89.4 px at 0.55 µm/px) |
 | Metric match threshold | `TrackingMetrics(..., threshold=0.8)` |
 | Frames per movie | Every non-empty frame, including each movie's last. `end_frame = count of non-empty frames`, used as an exclusive slice bound. The ground-truth lineage is the full `test.json`, so `aa_total` and `te_total` do not depend on which frames are evaluated |
-| Device | Evaluated on CPU (4 threads). Not re-checked on GPU for this checkpoint |
-| Verified at | Base commit `5adeac9` plus the uncommitted `correct-scale-convention` changes, 2026-11-05 |
+| Device | Evaluated on CPU (4 threads). Not re-checked on GPU for this checkpoint. Trained on one GPU (physical card 5) |
+| Verified at | Base commit `15ea776` plus the uncommitted `redesign-feature-extraction` changes, 2026-11-05 |
 | Verification environment | Python 3.14.3, torch 2.11.0+cu128, numpy 2.5.2, pandas 3.0.5, zarr 3.3.0, torch-geometric 2.8.0.post1 |
 
 ### Aggregate figures
@@ -59,21 +60,61 @@ Summed across all 12 movies (not an average of per-movie rates):
 
 | Metric | Value |
 | --- | --- |
-| Division precision | 0.9588 |
-| Division recall | 0.9477 |
-| **Division F1** | **0.9532** |
-| **Association accuracy (AA)** | **0.9934** |
-| **Target effectiveness (TE)** | **0.9946** |
-| Total ground-truth divisions | 178 (163 correct, 6 mismatched, 7 false positive, 9 missed) |
+| Division precision | 0.9699 |
+| Division recall | 0.9415 |
+| **Division F1** | **0.9555** |
+| **Association accuracy (AA)** | **0.9940** |
+| **Target effectiveness (TE)** | **0.9952** |
+| Total ground-truth divisions | 178 (161 correct, 7 mismatched, 5 false positive, 10 missed) |
 
 Against the `Caliban - GT` row of `benchmarks.csv` (0.9352 / 0.9781 / 0.9787), the figures
-above are higher on all three metrics. See the next section for how much of the movement is
-due to which change.
+above are higher on all three metrics.
 
-### What changed from the superseded baseline
+### What changed in `redesign-feature-extraction`
 
-The previous figures were **0.9451 / 0.9728 / 0.9747** (division F1 / AA / TE). The new
-ones differ because the *configuration* changed, not because the model regressed or
+One thing changed: the appearance input. The previous retrain (`correct-scale-convention`)
+clipped each cell to a fixed 32×32 window, which cut off 47.4% of test cells at the corrected
+scale; this one resizes each cell, whole and with its proportions kept, to 32×32. The
+per-cell normalization, the graph rule, the sampling extent, the scale rule, the
+configuration and the evaluation harness are unchanged. Morphologies, labels, resolutions
+and `track_length` in the processed zarrs are bit-identical to before.
+
+| Configuration | Division F1 | AA | TE | Division precision / recall |
+| --- | --- | --- | --- | --- |
+| Previous retrain (fixed crop), threshold 89 | 0.9532 | 0.9934 | 0.9946 | 0.9588 / 0.9477 |
+| **This file (resize), threshold 89** | **0.9555** | **0.9940** | **0.9952** | 0.9699 / 0.9415 |
+| Previous retrain (fixed crop), threshold 64 | 0.9529 | 0.9924 | 0.9937 | 0.9529 / 0.9529 |
+| This checkpoint (resize), threshold 64 | 0.9527 | 0.9930 | 0.9943 | 0.9641 / 0.9415 |
+| `Caliban - GT` reference | 0.9352 | 0.9781 | 0.9787 | — |
+
+The movement from the previous retrain, at threshold 89, in raw counts:
+
+| | Previous retrain | This file |
+| --- | --- | --- |
+| Association errors (of 48,562) | 322 | 293 |
+| Target-effectiveness errors (of 49,775) | 268 | 241 |
+| Correct divisions (of 178) | 163 | 161 |
+| False-positive / missed divisions | 7 / 9 | 5 / 10 |
+
+- **No headline metric regressed at either threshold.** At 89 all three rose; at 64 division
+  F1 is flat (-0.0002) and AA and TE rose by 0.0006.
+- **Association and target effectiveness moved in a consistent direction**, with roughly 9%
+  fewer errors of each kind. That is the more credible part of the movement.
+- **The division gain should not be read as real.** The new model identified two *fewer*
+  divisions correctly (161 against 163). Its F1 is higher only because it raised two fewer
+  false alarms, and its recall fell from 0.9477 to 0.9415. With 178 true divisions, a single
+  division is worth about 0.6 points of recall.
+- Dropping appearance's absolute size was the one risk named in advance, and division recall
+  is where a lost size cue would plausibly show. The two-division dip in correct divisions is
+  in that direction but is far inside what a single run can produce by chance.
+- The figures are from a single training run, stopped by hand at the best validation epoch.
+  No seed variation was measured, so differences of a few thousandths should not be read as
+  meaningful.
+
+### What changed from the original published baseline (`correct-scale-convention`)
+
+The original figures were **0.9451 / 0.9728 / 0.9747** (division F1 / AA / TE). The
+`correct-scale-convention` figures differ because the *configuration* changed, not because the model regressed or
 improved on a like-for-like basis. Four things changed at once:
 
 1. Training rescaled movies by the reciprocal of the inference convention (divergence 12).
@@ -92,7 +133,7 @@ the inherited `distance_threshold` of 64:
 | --- | --- | --- | --- |
 | Superseded baseline (old checkpoint, old data, threshold 64) | 0.9451 | 0.9728 | 0.9747 |
 | Retrained checkpoint, threshold 64 | 0.9529 | 0.9924 | 0.9937 |
-| Retrained checkpoint, threshold 89 (this file) | 0.9532 | 0.9934 | 0.9946 |
+| Retrained checkpoint, threshold 89 (`correct-scale-convention`, since superseded) | 0.9532 | 0.9934 | 0.9946 |
 | `Caliban - GT` reference | 0.9352 | 0.9781 | 0.9787 |
 
 - The step from the baseline to threshold 64 (+0.0078 / +0.0196 / +0.0190) is the combined
@@ -105,8 +146,17 @@ the inherited `distance_threshold` of 64:
 - The figures are from a single training run. No seed variation was measured, so
   differences of a few thousandths should not be read as meaningful.
 
-### Superseded baseline
+### Superseded baselines
 
+**`correct-scale-convention` (2026-11-05, replaced the same day).**
+`checkpoints/20261105-054354/best_model.pt` (SHA256
+`f1e647dfe987b4366968cc99d373f5d9599b8b5c51d8ee269dc485badc565894`), 50 epochs run to
+completion on fixed-crop appearances, evaluated at `distance_threshold=89`: division F1
+**0.9532**, AA **0.9934**, TE **0.9946** (division precision 0.9588, recall 0.9477; 163
+correct, 6 mismatched, 7 false positive, 9 missed of 178). Its per-movie results are
+recoverable from version control at commit `15ea776`.
+
+**The original published baseline.**
 `checkpoints/20260607-083350/best_model.pt` (SHA256
 `321d5a55ead5d03549be716f513d8abf469a74b6b50fec3b8a367b761e3d98d0`; also
 `torch-tracking_2026-07-30.pt` at HF revision `038f1e6e47f28f0cc11f106a14c7e8bae9d5896c`),

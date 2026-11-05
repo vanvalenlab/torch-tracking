@@ -23,6 +23,7 @@ import json
 import os
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -1466,54 +1467,40 @@ def test_morphology_is_area_perimeter_eccentricity_in_that_order():
 
 
 def test_appearance_crop_is_masked_to_its_own_cell():
-    """A neighbour overlapping the crop window contributes nothing."""
+    """A neighbour inside the cell's bounding box contributes nothing."""
     from torch_tracking.utils import get_image_features
 
-    # Two adjacent cells, close enough that cell 1's 32x32 window covers cell 2.
-    y = _mask_with_cells(
-        [[(1, (slice(28, 36), slice(28, 36))), (2, (slice(28, 36), slice(38, 46)))]]
-    )[0]
+    # Cell 1 is a ring whose hole is filled by cell 2, so cell 2 lies wholly inside
+    # cell 1's bounding box - the case where an unmasked crop would show it.
+    y = np.zeros((64, 64, 1), dtype=np.int32)
+    y[20:40, 20:40, 0] = 1
+    y[28:34, 28:34, 0] = 2
+    texture = np.random.default_rng(1).random((64, 64, 1)).astype(np.float32) + 0.5
 
-    X = np.zeros((64, 64, 1), dtype=np.float32)
-    X[y[..., 0] == 1] = 1.0
-    X[y[..., 0] == 2] = 50.0
+    quiet = np.where(y == 2, 0.0, texture).astype(np.float32)   # neighbour is dark
+    loud = np.where(y == 2, 50.0, texture).astype(np.float32)   # neighbour is very bright
 
-    # Normalization enabled: the default, and what CellTracker uses.
-    masked = get_image_features(X, y, norm=True)["appearances"][0]
-    assert not np.isclose(masked, 50.0).any(), (
-        "the neighbour's pixels leaked into this cell's appearance crop"
+    ring_quiet = get_image_features(quiet, y)["appearances"][0]
+    ring_loud = get_image_features(loud, y)["appearances"][0]
+
+    np.testing.assert_array_equal(
+        ring_quiet, ring_loud,
+        err_msg="the neighbour's pixels leaked into this cell's appearance crop",
     )
 
 
-def test_disabling_normalization_also_disables_masking_in_fixed_mode():
-    """The masking step shares the `norm` flag in fixed mode, but not in resize mode.
-
-    Not a divergence - the docstring says `norm` governs both removing non-cell pixels
-    and normalizing - but the asymmetry between the two crop modes is a trap worth
-    pinning, since nothing at the call site hints at it.
-    """
+def test_masking_cannot_be_switched_off():
+    """Masking is unconditional, and no flag selects a crop mode or disables it."""
     from torch_tracking.utils import get_image_features
 
-    y = _mask_with_cells(
-        [[(1, (slice(28, 36), slice(28, 36))), (2, (slice(28, 36), slice(38, 46)))]]
-    )[0]
-    X = np.zeros((64, 64, 1), dtype=np.float32)
-    X[y[..., 0] == 1] = 1.0
-    X[y[..., 0] == 2] = 50.0
+    y = np.zeros((64, 64, 1), dtype=np.int32)
+    y[20:40, 20:40, 0] = 1
+    y[28:34, 28:34, 0] = 2
+    X = np.where(y == 2, 50.0, 1.0).astype(np.float32)
 
-    leaks = lambda mode, norm: bool(
-        np.isclose(
-            get_image_features(X, y, crop_mode=mode, norm=norm)["appearances"][0], 50.0
-        ).any()
-    )
-
-    assert leaks("fixed", False), (
-        "fixed-crop mode masks inside `if norm:`, so disabling normalization leaves a "
-        "neighbour visible in the crop"
-    )
-    assert not leaks("resize", False), "resize mode masks unconditionally"
-    assert not leaks("fixed", True)
-    assert not leaks("resize", True)
+    for removed in ({"crop_mode": "fixed"}, {"crop_mode": "resize"}, {"norm": False}, {"norm": True}):
+        with pytest.raises(TypeError):
+            get_image_features(X, y, **removed)
 
 
 def test_feature_arrays_are_padded_to_the_busiest_frame():
@@ -1530,63 +1517,149 @@ def test_feature_arrays_are_padded_to_the_busiest_frame():
     assert get_max_cells(y) == 5, "capacity comes from the busiest frame"
 
 
-# --- Pending-fix: retained until correct-scale-convention ------------------------------
+# --- Appearance: an aspect-preserving resize, per-cell normalized, in image coordinates -
 
 
-def test_large_cell_is_clipped_by_the_fixed_crop():
-    """Pending-fix: the fixed 32x32 window clips rather than resizing."""
+def _single_cell(rows, cols, values=1.0, shape=(100, 100)):
+    """One labelled cell over a zero background; returns `(X, y)` ready for extraction.
+
+    ``values`` may be an array broadcastable to the cell. Note that a cell of one uniform
+    value normalizes to all zeros (its spread is zero), so fixtures that need a visible
+    crop give the cell some texture.
+    """
+    y = np.zeros((*shape, 1), dtype=np.int32)
+    y[rows, cols, 0] = 1
+    X = np.zeros((*shape, 1), dtype=np.float32)
+    X[rows, cols, 0] = values
+    return X, y
+
+
+def _striped_cell(rows, cols, width=10):
+    """A cell with coarse alternating stripes of intensity 1 and 2 along its columns."""
+    n_rows, n_cols = rows.stop - rows.start, cols.stop - cols.start
+    stripes = 1.0 + ((np.arange(n_cols) // width) % 2)
+    return _single_cell(rows, cols, np.broadcast_to(stripes, (n_rows, n_cols)))
+
+
+def test_large_cell_is_resized_not_clipped():
+    """Requirement: Appearance is an aspect-preserving resize to a fixed size."""
     from torch_tracking.utils import get_image_features
 
-    y = _mask_with_cells([[(1, (slice(2, 62), slice(2, 62)))]])[0]
-    X = np.ones((64, 64, 1), dtype=np.float32)
+    # A 60x60 cell, far larger than the 32x32 crop, with a marker in one corner. A window
+    # cut from the cell's centre would never see it.
+    X, y = _single_cell(slice(10, 70), slice(10, 70))
+    X[10:16, 10:16, 0] = 9.0
 
-    features = get_image_features(X, y, norm=False)
+    crop = get_image_features(X, y)["appearances"][0, ..., 0]
 
-    assert features["appearances"][0].shape[:2] == (32, 32), (
-        "A cell larger than the window is clipped to the central 32x32 rather than "
-        "resized. This is retained ON PURPOSE until correct-scale-convention replaces "
-        "the fixed crop with an aspect-preserving resize. If this changed, that change "
-        "has landed - update the movie-ingestion spec and delete this test."
+    assert crop.shape == (32, 32)
+    assert crop[:5, :5].max() > 5.0, "the cell's periphery was discarded rather than kept"
+    assert (crop != 0).all(), "a cell filling its bounding box should fill the whole crop"
+
+
+def test_small_cell_is_magnified_not_padded():
+    from torch_tracking.utils import get_image_features
+
+    X, y = _striped_cell(slice(40, 48), slice(40, 48), width=4)
+
+    crop = get_image_features(X, y)["appearances"][0, ..., 0]
+
+    assert (crop != 0).mean() > 0.99, "an 8x8 cell should be enlarged to fill the crop"
+
+
+def test_elongated_cell_keeps_its_proportions():
+    from torch_tracking.utils import get_image_features
+
+    X, y = _striped_cell(slice(10, 30), slice(10, 70))  # 20 x 60, a 3:1 cell
+
+    crop = get_image_features(X, y)["appearances"][0, ..., 0]
+
+    occupied = np.abs(crop) > 0.5
+    rows = occupied.any(axis=1).sum()
+    cols = occupied.any(axis=0).sum()
+    assert 2.7 <= cols / rows <= 3.5, (
+        f"a 3:1 cell came out {cols / rows:.2f}:1; it was stretched rather than padded to a square"
     )
 
 
-def test_centroids_are_reported_in_padded_coordinates():
-    """Divergence 11, retained: centroids carry a +appearance_dim offset."""
+def test_cells_of_the_same_shape_and_different_size_have_the_same_appearance():
+    """Appearance carries texture, shape and contrast - not size."""
+    from torch_tracking.utils import get_image_features
+
+    def ramp_cell(side):
+        # The same brightness gradient, laid across a cell of the given size.
+        ramp = np.linspace(1.0, 2.0, side, dtype=np.float32)[None, :]
+        return get_image_features(*_single_cell(slice(10, 10 + side), slice(10, 10 + side), ramp))
+
+    small, large = ramp_cell(10), ramp_cell(20)
+
+    np.testing.assert_allclose(small["appearances"], large["appearances"], atol=0.15)
+    assert large["morphologies"][0, 0] == 4 * small["morphologies"][0, 0], (
+        "size must still reach the model, through morphology"
+    )
+
+
+def test_crop_is_normalized_by_its_own_non_zero_pixels():
+    """Requirement: Appearance is normalized by the cell's own pixels."""
+    from torch_tracking.utils import get_image_features
+
+    texture = np.random.default_rng(0).random((32, 32)).astype(np.float32) + 0.5
+    X, y = _single_cell(slice(10, 42), slice(10, 42), texture)  # 32x32: needs no resampling
+
+    crop = get_image_features(X, y)["appearances"][0, ..., 0]
+
+    assert crop.mean() == pytest.approx(0.0, abs=1e-4)
+    assert crop.std() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_appearance_does_not_depend_on_overall_brightness():
+    """Per-cell normalization removes a cell's overall brightness scale."""
+    from torch_tracking.utils import get_image_features
+
+    texture = np.random.default_rng(0).random((20, 20)).astype(np.float32) + 0.5
+    dim = get_image_features(*_single_cell(slice(10, 30), slice(10, 30), texture))
+    bright = get_image_features(*_single_cell(slice(10, 30), slice(10, 30), 3.0 * texture))
+
+    np.testing.assert_allclose(dim["appearances"], bright["appearances"], atol=2e-3)
+
+
+def test_cell_on_all_zero_image_data_is_all_zero_and_silent():
+    """Divergence 14, fixed: the guard now tests for an empty index, so nothing warns."""
+    from torch_tracking.utils import get_image_features
+
+    X, y = _single_cell(slice(10, 30), slice(10, 30))
+    X[:] = 0.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any RuntimeWarning, e.g. a mean of nothing, fails
+        crop = get_image_features(X, y)["appearances"][0]
+
+    assert (crop == 0).all()
+    assert not np.isnan(crop).any()
+
+
+def test_centroids_are_reported_in_image_coordinates():
+    """Requirement: Centroids are reported in image coordinates."""
     from torch_tracking.utils import get_image_features
 
     y = np.zeros((64, 64, 1), dtype=np.int32)
     y[10:30, 10:30, 0] = 1  # centred at image coordinate (19.5, 19.5)
     X = np.ones((64, 64, 1), dtype=np.float32)
 
-    features = get_image_features(X, y, appearance_dim=32)
-    row, col = features["centroids"][0]
+    row, col = get_image_features(X, y)["centroids"][0]
 
-    assert (row, col) == pytest.approx((51.5, 51.5)), (
-        "Divergence 11: centroids are reported in padded coordinates, offset by "
-        "+appearance_dim (32 px) on both axes. This is retained ON PURPOSE until "
-        "correct-scale-convention replaces the padding step that causes it. If this "
-        "now returns (19.5, 19.5), that change has landed - update the movie-ingestion "
-        "spec and delete this test."
-    )
+    assert (row, col) == pytest.approx((19.5, 19.5))
 
 
-def test_all_zero_appearance_crop_stays_zero_and_warns():
-    """Divergence 14, retained: the guard tests tuple arity, not emptiness."""
+def test_resizing_the_same_cell_twice_is_bit_identical():
+    """Requirement: Ingestion is deterministic, including the per-cell resampling."""
     from torch_tracking.utils import get_image_features
 
-    y = np.zeros((64, 64, 1), dtype=np.int32)
-    y[10:30, 10:30, 0] = 1
-    X = np.zeros((64, 64, 1), dtype=np.float32)  # the cell sits on all-zero image data
+    rng = np.random.default_rng(0)
+    texture = rng.random((47, 30)).astype(np.float32) + 0.5
+    X, y = _single_cell(slice(10, 57), slice(10, 40), texture)
 
-    with pytest.warns(RuntimeWarning, match="Mean of empty slice"):
-        features = get_image_features(X, y, norm=True)
+    first = get_image_features(X, y)["appearances"]
+    second = get_image_features(X.copy(), y.copy())["appearances"]
 
-    crop = features["appearances"][0]
-    assert not np.isnan(crop).any(), (
-        "Divergence 14: `if len(idx) > 0` tests the arity of an index tuple rather "
-        "than whether it is empty, so it never guards anything; the crop escapes "
-        "becoming NaN only because assigning through an empty index is a no-op. "
-        "Retained ON PURPOSE until correct-scale-convention removes the fixed-crop "
-        "branch - then update the movie-ingestion spec and delete this test."
-    )
-    assert (crop == 0).all()
+    assert first.tobytes() == second.tobytes()

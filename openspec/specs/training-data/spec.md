@@ -156,14 +156,19 @@ specified here as current behavior rather than as intended behavior.
 
 The dataloader SHALL compute each sample's spatial adjacency from that sample's centroids
 when the sample is drawn, rather than reading it from the processed zarr. Conversion
-computes a spatial adjacency and a validity mask internally and discards both; this is
-recorded as divergence 15.
+SHALL NOT compute any array it does not return. This narrows divergence 15: the discarded
+validity mask is deleted by this change, and the discarded spatial adjacency remains.
 
 #### Scenario: A drawn sample carries adjacency the zarr does not hold
 
 - **WHEN** a sample is drawn from the dataloader
 - **THEN** its `adj_matrices` SHALL be derived from its centroids
 - **AND** no adjacency SHALL have been read from the processed zarr
+
+#### Scenario: Conversion computes no discarded validity mask
+
+- **WHEN** a split is converted
+- **THEN** conversion SHALL NOT build a per-frame validity mask that it does not return
 
 ### Requirement: Samples are fixed-length windows slid across each movie
 
@@ -255,23 +260,31 @@ that is shuffled and augmented cannot produce a stable evaluation.
 - **WHEN** a test dataloader is constructed without overriding augmentation
 - **THEN** it SHALL shuffle and SHALL augment
 
-### Requirement: Appearance is a fixed-size crop that clips large cells
+### Requirement: Appearance is an aspect-preserving resize to a fixed size
 
-**Superseded-pending:** `redesign-feature-extraction` replaces this; no characterization
-test is written for it. Conversion SHALL extract each cell's appearance as a fixed 32×32
-pixel window centred on its centroid, taken from a zero-padded image, masked to that
-cell's label and normalized by the mean and standard deviation of its non-zero pixels. A
-cell larger than the window is clipped.
+Conversion SHALL extract each cell's appearance by taking its bounding box, padding that
+box to a square, masking it to that cell's label, and resizing the result to 32×32
+pixels. No cell SHALL be clipped and no aspect ratio SHALL be altered. Conversion SHALL
+normalize the crop by the mean and standard deviation of the cell's own non-zero pixels.
+This is the same rule inference applies, so a cell presents the same appearance in
+training as at inference.
 
-#### Scenario: A large cell is clipped rather than resized
+#### Scenario: A large cell is resized rather than clipped
 
 - **WHEN** a cell's extent exceeds 32 pixels on either axis
-- **THEN** its appearance SHALL contain only the central 32×32 pixels of the cell
+- **THEN** its stored appearance SHALL contain the whole cell, reduced to fit
 
-#### Scenario: Centroids are reported in padded coordinates
+#### Scenario: Centroids are stored in image coordinates
 
-- **WHEN** appearance is extracted in this mode
-- **THEN** the reported centroids SHALL be offset by 32 pixels on both axes relative to image coordinates
+- **WHEN** appearance is extracted during conversion
+- **THEN** the stored centroids SHALL carry no offset relative to the rescaled image
+
+#### Scenario: Conversion and inference extract appearance identically
+
+- **WHEN** the same frame and mask are passed through conversion and through the
+  inference feature path
+- **THEN** the resulting appearance crops SHALL be identical
+- **AND** the resulting centroids SHALL be identical
 
 ### Requirement: Per-movie resolution comes from an undocumented sidecar
 
@@ -292,25 +305,14 @@ to conversion alone because the resolutions are persisted into both zarrs.
 - **WHEN** a converted split is used for training or evaluation
 - **THEN** `data-source.npz` SHALL NOT be read
 
-### Requirement: Crop mode is configurable in name only
-
-**Superseded-pending:** `redesign-feature-extraction` replaces this; no characterization
-test is written for it. The training configuration SHALL record a `crop_mode` value and
-SHALL NOT act on it, because appearance crops are fixed at conversion time. Crop size, by
-contrast, is consumed when the model is built, so a crop size disagreeing with the stored
-appearances is a silent misconfiguration. This is divergence 18.
-
-#### Scenario: Changing the configured crop mode has no effect
-
-- **WHEN** a training run sets `crop_mode` to a different value
-- **THEN** the appearance data SHALL be unchanged, because it was baked into the processed zarr
-
 ### Requirement: The conversion output directory parameter is unusable
 
-**Superseded-pending:** `redesign-feature-extraction` replaces this; no characterization
-test is written for it. Conversion SHALL accept an output-directory parameter and SHALL
-raise `NameError` when any value other than `None` is supplied, because the names it
-needs are bound only on the default branch. This is divergence 19.
+**Superseded-pending:** a later change replaces this; no characterization test is written
+for it. Conversion SHALL accept an output-directory parameter and SHALL raise `NameError`
+when any value other than `None` is supplied, because the names it needs are bound only
+on the default branch. This is divergence 19. It was previously attributed to
+`redesign-feature-extraction`, which does not touch argument binding; the attribution is
+corrected here and the fix is not performed.
 
 #### Scenario: Supplying an output directory fails
 

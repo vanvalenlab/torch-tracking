@@ -24,7 +24,6 @@ class TrainingConfig:
     val_loader: torch.utils.data.DataLoader = None
     optimizer: str = 'radam'
     scheduler: str = 'reduce_on_plateau'
-    crop_mode: str = 'fixed'
     device: str = 'cuda'
     checkpoint_dir: str = './checkpoints/'
     log_dir: str = './logs/'
@@ -65,7 +64,6 @@ class TrainingConfig:
         "num_workers": self.num_workers,
         "clipnorm": self.clipnorm,
         "step_size": self.step_size,
-        "crop_mode": self.crop_mode,
         "patience": self.patience,
         "log_and_save": self.log_and_save,
         "enable_early_stopping": self.enable_early_stopping,

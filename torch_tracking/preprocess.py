@@ -76,7 +76,7 @@ def get_temporal_adjacency(lineage, max_frames, max_cells):
 
 
 def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1), 
-                 crop_mode='fixed', clahe=False, distance_threshold=DISTANCE_THRESHOLD, mpps=None):
+                 clahe=False, distance_threshold=DISTANCE_THRESHOLD, mpps=None):
     
     B, T, H, W, C = X.shape
 
@@ -93,7 +93,6 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
         (B, T-1, max_tracks, max_tracks), 
         dtype='float32'
     )
-    mask = np.zeros(batch_shape + (max_tracks,), dtype='bool')
     track_length = np.zeros((B, max_tracks, 2), dtype='int32')
 
     # Histogram normalization on image
@@ -114,8 +113,7 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
             frame_features = get_image_features(
                 X_batch[frame], 
                 y_batch[frame],
-                appearance_dim=appearance_shape[0],
-                crop_mode=crop_mode
+                appearance_dim=appearance_shape[0]
             )
             
             track_ids = frame_features['labels'] - 1  # Convert to 0-indexed
@@ -124,10 +122,6 @@ def get_features(X, y, lineages, max_cells, appearance_shape=(32, 32, 1),
             centroids[batch, frame, track_ids] = frame_features['centroids']
             morphologies[batch, frame, track_ids] = frame_features['morphologies']
             appearances[batch, frame, track_ids] = frame_features['appearances']
-            
-            # Update mask for valid cells
-            if track_ids.size > 0:
-                mask[batch, frame, :track_ids[-1] + 1, :track_ids[-1] + 1] = True
             
             # Compute spatial adjacency matrix (distance-based)
             cent = centroids[batch, frame]
@@ -253,7 +247,7 @@ def convert_trk_to_zarr(filename, out_dir=None, track_length=8):
             max_cells = curr_m
 
     # Compute features before writing anything, so a failure here leaves no stale output.
-    features = get_features(X, y, lineages, max_cells, crop_mode='fixed', mpps=mpps)
+    features = get_features(X, y, lineages, max_cells, mpps=mpps)
 
     with open(os.path.join(file_dir, split) + '.json', 'w') as file:
         json.dump(lineages, file)

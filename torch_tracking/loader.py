@@ -345,7 +345,6 @@ if __name__ == '__main__':
         "num_workers": 8,
         "clipnorm": 0.001,
         "step_size": 5,
-        "crop_mode": "resize",
         "patience": 5,
         "log_and_save": True,
         "enable_early_stopping": False,

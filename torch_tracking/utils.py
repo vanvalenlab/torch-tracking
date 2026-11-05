@@ -440,29 +440,32 @@ def get_max_cells(y):
             max_cells = n_cells
     return max_cells
 
-def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
+def get_image_features(X, y, appearance_dim=32):
     """Return features for every object in the array.
+
+    Appearance is what a cell looks like - its texture, shape and contrast - and
+    deliberately not how big it is. Size is carried by the morphology vector, which is
+    measured after the frame has been rescaled to the model resolution. Each cell's
+    bounding box is therefore masked to that cell's own label (so neighbours do not leak
+    in), normalized by the mean and standard deviation of its own non-zero pixels,
+    padded to a square about the cell (so its proportions are kept), and resized to
+    ``appearance_dim`` x ``appearance_dim``. Nothing is clipped and nothing is stretched.
+
+    Normalizing before the resize means the statistics come from the cell's real pixels
+    rather than from interpolated ones. A cell with no non-zero pixels is left as zeros.
+    Centroids are in image coordinates, with no offset.
 
     Args:
         X (np.array): a 3D numpy array of raw data of shape (x, y, c).
         y (np.array): a 3D numpy array of integer labels of shape (x, y, 1).
-        appearance_dim (int): The resized shape of the appearance feature.
-        crop_mode (str): Whether to do a fixed crop or to crop and resize
-            to create the appearance features
-        norm (bool): Whether to remove non cell features and normalize the
-            foreground pixels by zero-meaning and dividing by the standard
-            deviation. Applies to fixed crop mode only.
+        appearance_dim (int): The side length of the square appearance feature.
 
     Returns:
         dict: A dictionary of feature names to np.arrays of shape
             (n, c) or (n, x, y, c) where n is the number of objects.
     """
-    # X must be float32 for the resize norm option to work correctly
     X = X.astype('float32')
     y = y.astype('int32')
-
-    if crop_mode not in ['resize', 'fixed']:
-        raise ValueError('crop_mode must be either resize or fixed')
 
     appearance_dim = int(appearance_dim)
 
@@ -480,72 +483,42 @@ def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
     appearances = np.zeros((num_labels, appearance_dim,
                             appearance_dim, X.shape[-1]), dtype='float32')
 
-    if crop_mode == 'fixed':
-        # Zero-pad the X array for fixed crop mode
-        pad_width = ((appearance_dim, appearance_dim),
-                     (appearance_dim, appearance_dim),
-                     (0, 0))
-        X_padded = np.pad(X, pad_width=pad_width)
-        y_padded = np.pad(y, pad_width=pad_width)
+    for i, prop in enumerate(regionprops(y[..., 0], cache=False)):
 
-        props = regionprops(y_padded[..., 0], cache=False)
-
-    # iterate over all objects in y
-    if crop_mode == 'resize':
-        props = regionprops(y[..., 0], cache=False)
-
-    for i, prop in enumerate(props):
-
-        # Get label
         labels[i] = prop.label
-
-        # Get centroid
-        centroid = np.array(prop.centroid)
-        centroids[i] = centroid
-
-        # Get morphology
-        morphology = np.array([
+        centroids[i] = np.array(prop.centroid)
+        morphologies[i] = np.array([
             prop.area,
             prop.perimeter,
             prop.eccentricity
         ])
-        morphologies[i] = morphology
 
-        if crop_mode == 'resize':
-            # Get appearance
-            minr, minc, maxr, maxc = prop.bbox
-            appearance = np.copy(X[minr:maxr, minc:maxc, :])
-            resize_shape = (appearance_dim, appearance_dim)
+        # Crop to the bounding box and keep only this cell's own pixels.
+        minr, minc, maxr, maxc = prop.bbox
+        app = X[minr:maxr, minc:maxc, :] * (y[minr:maxr, minc:maxc, :] == prop.label)
 
-            label = np.copy(y[minr:maxr, minc:maxc])
+        # Zero-mean, unit-spread over the cell's own non-zero pixels. The guard tests
+        # the size of the index, not the arity of the index tuple (divergence 14): an
+        # all-zero cell has nothing to normalize and stays zero, without a warning.
+        idx = np.nonzero(app)
+        if idx[0].size > 0:
+            masked_app = app[idx]
+            app[idx] = (masked_app - np.mean(masked_app)) / (np.std(masked_app) + 1e-4)
 
-            appearance = appearance * (label == prop.label)
-            appearances[i] = resize(appearance, resize_shape)
+        # Pad the shorter side with background so the box is square about the cell.
+        # Resizing a non-square box to a square would stretch the cell.
+        height, width = app.shape[:2]
+        side = max(height, width)
+        pad_r, pad_c = side - height, side - width
+        app = np.pad(app, ((pad_r // 2, pad_r - pad_r // 2),
+                           (pad_c // 2, pad_c - pad_c // 2),
+                           (0, 0)))
 
-        if crop_mode == 'fixed':
-            cent = np.array(prop.centroid)
-            delta = appearance_dim // 2
-            minr = int(cent[0]) - delta
-            maxr = int(cent[0]) + delta
-            minc = int(cent[1]) - delta
-            maxc = int(cent[1]) + delta
-
-            app = np.copy(X_padded[minr:maxr, minc:maxc, :])
-            label = np.copy(y_padded[minr:maxr, minc:maxc])
-
-            if norm:
-                # Use label as a mask to zero out non-label information
-                app = app * (label == prop.label)
-                idx = np.nonzero(app)
-
-                # Check data and normalize
-                if len(idx) > 0:
-                    masked_app = app[idx]
-                    mean = np.mean(masked_app)
-                    std = np.std(masked_app)
-                    app[idx] = (masked_app - mean) / (std + 1e-4)
-
-            appearances[i] = app
+        if side == 1:
+            # A single-pixel cell: the resize helper squeezes it to a scalar.
+            appearances[i] = np.broadcast_to(app, appearances[i].shape)
+        else:
+            appearances[i] = resize(app, (appearance_dim, appearance_dim))
 
     return {
         'appearances': appearances,
