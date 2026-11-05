@@ -147,61 +147,6 @@ the package. No entry point SHALL carry its own copy of that rule.
 - **WHEN** the parameter sweep and the single-checkpoint harness evaluate the same movie
 - **THEN** both SHALL evaluate the same frames
 
-### Requirement: Evaluation reproduces the recorded baseline exactly
-
-Evaluating the baseline checkpoint against the `DynamicNuclearNet-tracking` test split with
-the parameters recorded in `metrics/PROVENANCE.md` SHALL reproduce `metrics/eval_results.csv`
-exactly, and SHALL report pooled figures of 0.9451, 0.9728 and 0.9747. This fixes the
-refactor, not the baseline's validity: those figures are known to be the product of two
-compensating defects.
-
-#### Scenario: The refactored harness reproduces the tracked CSV
-
-- **WHEN** the baseline checkpoint is evaluated with the recorded parameters
-- **THEN** the per-movie results SHALL equal the tracked `metrics/eval_results.csv`
-
-#### Scenario: Reproduction is not an endorsement
-
-- **WHEN** a reader consults these figures as evidence of accuracy
-- **THEN** the specification SHALL direct them to the divergences that produced them,
-  rather than presenting the figures as a validated baseline
-
-### Requirement: The final non-empty frame of each movie is excluded
-
-**Pending-fix:** `correct-scale-convention` removes this. Evaluation SHALL truncate each
-movie to one frame fewer than its count of non-empty frames, excluding the final non-empty
-frame and every cell in it. This is divergence 25 and is suspected incorrect. It is
-retained only because changing the evaluated extent would move the figures and forfeit the
-reproduction gate above.
-
-#### Scenario: A movie's last labelled frame is not evaluated
-
-- **WHEN** a movie holds 71 non-empty frames
-- **THEN** evaluation SHALL cover frames 0 through 69
-- **AND** frame 70 SHALL contribute to no metric
-
-#### Scenario: The exclusion is not negligible
-
-- **WHEN** the twelve-movie test split is evaluated
-- **THEN** 920 cell-instances SHALL lie in excluded frames
-
-### Requirement: Inference resolution is fixed rather than read from the movie
-
-**Pending-fix:** `correct-scale-convention` removes this. Evaluation SHALL construct the
-tracker without supplying a per-movie resolution, so every movie is tracked at the
-tracker's default of 0.55 µm/px regardless of its declared resolution. This is divergences
-12 and 28, retained to preserve the reproduction gate.
-
-#### Scenario: A coarser movie is tracked as though it were at the reference resolution
-
-- **WHEN** a movie declared at 0.65 µm/px is evaluated
-- **THEN** its scale factor SHALL be 1.0 and no rescaling SHALL occur
-
-#### Scenario: Most of the evaluation set is affected
-
-- **WHEN** the test split is evaluated
-- **THEN** ten of its twelve movies SHALL be tracked at a resolution other than the one they declare
-
 ### Requirement: The target-effectiveness column keeps its published name
 
 The per-movie CSV SHALL retain the column name `te_accuracy`. Documentation SHALL describe
@@ -218,3 +163,75 @@ break consumers of the published baseline.
 
 - **WHEN** documentation describes that column
 - **THEN** it SHALL identify the quantity as target effectiveness, not track-end accuracy
+
+### Requirement: Evaluation covers every non-empty frame
+
+Evaluation SHALL cover every non-empty frame of each movie, including the final one. The
+extent rule SHALL be derived once and shared with the training sampler, so evaluation and
+training agree on which frames a movie has.
+
+#### Scenario: A movie's last labelled frame is evaluated
+
+- **WHEN** a movie holds 71 non-empty frames
+- **THEN** evaluation SHALL cover frames 0 through 70
+
+#### Scenario: Previously excluded cells are measured
+
+- **WHEN** the twelve-movie test split is evaluated
+- **THEN** the 920 cell-instances formerly lying in excluded frames SHALL contribute to the metrics
+
+#### Scenario: Empty frames stay excluded
+
+- **WHEN** a movie's trailing frames contain no cells
+- **THEN** those frames SHALL contribute to no metric
+
+### Requirement: Inference resolution is read from the movie
+
+Evaluation SHALL construct the tracker with the resolution each movie declares, read from
+the split's zarr, so every movie is rescaled by `mpp / MODEL_MPP`. No movie SHALL be
+tracked at a resolution other than the one it declares.
+
+#### Scenario: A coarser movie is rescaled
+
+- **WHEN** a movie declared at 0.65 µm/px is evaluated, with `MODEL_MPP` of 0.55 µm
+- **THEN** its scale factor SHALL be `0.65 / 0.55`
+
+#### Scenario: A movie at the reference resolution is untouched
+
+- **WHEN** a movie declared at `MODEL_MPP` is evaluated
+- **THEN** its scale factor SHALL be 1.0 and no rescaling SHALL occur
+
+#### Scenario: The declared resolution is required
+
+- **WHEN** a split's zarr holds no `mpp` array
+- **THEN** evaluation SHALL fail rather than default to the reference resolution
+
+### Requirement: Accuracy is reported against the external reference, not the superseded baseline
+
+Evaluation of the corrected pipeline SHALL be reported against the "Caliban - GT" row of
+`metrics/benchmarks.csv`. Figures from the superseded baseline SHALL be reported as moved
+rather than as a regression or an improvement, because they measured a configuration built
+from two compensating defects that no longer exists.
+
+#### Scenario: Parity is measured against the external reference
+
+- **WHEN** the corrected pipeline's division F1, association accuracy and target effectiveness are reported
+- **THEN** they SHALL be compared against the "Caliban - GT" row
+- **AND** SHALL NOT be compared against the "Caliban - Caliban" row
+
+#### Scenario: The old figures are not treated as a standard
+
+- **WHEN** the new figures differ from 0.9451, 0.9728 and 0.9747
+- **THEN** the difference SHALL be reported as a change of configuration
+- **AND** SHALL NOT be characterized as a regression against a validated baseline
+
+#### Scenario: The threshold's contribution is separable
+
+- **WHEN** the corrected pipeline is evaluated
+- **THEN** figures SHALL be reported both at the inherited `distance_threshold` and at the retuned value
+- **AND** a reader SHALL be able to distinguish the scale correction's effect from the retune's
+
+#### Scenario: Provenance is regenerated
+
+- **WHEN** new figures are recorded
+- **THEN** `metrics/PROVENANCE.md` SHALL record the new checkpoint revision and hash, dataset revision, parameters, match threshold, and environment and dependency versions

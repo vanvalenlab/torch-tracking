@@ -1,14 +1,16 @@
 """L3 - accuracy guardrails. Needs BOTH gated assets: HF_TOKEN and the dataset.
 
-This is the only layer that asserts on accuracy, and it asserts thresholds rather than
-exact values, because retraining legitimately moves these numbers. The recorded baseline
-and its provenance are in metrics/PROVENANCE.md.
+This layer reports accuracy against the external reference rather than asserting it
+against any recorded figure, because retraining legitimately moves these numbers. What
+produced the current figures is in metrics/PROVENANCE.md.
 
 It does not run in CI: trained weights are gated on HuggingFace, and there is currently
 no route for a new user to obtain DynamicNuclearNet-tracking at all (doc/model_access.md).
 Both fixtures skip rather than fail, so an ordinary `pytest` run is green without them.
 
-The reproduction gate below arrives with `make-eval-harness-reproducible`.
+The weights these tests use must be the retrained checkpoint. The `pinned_weights` fixture
+in conftest.py is the one place the revision lives; the superseded checkpoint was trained
+under the old scale convention and must not be evaluated with the corrected pipeline.
 """
 
 import pytest
@@ -23,99 +25,118 @@ def test_gated_assets_available(pinned_weights, dataset_dir):
 
 
 # ======================================================================================
-# tracking-metrics: the reproduction gate.
+# tracking-metrics: accuracy against the external reference.
 #
-# This is the requirement that justifies make-eval-harness-reproducible, and the one CI
-# cannot run. A green credential-free suite is NOT evidence that this passed.
+# Nothing here is compared against the superseded baseline. Those figures measured a
+# configuration built from two compensating defects that no longer exists, so a delta
+# against them is arithmetic, not evidence. CI cannot run these: a green credential-free
+# suite is NOT evidence that they passed.
 # ======================================================================================
 
-#: The recorded baseline. metrics/PROVENANCE.md records the checkpoint, dataset,
-#: parameters and match threshold behind these.
-BASELINE_POOLED = {
-    "division_f1": 0.9451,
-    "aa_accuracy": 0.9728,
-    "te_accuracy": 0.9747,
-}
+CONTRACT_METRICS = ("division_f1", "aa_accuracy", "te_accuracy")
 
 
-def test_harness_reproduces_the_recorded_baseline_exactly(
-    pinned_weights, dataset_dir, tmp_path
-):
-    """The refactored harness must reproduce metrics/eval_results.csv exactly.
-
-    This fixes the refactor, not the baseline's validity. Those figures are known to be
-    the product of two compensating defects - training rescales by `0.55/mpp` while this
-    harness supplies no `mpp` at all (divergences 12 and 28) - and ten of the twelve test
-    movies are declared at 0.65 um/px. What is trusted here is the baseline's
-    *stability*, which is all a refactor needs to be checked against.
-    """
-    import pandas as pd
-
-    from tests.conftest import BASELINE_INFERENCE_PARAMS, BASELINE_MATCH_THRESHOLD, REPO_ROOT
+def _evaluate(pinned_weights, dataset_dir, output_dir, distance_threshold, device="cpu"):
+    from tests.conftest import BASELINE_INFERENCE_PARAMS, BASELINE_MATCH_THRESHOLD
     from torch_tracking.eval import evaluate
 
-    recorded = pd.read_csv(REPO_ROOT / "metrics" / "eval_results.csv", index_col=0)
-
-    result = evaluate(
+    params = dict(BASELINE_INFERENCE_PARAMS, distance_threshold=distance_threshold)
+    return evaluate(
         checkpoint_path=str(pinned_weights),
         split_dir=dataset_dir,
         split="test",
-        output_dir=tmp_path,
-        device="cpu",
+        output_dir=output_dir,
+        device=device,
         threshold=BASELINE_MATCH_THRESHOLD,
         progress=False,
-        **BASELINE_INFERENCE_PARAMS,
+        **params,
     )
 
-    produced = pd.read_csv(result.results_path, index_col=0)
 
-    pd.testing.assert_frame_equal(
-        produced, recorded, check_exact=False, rtol=1e-9, atol=1e-9
+def _report(label, pooled, reference, record_property):
+    """Print and record each contract metric next to the reference, asserting no floor."""
+    for key in CONTRACT_METRICS:
+        line = f"{label}: {key} = {pooled[key]:.4f}  (Caliban - GT: {reference[key]:.4f})"
+        print(line)
+        record_property(f"{label}.{key}", round(float(pooled[key]), 6))
+        record_property(f"{label}.{key}.reference", round(float(reference[key]), 6))
+
+
+def test_corrected_pipeline_is_reported_against_the_reference(
+    pinned_weights, dataset_dir, tmp_path, record_property
+):
+    """Report division F1, association accuracy and target effectiveness against the
+    "Caliban - GT" row of metrics/benchmarks.csv.
+
+    Reported, not floored: what tolerance counts as parity is a decision for the person
+    reviewing the retrain, and constraint 3 makes the reference the floor they judge by.
+    """
+    from tests.conftest import INHERITED_DISTANCE_THRESHOLD, reference_rows
+    from torch_tracking.eval import pooled_metrics
+
+    result = _evaluate(pinned_weights, dataset_dir, tmp_path, INHERITED_DISTANCE_THRESHOLD)
+    reference_df = reference_rows()
+    reference = pooled_metrics(reference_df)
+
+    assert len(result.per_movie) == len(reference_df), "compare like with like: same movies"
+    _report("inherited_threshold", result.pooled, reference, record_property)
+
+    for key in CONTRACT_METRICS:
+        assert 0.0 <= result.pooled[key] <= 1.0, f"pooled {key} is not a ratio"
+
+
+def test_the_retune_is_separable_from_the_scale_correction(
+    pinned_weights, dataset_dir, tmp_path, record_property
+):
+    """Evaluate at the inherited distance_threshold AND the retuned one, so a reader can
+    tell the scale correction's effect from the retune's.
+
+    The inherited 64 px was optimized at 0.768 um/px; at the corrected 0.55 um/px it
+    covers about half the area. Two variables moved in this change, so both are reported.
+    """
+    from tests.conftest import (
+        INHERITED_DISTANCE_THRESHOLD,
+        RETUNED_DISTANCE_THRESHOLD,
+        reference_rows,
     )
+    from torch_tracking.eval import pooled_metrics
 
-    for key, expected in BASELINE_POOLED.items():
-        assert result.pooled[key] == pytest.approx(expected, abs=5e-5), (
-            f"pooled {key} is {result.pooled[key]}, recorded baseline is {expected}. "
-            "The refactor was required to change nothing it measures."
-        )
+    if RETUNED_DISTANCE_THRESHOLD is None:
+        pytest.skip("distance_threshold has not been retuned yet (correct-scale-convention 8.3)")
+
+    reference = pooled_metrics(reference_rows())
+    for label, threshold in (
+        ("inherited_threshold", INHERITED_DISTANCE_THRESHOLD),
+        ("retuned_threshold", RETUNED_DISTANCE_THRESHOLD),
+    ):
+        result = _evaluate(pinned_weights, dataset_dir, tmp_path / label, threshold)
+        _report(label, result.pooled, reference, record_property)
 
 
-def test_reproduction_holds_on_gpu_as_well_as_cpu(pinned_weights, dataset_dir, tmp_path):
+def test_cpu_and_gpu_agree_on_the_corrected_pipeline(
+    pinned_weights, dataset_dir, tmp_path
+):
     """Constraint 1 claims byte-identical output across CPU and GPU. Confirm it.
 
-    Skips where no CUDA device is present, which includes CI and every CPU-only
-    machine, so an ordinary run is unaffected.
+    Skips where no CUDA device is present, which includes CI and every CPU-only machine.
+    Compares the pipeline against itself, so it needs no reference figures. On a shared
+    server, only run this on a GPU you have been assigned.
     """
     import pandas as pd
     import torch
 
+    from tests.conftest import INHERITED_DISTANCE_THRESHOLD
+
     if not torch.cuda.is_available():
-        pytest.skip("no CUDA device available; the CPU gate covers the baseline")
+        pytest.skip("no CUDA device available; nothing to compare the CPU run against")
 
-    from tests.conftest import BASELINE_INFERENCE_PARAMS, BASELINE_MATCH_THRESHOLD, REPO_ROOT
-    from torch_tracking.eval import evaluate
-
-    recorded = pd.read_csv(REPO_ROOT / "metrics" / "eval_results.csv", index_col=0)
-
-    result = evaluate(
-        checkpoint_path=str(pinned_weights),
-        split_dir=dataset_dir,
-        split="test",
-        output_dir=tmp_path,
-        device="cuda",
-        threshold=BASELINE_MATCH_THRESHOLD,
-        progress=False,
-        **BASELINE_INFERENCE_PARAMS,
+    cpu = _evaluate(pinned_weights, dataset_dir, tmp_path / "cpu", INHERITED_DISTANCE_THRESHOLD)
+    gpu = _evaluate(
+        pinned_weights, dataset_dir, tmp_path / "gpu", INHERITED_DISTANCE_THRESHOLD, device="cuda"
     )
-
-    produced = pd.read_csv(result.results_path, index_col=0)
 
     pd.testing.assert_frame_equal(
-        produced, recorded, check_exact=False, rtol=1e-9, atol=1e-9
+        pd.read_csv(gpu.results_path, index_col=0),
+        pd.read_csv(cpu.results_path, index_col=0),
+        check_exact=False, rtol=1e-9, atol=1e-9,
     )
-
-    for key, expected in BASELINE_POOLED.items():
-        assert result.pooled[key] == pytest.approx(expected, abs=5e-5), (
-            f"pooled {key} on GPU is {result.pooled[key]}, recorded baseline is "
-            f"{expected}. Constraint 1 requires CPU and GPU to agree."
-        )

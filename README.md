@@ -81,7 +81,7 @@ python -m torch_tracking.preprocess
 
 By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file it produces:
 
-- `<split>.zarr` — raw arrays (`X`, `y`)
+- `<split>.zarr` — raw arrays (`X`, `y`) at native resolution, plus `mpp`
 - `<split>_proc.zarr` — pre-extracted features ready for the dataloader
 - `<split>.json` — ground-truth lineage records
 
@@ -105,10 +105,19 @@ The processed Zarr file (`*_proc.zarr`) stores pre-extracted per-cell features:
 | `morphologies` | `(B, T, N, 3)` | Per-cell morphological features: area, perimeter, eccentricity |
 | `centroids` | `(B, T, N, 2)` | Y and X centroid coordinates in pixels |
 | `labels` | `(B, T-1, N, N)` | Temporal adjacency matrix (ground truth): `1` = same cell, `2` = daughter, `0` = different cell, `-1` = padding |
+| `track_length` | `(B, N, 2)` | Allocated but never populated (all zeros) |
+| `mpp` | `(B,)` | Each movie's declared resolution in µm/px, as float64 |
 
 - `B` — number of movies in the batch
 - `T` — number of frames
 - `N` — maximum number of cells across the dataset (padded with zeros)
+
+Features are extracted after each movie is rescaled by `mpp / 0.55`, so every cell is
+seen at 0.55 µm/px whatever resolution its movie declares. Both zarrs record `mpp`, and
+anything reading a split without it fails rather than assuming a resolution; a zarr
+converted before this was recorded must be regenerated. The frame-indexed arrays are
+chunked as one movie by one `track_length` window (`convert_trk_to_zarr(...,
+track_length=8)`), so reading a training window touches at most two chunks.
 
 ---
 
@@ -211,7 +220,7 @@ train_loader, val_loader, _ = create_trk_dataloaders(
     train_path=Path.home() / '.deepcell/tracking/train_proc.zarr',
     val_path=Path.home() / '.deepcell/tracking/val_proc.zarr',
     batch_size=config['batch_size'],
-    distance_threshold=64,
+    distance_threshold=89,
     num_workers=config['num_workers'],
 )
 

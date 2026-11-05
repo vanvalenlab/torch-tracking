@@ -13,6 +13,7 @@ from typing import Dict
 
 from torch_tracking.model import GNNTrackingModel
 from torch_tracking.loader import create_trk_dataloaders
+from torch_tracking.utils import DISTANCE_THRESHOLD
 from torch_tracking.loss import TrackingLoss
 from torch_tracking.utils import MetricsTracker, EarlyStopping, create_optimizer, create_scheduler
 
@@ -446,7 +447,7 @@ if __name__ == "__main__":
         train_path=Path.home() / '.deepcell/tracking/train_proc.zarr',
         val_path=Path.home() / '.deepcell/tracking/val_proc.zarr',
         batch_size=config.batch_size,
-        distance_threshold=64,
+        distance_threshold=DISTANCE_THRESHOLD,
         num_workers=config.num_workers,
         truncate_dataset = config.truncate_dataset,
     )

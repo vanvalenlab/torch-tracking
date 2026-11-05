@@ -12,7 +12,7 @@ import glob
 from huggingface_hub import hf_hub_download
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
-from torch_tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations
+from torch_tracking.utils import get_max_cells, get_image_features, resize, clean_up_annotations, MODEL_MPP, scale_factor, spatial_adjacency, DISTANCE_THRESHOLD
 
 from torch_tracking.model import GNNTrackingModel
 
@@ -28,7 +28,7 @@ class CellTracker:
 
         distance_threshold (int, optional): The distance threshold by which cells are 
             considered "connected" in the GNN in pixels
-            Default is 64 pixels
+            Default is 89 pixels (`utils.DISTANCE_THRESHOLD`)
 
             
         death (float, optional): The threshold probability for a 
@@ -59,7 +59,7 @@ class CellTracker:
         self,
         checkpoint_dir = None,
         device = None,
-        distance_threshold: int = 64,
+        distance_threshold: int = DISTANCE_THRESHOLD,
         death: float = 0.999,
         birth: float = 0.999,
         division: float = 0.5,
@@ -82,8 +82,8 @@ class CellTracker:
         self.dtype = 'float32'
         self.track_length = track_length
         self.tracks = {}
-        self.model_mpp = 0.55
-        self.scale_factor = mpp/self.model_mpp
+        self.model_mpp = MODEL_MPP
+        self.scale_factor = scale_factor(mpp, self.model_mpp)
         self.verbose = verbose
 
         # Tracking state
@@ -271,16 +271,13 @@ class CellTracker:
                 morphologies[batch, frame, :num_tracks] = frame_features['morphologies']
                 appearances[batch, frame, :num_tracks] = frame_features['appearances']
                 
-                # Compute adjacency based on distance threshold
-                distance = cdist(centroids[batch, frame], centroids[batch, frame], metric='euclidean')
-                adj = ((distance > 0) & (distance < self.distance_threshold)).astype(np.float32)
-                
-                # Disconnect padded nodes
-                morph = morphologies[batch, frame]
-                is_pad = np.matmul(morph, morph.T) == 0
-                adj = adj * (1 - is_pad)
-                
-                adj_matrices[batch, frame] = adj
+                # Spatial graph by the rule shared with the training dataloader,
+                # which excludes padded nodes.
+                adj_matrices[batch, frame] = spatial_adjacency(
+                    centroids[batch, frame],
+                    morphologies[batch, frame],
+                    self.distance_threshold,
+                )
         return adj_matrices, appearances, morphologies, centroids
 
     def _to_tensors(

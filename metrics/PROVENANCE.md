@@ -7,7 +7,7 @@ the claims rather than take them on faith.
 
 | File | What it holds | Reproducible? |
 | --- | --- | --- |
-| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access — verified 2026-11-04 |
+| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access and the checkpoint below — regenerated 2026-11-05 |
 | `benchmarks.csv` | The TF Caliban tracking reference numbers | **No. Permanently irreproducible** — see below |
 
 Other CSVs here (`postprocess_sweep.csv`) remain ignored: they are derived, regenerable, and
@@ -32,62 +32,26 @@ Every number in both files measures *tracking only*, on masks supplied as input.
 
 ## `eval_results.csv`
 
+Regenerated 2026-11-05 by `correct-scale-convention` from a model retrained on corrected
+data. It **replaces wholesale** the figures this file held before; those are kept under
+"Superseded baseline" below only so that the movement can be explained.
+
 | Field | Value |
 | --- | --- |
-| Produced by | `checkpoints/20260607-083350/best_model.pt` |
-| Checkpoint SHA256 | `321d5a55ead5d03549be716f513d8abf469a74b6b50fec3b8a367b761e3d98d0` |
-| Also published as | `vanvalenlab/torch-tracking` → `torch-tracking_2026-07-30.pt` (HuggingFace) |
-| HF revision | `038f1e6e47f28f0cc11f106a14c7e8bae9d5896c` |
-| Dataset | `DynamicNuclearNet-tracking` v1.0, `test` split (12 movies, up to 71 frames, 584×600) |
-| Harness | `torch_tracking.eval.evaluate()` — see the note on the entry point below |
-| Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=64`. **No `mpp` is supplied**, so the tracker's default of 0.55 applies to every movie — see below |
+| Produced by | `checkpoints/20261105-054354/best_model.pt` (local only) |
+| Checkpoint SHA256 | `f1e647dfe987b4366968cc99d373f5d9599b8b5c51d8ee269dc485badc565894` |
+| Published as | **Not yet published.** Weights go to `vanvalenlab/torch-tracking` only after the owner validates them and uploads manually. The HuggingFace filename and revision are added here by the owner after that upload |
+| Dataset | `DynamicNuclearNet-tracking` v1.0, `test` split (12 movies, up to 71 frames, 584×600). Evaluated from `~/.deepcell/tracking/test.zarr`, regenerated 2026-11-04 so that it carries per-movie `mpp` |
+| Training data | The `train` and `val` splits regenerated 2026-11-04 from the `.trks` archives (`train_proc.zarr`, `val_proc.zarr`), converted with the corrected scale rule `mpp/0.55` |
+| Training configuration | `checkpoints/20261105-054354/config.json` and `run_manifest.json`: RAdam, lr 1e-3, `reduce_on_plateau`, 50 epochs (run to completion, no early stopping), batch size 8, 2 layers, `crop_mode=fixed`, `crop_size=32`, `loss=wcce`, bfloat16, `distance_threshold=89` |
+| Harness | `torch_tracking.eval.evaluate()`, invoked as `python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking --distance-threshold 89` |
+| Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=89`. Each movie's own `mpp` is read from the zarr and passed to its tracker |
+| Retuned parameter | `distance_threshold` 64 → **89 px**. Derived, not swept: it keeps the old physical reach (64 px at the old effective 0.768 µm/px = 49.2 µm = 89.4 px at 0.55 µm/px) |
 | Metric match threshold | `TrackingMetrics(..., threshold=0.8)` |
-| Frames per movie | `end_frame = (count of non-empty frames) - 1`, per `build_indices`, used as a **slice bound** — so each movie's final non-empty frame is excluded. See below |
-| Device | Reproduced exactly on **both** CPU and GPU, as constraint 1 requires. The harness defaults to CPU and requires no GPU; the original figures were produced on `cuda:1` |
-| Verified at | commit `a1c39ff`, 2026-11-04 |
-| Re-verified at | `make-eval-harness-reproducible`, 2026-11-04 — reproduced exactly through the new entry point |
+| Frames per movie | Every non-empty frame, including each movie's last. `end_frame = count of non-empty frames`, used as an exclusive slice bound. The ground-truth lineage is the full `test.json`, so `aa_total` and `te_total` do not depend on which frames are evaluated |
+| Device | Evaluated on CPU (4 threads). Not re-checked on GPU for this checkpoint |
+| Verified at | Base commit `5adeac9` plus the uncommitted `correct-scale-convention` changes, 2026-11-05 |
 | Verification environment | Python 3.14.3, torch 2.11.0+cu128, numpy 2.5.2, pandas 3.0.5, zarr 3.3.0, torch-geometric 2.8.0.post1 |
-
-### What these figures do and do not cover
-
-Three facts about how these numbers were produced, recorded here because they qualify
-every accuracy claim that cites them.
-
-**The entry point moved, the numbers did not.** `make-eval-harness-reproducible` replaced
-the `__main__` script with the importable `torch_tracking.eval.evaluate()`. That change was
-gated on reproducing this file exactly, so the figures above describe both the original
-script and the current harness. Reproduce them with:
-
-```bash
-python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking
-```
-
-**The figures are stable across dependency versions, as far as has been tested.** The
-original run used a different torch build from the one in the environment table above - the
-re-verification crossed a torch downgrade from 2.13.0+cu130 to 2.11.0+cu128 and reproduced
-every row to within 1e-9. That is one data point, not a guarantee, but it means a future
-reproduction failure is more likely to indicate a code change than a dependency bump. The
-environment is recorded from here on so that the distinction can be made at all: it could
-not be, before this entry existed.
-
-**Each movie's final non-empty frame was not evaluated.** The frame extent is one fewer
-than the count of non-empty frames and is used as a slice bound, so the last labelled frame
-of every movie is dropped — **920 cell-instances** across the twelve-movie test split, 241
-of them in movie 8 alone. This is divergence 25. The figures above therefore cover one
-frame less per movie than the dataset provides.
-
-**No per-movie resolution reached the tracker.** The harness supplies no `mpp`, so every
-movie is tracked at the default 0.55 um/px. The test split declares **ten of its twelve
-movies at 0.65 um/px**. Meanwhile training rescaled by `0.55/mpp` — the reciprocal of the
-inference convention — giving an effective training resolution of 0.768 um/px for those
-same movies. These two errors partially cancel, which is why the figures above look
-reasonable. They are divergences 12 and 28, and `correct-scale-convention` corrects both
-together with a retrain. Correcting either alone makes the mismatch worse, so these numbers
-cannot be improved on incrementally; they will be replaced wholesale.
-
-**The published weights and the baseline weights are the same file.** The checkpoint that
-produced these numbers is byte-identical to the one `CellTracker()` downloads by default, so
-this table describes the model users actually get — not a lab-local variant.
 
 ### Aggregate figures
 
@@ -95,40 +59,73 @@ Summed across all 12 movies (not an average of per-movie rates):
 
 | Metric | Value |
 | --- | --- |
-| Division precision | 0.9627 |
-| Division recall | 0.9281 |
-| **Division F1** | **0.9451** |
-| **Association accuracy (AA)** | **0.9728** |
-| **Target effectiveness (TE)** | **0.9747** |
-| Total ground-truth divisions | 178 |
+| Division precision | 0.9588 |
+| Division recall | 0.9477 |
+| **Division F1** | **0.9532** |
+| **Association accuracy (AA)** | **0.9934** |
+| **Target effectiveness (TE)** | **0.9946** |
+| Total ground-truth divisions | 178 (163 correct, 6 mismatched, 7 false positive, 9 missed) |
 
-### How attribution was established
+Against the `Caliban - GT` row of `benchmarks.csv` (0.9352 / 0.9781 / 0.9787), the figures
+above are higher on all three metrics. See the next section for how much of the movement is
+due to which change.
 
-The file carried no checkpoint provenance, so it was determined empirically on 2026-11-04:
+### What changed from the superseded baseline
 
-1. Four candidate checkpoints existed. `metrics/eval_results.csv` is dated 2026-08-10, a day
-   before `20260811-135018` was written, ruling that one out on timestamps alone.
-2. Replaying movie 0 matched three of the four candidates — too coarse to discriminate.
-3. Replaying movie 8 (57 divisions, the largest) matched `20260607-083350` on all nine raw
-   counts and excluded the other two.
-4. Replaying all 12 movies with `20260607-083350` reproduced **every row identically**, and
-   the aggregate division F1 to four decimal places.
+The previous figures were **0.9451 / 0.9728 / 0.9747** (division F1 / AA / TE). The new
+ones differ because the *configuration* changed, not because the model regressed or
+improved on a like-for-like basis. Four things changed at once:
 
-This agreed with the checkpoint path that `torch_tracking/eval.py` hardcoded at the time.
-That path is now a required argument, so the agreement is historical evidence for the
-identification above rather than something a reader can re-check in the source.
+1. Training rescaled movies by the reciprocal of the inference convention (divergence 12).
+   Retraining uses the corrected rule.
+2. Inference supplied no per-movie `mpp`, so ten of twelve test movies were tracked at the
+   wrong resolution (divergence 28). Each movie's own `mpp` now reaches its tracker.
+3. Each movie's last non-empty frame was dropped from evaluation, 920 cell-instances in all
+   (divergence 25), and the last two from training (divergence 31). Both are included now.
+4. Training and inference built the spatial graph by different rules (divergence 17).
+   Training now matches inference.
+
+The retune is separable from the rest, because the same checkpoint was also evaluated at
+the inherited `distance_threshold` of 64:
+
+| Configuration | Division F1 | AA | TE |
+| --- | --- | --- | --- |
+| Superseded baseline (old checkpoint, old data, threshold 64) | 0.9451 | 0.9728 | 0.9747 |
+| Retrained checkpoint, threshold 64 | 0.9529 | 0.9924 | 0.9937 |
+| Retrained checkpoint, threshold 89 (this file) | 0.9532 | 0.9934 | 0.9946 |
+| `Caliban - GT` reference | 0.9352 | 0.9781 | 0.9787 |
+
+- The step from the baseline to threshold 64 (+0.0078 / +0.0196 / +0.0190) is the combined
+  effect of the scale correction, the restored frames, the graph fix and the retrain. They
+  cannot be separated from one another, because correcting any one alone was shown to make
+  the mismatch worse.
+- The step from 64 to 89 (+0.0003 / +0.0010 / +0.0009) is the retune alone. It is small, and
+  division precision and recall trade against each other (0.9529 / 0.9529 at 64; 0.9588 /
+  0.9477 at 89).
+- The figures are from a single training run. No seed variation was measured, so
+  differences of a few thousandths should not be read as meaningful.
+
+### Superseded baseline
+
+`checkpoints/20260607-083350/best_model.pt` (SHA256
+`321d5a55ead5d03549be716f513d8abf469a74b6b50fec3b8a367b761e3d98d0`; also
+`torch-tracking_2026-07-30.pt` at HF revision `038f1e6e47f28f0cc11f106a14c7e8bae9d5896c`),
+evaluated at `distance_threshold=64` with no `mpp`, excluding each movie's last frame:
+division F1 **0.9451**, AA **0.9728**, TE **0.9747** (division precision 0.9627, recall
+0.9281). It was attributed to that checkpoint on 2026-11-04 by replaying every movie and
+matching every row; it was reproduced exactly on CPU and GPU. Those figures remain
+recoverable from version control but describe a configuration that no longer exists, and
+are not a target for any test.
 
 ### Reproducing it
 
-Requires `DynamicNuclearNet-tracking` (see `doc/model_access.md`). The full test set takes
-roughly two minutes on CPU, so compute is not the barrier — dataset access is.
-
-`make-eval-harness-reproducible` replaced the hardcoded checkpoint path, device and output
-location with arguments, and removed the stray root-level copy of this file that the old
-harness produced. Reproduce the figures with:
+Requires `DynamicNuclearNet-tracking` (see `doc/model_access.md`) and the checkpoint
+above, which is held locally by the owner. The full test set takes roughly 90 seconds on
+CPU, so compute is not the barrier — dataset and weights access is.
 
 ```bash
-python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking
+python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking \
+    --distance-threshold 89
 ```
 
 ---

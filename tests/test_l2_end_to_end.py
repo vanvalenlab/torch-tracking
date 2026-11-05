@@ -251,26 +251,114 @@ def test_each_movie_is_evaluated_from_fresh_tracker_state(
         ), f"movie B's {column} changed when it was evaluated first"
 
 
-def test_inference_resolution_is_fixed_not_read_from_the_movie(untrained_checkpoint):
-    """Divergences 12 and 28, pinned deliberately."""
+@pytest.fixture
+def built_trackers(monkeypatch):
+    """Record every CellTracker the two evaluation entry points construct."""
+    from torch_tracking import eval as eval_module
+    from torch_tracking import eval_sweep
     from torch_tracking.tracker import CellTracker
 
-    # This is how evaluate() constructs its tracker: no mpp= is supplied.
-    tracker = CellTracker(
-        checkpoint_dir=str(untrained_checkpoint),
-        device="cpu",
-        verbose=False,
-        **BASELINE_INFERENCE_PARAMS,
+    built = []
+
+    def recording(*args, **kwargs):
+        tracker = CellTracker(*args, **kwargs)
+        built.append(tracker)
+        return tracker
+
+    monkeypatch.setattr(eval_module, "CellTracker", recording)
+    monkeypatch.setattr(eval_sweep, "CellTracker", recording)
+    return built
+
+
+def _split_with_resolutions(tmp_path, synthetic_movie, mpp):
+    """A two-movie split declaring `mpp` (a scalar, a pair, or None for no array)."""
+    from tests.conftest import write_split
+
+    X = np.stack([synthetic_movie.X, synthetic_movie.X])
+    y = np.stack([synthetic_movie.y, synthetic_movie.y])
+    return write_split(
+        tmp_path / "split", X, y, [synthetic_movie.lineage] * 2, mpp=mpp
     )
 
-    assert tracker.scale_factor == 1.0, (
-        "Divergences 12 and 28: the harness supplies no per-movie mpp, so every movie "
-        "is tracked at the default 0.55 um/px whatever it declares - ten of the twelve "
-        "test movies are declared at 0.65. This is retained ON PURPOSE so the harness "
-        "reproduces the recorded baseline exactly. If this changed, "
-        "correct-scale-convention has landed - update the tracking-metrics spec and "
-        "delete this test."
+
+def test_evaluation_tracks_each_movie_at_its_declared_resolution(
+    untrained_checkpoint, synthetic_movie, tmp_path, built_trackers
+):
+    """Requirement: Inference resolution is read from the movie.
+
+    Divergences 12 and 28: every movie was tracked at the default 0.55 whatever it
+    declared, so ten of the twelve real test movies were not rescaled at all.
+    """
+    from torch_tracking.eval import evaluate
+    from torch_tracking.utils import scale_factor
+
+    split_dir = _split_with_resolutions(tmp_path, synthetic_movie, [0.55, 0.65])
+    evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=split_dir,
+        output_dir=tmp_path / "out",
+        progress=False,
     )
+
+    assert [t.scale_factor for t in built_trackers] == [scale_factor(0.55), scale_factor(0.65)]
+    assert built_trackers[0].scale_factor == 1.0, "a movie at MODEL_MPP is not rescaled"
+    assert built_trackers[1].scale_factor == pytest.approx(0.65 / 0.55)
+
+
+def test_the_sweep_tracks_each_movie_at_its_declared_resolution(
+    untrained_checkpoint, synthetic_movie, tmp_path, built_trackers
+):
+    """Requirement: Inference resolution is read from the movie (sweep entry point)."""
+    from torch_tracking.eval_sweep import sweep
+    from torch_tracking.utils import scale_factor
+
+    split_dir = _split_with_resolutions(tmp_path, synthetic_movie, [0.55, 0.65])
+    sweep(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=split_dir,
+        output_dir=tmp_path / "out",
+        division_sweep=[0.5],
+        birth_sweep=[0.999],
+        death_sweep=[0.99],
+        progress=False,
+    )
+
+    assert [t.scale_factor for t in built_trackers] == [scale_factor(0.55), scale_factor(0.65)]
+
+
+def test_evaluation_fails_without_a_recorded_resolution(
+    untrained_checkpoint, synthetic_movie, tmp_path, built_trackers
+):
+    """Requirement: Inference resolution is read from the movie (it is required).
+
+    A zarr with no `mpp` predates per-movie resolution and was converted under the
+    superseded convention. Evaluating it at a default resolution would hide that.
+    """
+    from torch_tracking.eval import evaluate
+    from torch_tracking.eval_sweep import sweep
+
+    split_dir = _split_with_resolutions(tmp_path, synthetic_movie, None)
+    common = dict(checkpoint_path=str(untrained_checkpoint), split_dir=split_dir,
+                  output_dir=tmp_path / "out", progress=False)
+
+    with pytest.raises(ValueError, match="'mpp'"):
+        evaluate(**common)
+    with pytest.raises(ValueError, match="'mpp'"):
+        sweep(division_sweep=[0.5], birth_sweep=[0.999], death_sweep=[0.99], **common)
+    assert built_trackers == [], "no tracker may be built, so no default resolution is used"
+
+
+def test_inference_scale_factor_is_the_shared_rule(untrained_checkpoint):
+    """Requirement: Conversion and inference agree on the scale factor.
+
+    The conversion half is test_conversion_rescales_by_the_shared_rule; together they
+    pin both ends to `utils.scale_factor`, so the two conventions cannot drift apart.
+    """
+    from torch_tracking.utils import scale_factor
+
+    for mpp in (0.55, 0.65):
+        assert _tracker(untrained_checkpoint, mpp=mpp).scale_factor == scale_factor(mpp)
+    assert _tracker(untrained_checkpoint, mpp=0.65).scale_factor > 1.0
 
 
 # ======================================================================================
@@ -396,7 +484,7 @@ def test_no_cell_is_adjacent_to_itself(untrained_checkpoint):
 
 
 def test_padding_entries_are_isolated(untrained_checkpoint):
-    """The property that separates inference from training's divergence 17."""
+    """Inference isolates padding slots; training does the same (divergence 17, fixed)."""
     import numpy as np
 
     # Frame 0 has three cells, frame 1 has one: frame 1 carries two padding slots.
@@ -414,11 +502,40 @@ def test_padding_entries_are_isolated(untrained_checkpoint):
     assert is_padding.any(), "fixture must produce padding slots"
 
     assert padded_frame[is_padding].sum() == 0, (
-        "every padding slot must be disconnected. Inference applies this exclusion "
-        "(tracker.py:277-281); the training dataloader does not, which is divergence 17 "
-        "and belongs to training-data."
+        "every padding slot must be disconnected. Inference and the training "
+        "dataloader apply the same exclusion (utils.spatial_adjacency); see "
+        "test_training_and_inference_build_the_same_graph."
     )
     assert padded_frame[:, is_padding].sum() == 0, "padding columns must also be empty"
+
+
+def test_training_and_inference_build_the_same_graph(untrained_checkpoint):
+    """Requirement: Training and inference build the spatial graph by the same rule.
+
+    The same frames go through the tracker's graph and the training dataloader's. Cells
+    sit near the origin so a padding slot at (0, 0) would link to them if either side
+    failed to exclude padding; frame 1 holds two padding slots.
+    """
+    import numpy as np
+    from types import SimpleNamespace
+
+    from torch_tracking.loader import TrkDataset
+
+    X, y = _two_frame_movie([
+        [(1, 3, 3), (2, 20, 20), (3, 40, 20)],
+        [(1, 3, 3)],
+    ])
+    tracker = _tracker(untrained_checkpoint)
+    tracker.preprocess_movie(movie=X, annotation=y)
+    adj, _, morphologies, centroids = tracker._extract_features()
+
+    # Call the dataloader's own method, with just the state it reads.
+    loader_like = SimpleNamespace(distance_threshold=tracker.distance_threshold)
+    training = TrkDataset._get_adj_matrix(loader_like, centroids[0], morphologies[0])
+
+    assert (morphologies[0, 1].sum(axis=-1) == 0).any(), "fixture must produce padding"
+    np.testing.assert_array_equal(training, adj[0] > 0)
+    assert training[1, 0, 1:].sum() == 0, "a real cell near the origin links to no padding slot"
 
 
 def test_ingestion_is_deterministic(untrained_checkpoint, synthetic_movie):

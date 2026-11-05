@@ -3,17 +3,9 @@
 Importing this module performs no evaluation: it loads no checkpoint, reads no
 dataset and writes no file. Call :func:`evaluate` to run an evaluation.
 
-Two behaviors in here are known to be wrong and are retained deliberately, because
-correcting either alone moves the recorded figures and forfeits the reproduction
-guarantee that makes this harness trustworthy. Both are removed by
-``correct-scale-convention``:
-
-* **Divergence 25** - each movie's final non-empty frame is excluded from
-  evaluation, because the frame extent is used as a slice bound. See
-  :func:`build_indices`.
-* **Divergences 12 and 28** - no per-movie ``mpp`` is supplied to the tracker, so
-  every movie is tracked as though it were at the reference resolution of
-  0.55 um/px. Ten of the twelve test movies are declared at 0.65 um/px.
+Every non-empty frame of each movie is evaluated (see :func:`build_indices`), and each
+movie is tracked at the resolution it declares: that resolution is read from the split's
+zarr, so the tracker rescales by ``mpp / MODEL_MPP`` exactly as conversion did.
 """
 
 from dataclasses import dataclass, field
@@ -26,6 +18,7 @@ import tqdm
 import zarr
 
 from torch_tracking.tracker import CellTracker
+from torch_tracking.utils import require_mpp, count_nonempty_frames, DISTANCE_THRESHOLD
 from torch_tracking.metrics import TrackingMetrics
 
 __all__ = [
@@ -52,24 +45,14 @@ COUNT_COLUMNS = (
 
 
 def build_indices(y):
-    """Per-movie frame extent, derived from the count of non-empty mask frames.
+    """Per-movie frame extent: the count of non-empty mask frames.
 
-    This is the single definition of the rule; ``eval_sweep`` imports it rather
-    than carrying its own copy.
-
-    **Divergence 25.** The returned value is one *fewer* than the number of
-    non-empty frames, and callers use it as a slice bound. Each movie's final
-    non-empty frame is therefore never evaluated - 920 cell-instances across the
-    test split. This is retained deliberately so that the harness reproduces the
-    recorded baseline exactly; ``correct-scale-convention`` removes it.
+    This is the single definition of the rule; ``eval_sweep`` imports it rather than
+    carrying its own copy, and the training sampler derives its extent from the same
+    ``count_nonempty_frames``. The value is the exclusive end of the movie's occupied
+    frames, so it is used as a slice bound that includes every non-empty frame.
     """
-    samples = []
-
-    for batch in range(y.shape[0]):
-        end_frame = np.sum(np.sum(y[batch], axis=(1, 2, 3)) != 0) - 1
-        samples.append(end_frame.item())
-
-    return samples
+    return [count_nonempty_frames(y[batch]) for batch in range(y.shape[0])]
 
 
 def pooled_metrics(df):
@@ -158,7 +141,7 @@ def evaluate(
     birth=0.999,
     death=0.999,
     track_length=8,
-    distance_threshold=64,
+    distance_threshold=DISTANCE_THRESHOLD,
     threshold=0.8,
     write_movies=False,
     movies_dir='movies',
@@ -191,6 +174,7 @@ def evaluate(
     zarr_path, lineage_path = _resolve_split(split_dir, split)
 
     z = zarr.open(str(zarr_path))
+    mpps = require_mpp(z, zarr_path)
     with open(lineage_path) as handle:
         gt_lineages = json.load(handle)
 
@@ -211,12 +195,11 @@ def evaluate(
 
         # A tracker is constructed per movie, so no state carries across movies
         # and evaluation order cannot affect any movie's result.
-        #
-        # Divergences 12 and 28: no mpp= is supplied, so scale_factor is 1.0 for
-        # every movie regardless of its declared resolution. Retained deliberately.
+        # It is given the movie's declared resolution, so it is rescaled to MODEL_MPP.
         tracker = CellTracker(
             checkpoint_dir=checkpoint_path,
             device=device,
+            mpp=float(mpps[batch]),
             division=division,
             birth=birth,
             death=death,
@@ -225,8 +208,6 @@ def evaluate(
             verbose=verbose,
         )
 
-        # Divergence 25: end_frame is one fewer than the non-empty frame count and
-        # is used here as a slice bound, so the final non-empty frame is dropped.
         tracker.preprocess_movie(
             movie=X[batch, :end_frame],
             annotation=y[batch, :end_frame],

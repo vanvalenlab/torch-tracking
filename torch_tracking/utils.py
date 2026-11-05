@@ -8,9 +8,85 @@ import cv2
 from skimage import transform
 import pandas as pd
 import networkx as nx
+from scipy.spatial.distance import cdist
 from tqdm import tqdm
 import torch.optim as optim
 from skimage.measure import regionprops
+
+# The resolution, in microns per pixel, that the model is trained at. Every movie is
+# rescaled to this resolution, in conversion and at inference alike.
+MODEL_MPP = 0.55
+
+
+# Pixel radius within which two cells are linked in the spatial graph, on the grid at
+# MODEL_MPP. 89 px keeps the physical reach the model was originally tuned at: 64 px at the
+# old effective 0.768 um/px (0.65**2 / 0.55) is 49.2 um, which is 89.4 px at 0.55 um/px.
+# Derived rather than swept, because a retune needs a trained model (see
+# correct-scale-convention design.md, Decision 4). Used by training, inference and
+# evaluation alike so they cannot disagree.
+DISTANCE_THRESHOLD = 89
+
+
+def scale_factor(mpp, model_mpp=MODEL_MPP):
+    """Factor by which a movie declared at ``mpp`` is rescaled to the model resolution.
+
+    One output pixel must span ``model_mpp`` microns. A movie coarser than the model
+    (larger ``mpp``) has fewer pixels per micron, so it is enlarged: the factor is
+    ``mpp / model_mpp``. This is the single definition of the rule; conversion and
+    inference both call it so the two cannot disagree.
+    """
+    # float64 whatever the caller's type: a float32 scalar would round differently from
+    # the declared value and could size the same movie one pixel apart on the two sides.
+    return float(mpp) / float(model_mpp)
+
+
+def spatial_adjacency(centroids, morphologies, distance_threshold):
+    """Boolean ``(N, N)`` spatial graph over one frame's cell slots.
+
+    Two slots are linked when both are real cells and their centroid distance is
+    strictly greater than zero and strictly less than ``distance_threshold``. A padding
+    slot carries an all-zero morphology (a real cell has positive area), so any pair
+    involving one has a zero morphology dot product and is excluded.
+
+    The single definition of the graph rule: the tracker and the training dataloader
+    both call it, so training and inference build the same graph. Padding slots also sit
+    at centroid (0, 0), so without the exclusion every real cell near the origin would be
+    linked to every padding slot.
+    """
+    distance = cdist(centroids, centroids, metric='euclidean')
+    adjacency = (distance > 0) & (distance < distance_threshold)
+    is_pad = np.matmul(morphologies, morphologies.T) == 0
+    return adjacency & ~is_pad
+
+
+def count_nonempty_frames(movie):
+    """Number of frames of ``movie`` holding any non-zero value.
+
+    The single definition of a movie's extent, shared by evaluation and the training
+    sampler so the two cannot disagree about which frames exist. The leading axis is
+    time; every other axis, however many there are, is reduced - so the count does not
+    depend on the channel axis being singleton. Trailing frames are assumed empty
+    padding, so the count is also the exclusive end of the occupied frames.
+    """
+    movie = np.asarray(movie)
+    return int(movie.reshape(movie.shape[0], -1).any(axis=1).sum())
+
+
+def require_mpp(store, path):
+    """Return a converted split's per-movie resolutions, failing if it holds none.
+
+    A zarr written before per-movie resolution was persisted has no ``mpp`` array. It
+    was converted under the superseded scale convention, so it must be regenerated;
+    silently assuming ``MODEL_MPP`` would hide that and reproduce the mismatch.
+    """
+    if 'mpp' not in store:
+        raise ValueError(
+            f"{path} holds no 'mpp' array. It was converted before per-movie resolution "
+            "was persisted, under the superseded scale convention, and must be "
+            "regenerated with convert_trk_to_zarr. No default resolution is assumed."
+        )
+    return np.asarray(store['mpp'][:], dtype='float64')
+
 
 def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_format = 'channels_last'):
     """Pre-process images using Contrast Limited Adaptive

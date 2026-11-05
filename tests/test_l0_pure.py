@@ -184,6 +184,7 @@ def make_processed_zarr(path, n_movies=1, n_frames=6, max_cells=4, centroids=Non
         ("centroids", cents),
         ("labels", labels),
         ("track_length", track_length),
+        ("mpp", np.full(n_movies, REFERENCE_MPP, dtype="float64")),
     ):
         z.create_array(name, data=arr)
     return path
@@ -404,8 +405,8 @@ def test_capacity_comes_from_the_busiest_lineage(converted_split):
     assert np.all(morph[1, :, 2] == 0)
 
 
-def test_processed_zarr_holds_exactly_five_arrays(converted_split):
-    """Requirement: The processed zarr holds exactly five arrays.
+def test_processed_zarr_holds_exactly_six_arrays(converted_split):
+    """Requirement: The processed zarr holds exactly six arrays.
 
     Pins divergence 15: conversion computes a spatial adjacency and a validity mask
     for every frame and returns neither, so no adjacency reaches the zarr.
@@ -419,6 +420,7 @@ def test_processed_zarr_holds_exactly_five_arrays(converted_split):
         "centroids",
         "labels",
         "track_length",
+        "mpp",
     }, (
         "Divergence 15: the processed zarr holds no spatial adjacency, because "
         "get_features computes one per frame and returns it to nobody. If an "
@@ -432,6 +434,161 @@ def test_processed_zarr_holds_exactly_five_arrays(converted_split):
     assert z["centroids"].shape == (b, t, n, 2)
     assert z["labels"].shape == (b, t - 1, n, n)
     assert z["track_length"].shape == (b, n, 2)
+    assert z["mpp"].shape == (b,)
+
+
+def test_both_zarrs_record_each_movies_declared_resolution(tmp_path):
+    """Requirement: Both zarrs record each movie's declared resolution."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_movies=2)
+    write_sidecar(tmp_path, "train", [0.55, 0.65])  # two movies, two resolutions
+    convert_trk_to_zarr(str(trks))
+
+    for name in ("train.zarr", "train_proc.zarr"):
+        mpp = zarr.open(str(tmp_path / name), mode="r")["mpp"][:]
+        assert mpp.shape == (2,), name
+        assert mpp.dtype == np.float64, name
+        assert mpp.tolist() == [0.55, 0.65], f"{name}: stored value must equal the declared one"
+
+
+def test_conversion_writes_both_zarrs_or_neither(tmp_path, monkeypatch):
+    """Requirement: Both zarrs record each movie's declared resolution (all-or-nothing).
+
+    A failure while writing the processed zarr, after the unprocessed one is complete,
+    must not leave one file holding `mpp` and the other not.
+    """
+    from torch_tracking import preprocess
+
+    trks, _, _, _ = make_split(tmp_path)
+    real = preprocess.get_features
+
+    def unwritable(*args, **kwargs):
+        features = real(*args, **kwargs)
+        features["poison"] = object()  # fails at write time, after X/y/mpp are staged
+        return features
+
+    monkeypatch.setattr(preprocess, "get_features", unwritable)
+
+    with pytest.raises(Exception):
+        preprocess.convert_trk_to_zarr(str(trks))
+
+    leftovers = sorted(p.name for p in tmp_path.glob("train*.zarr*"))
+    assert leftovers == [], f"a failed conversion left output behind: {leftovers}"
+
+
+def test_a_zarr_without_mpp_is_rejected_naming_the_array(tmp_path):
+    """Requirement: A stale conversion is rejected (reader side, no default resolution)."""
+    from torch_tracking.loader import TrkDataset
+    from torch_tracking.utils import require_mpp
+
+    path = make_processed_zarr(tmp_path / "stale_proc.zarr")
+    del zarr.open(str(path), mode="a")["mpp"]
+
+    with pytest.raises(ValueError, match=r"'mpp'.*stale_proc\.zarr|stale_proc\.zarr.*'mpp'"):
+        TrkDataset(path, track_length=3, augment=False)
+    with pytest.raises(ValueError, match="mpp"):
+        require_mpp(zarr.open(str(path), mode="r"), path)
+
+
+def test_reading_a_converted_split_does_not_need_the_sidecar(tmp_path):
+    """Requirement: Both zarrs record each movie's declared resolution (no sidecar at runtime)."""
+    from torch_tracking.loader import TrkDataset
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_frames=6)
+    convert_trk_to_zarr(str(trks))
+    (tmp_path / "data-source.npz").unlink()
+
+    dataset = TrkDataset(tmp_path / "train_proc.zarr", track_length=3, augment=False)
+    assert len(dataset) > 0
+
+
+FRAME_INDEXED = ("appearances", "morphologies", "centroids", "labels")
+
+
+def _chunks_touched(arr, movie, start, frames):
+    """How many chunks reading one movie's frames [start, start+frames) touches."""
+    chunks, shape = arr.chunks, arr.shape
+    last = start + frames - 1
+    touched = 1                                   # a single movie: one chunk on axis 0
+    touched *= last // chunks[1] - start // chunks[1] + 1   # the time axis
+    for axis in range(2, len(shape)):             # every remaining axis is read whole
+        touched *= -(-shape[axis] // chunks[axis])
+    return touched
+
+
+def _convert_for_window(tmp_path, track_length=None, n_frames=10):
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_movies=2, n_frames=n_frames)
+    if track_length is None:
+        convert_trk_to_zarr(str(trks))
+    else:
+        convert_trk_to_zarr(str(trks), track_length=track_length)
+    return zarr.open(str(tmp_path / "train_proc.zarr"), mode="r")
+
+
+def test_processed_arrays_are_chunked_on_the_sampling_window(tmp_path):
+    """Requirement: Processed arrays are chunked along the sampling window."""
+    z = _convert_for_window(tmp_path)
+
+    for name in FRAME_INDEXED:
+        shape, chunks = z[name].shape, z[name].chunks
+        assert chunks[0] == 1, f"{name}: a chunk spans more than one movie {chunks}"
+        assert chunks[1] == min(8, shape[1]), f"{name}: time chunk is not the window {chunks}"
+        assert chunks[2:] == shape[2:], (
+            f"{name}: every cell slot and each crop must lie wholly within one chunk, "
+            f"got chunks {chunks} for shape {shape}"
+        )
+
+
+def test_a_window_read_touches_at_most_two_chunks_per_array(tmp_path):
+    """Requirement: Processed arrays are chunked along the sampling window."""
+    z = _convert_for_window(tmp_path)
+    window = 8
+
+    for name in FRAME_INDEXED:
+        arr = z[name]
+        frames = min(window, arr.shape[1])
+        for movie in range(arr.shape[0]):
+            for start in range(arr.shape[1] - frames + 1):
+                touched = _chunks_touched(arr, movie, start, frames)
+                assert touched <= 2, (
+                    f"{name}: reading movie {movie} frames [{start}, {start + frames}) "
+                    f"touches {touched} chunks; chunks={arr.chunks}, shape={arr.shape}"
+                )
+
+
+def test_the_chunk_counter_flags_automatic_chunking_at_real_split_shape():
+    """Guards the guard: at fixture size zarr's automatic chunking is a single chunk and
+    would pass the two-chunk check trivially, so show the counter bites where it matters.
+
+    Metadata only - the array is declared, never written, so nothing is allocated.
+    """
+    auto = zarr.create_array(
+        store={}, shape=(12, 71, 331, 32, 32, 1), dtype="float32", chunks="auto"
+    )
+    assert _chunks_touched(auto, movie=0, start=0, frames=8) > 2, (
+        "zarr's automatic chunking of the real test-split shape should be flagged"
+    )
+
+    windowed = zarr.create_array(
+        store={}, shape=(12, 71, 331, 32, 32, 1), dtype="float32",
+        chunks=(1, 8, 331, 32, 32, 1),
+    )
+    assert max(
+        _chunks_touched(windowed, movie=0, start=s, frames=8) for s in range(71 - 8 + 1)
+    ) <= 2
+
+
+def test_chunk_length_follows_the_configured_window(tmp_path):
+    """Requirement: Processed arrays are chunked along the sampling window."""
+    z = _convert_for_window(tmp_path, track_length=4)
+
+    assert z.attrs["track_length"] == 4, "the window the layout was built for is recorded"
+    for name in FRAME_INDEXED:
+        assert z[name].chunks[1] == min(4, z[name].shape[1]), name
 
 
 def test_track_length_is_stored_but_never_populated(converted_split):
@@ -453,11 +610,11 @@ def test_track_length_is_stored_but_never_populated(converted_split):
 
 
 def test_conversion_writes_sibling_zarr_and_lineage_json(converted_split):
-    """Requirement: The processed zarr holds exactly five arrays."""
+    """Requirement: The processed zarr holds exactly six arrays (sibling layout)."""
     tmp_path, split = converted_split
 
     raw = zarr.open(str(tmp_path / f"{split}.zarr"), mode="r")
-    assert set(raw.keys()) == {"X", "y"}
+    assert set(raw.keys()) == {"X", "y", "mpp"}
     assert raw["X"].shape == raw["y"].shape == (2, 4, 64, 64, 1)
 
     lineage_json = tmp_path / f"{split}.json"
@@ -645,12 +802,12 @@ def test_adjacency_is_rebuilt_at_sampling_time_not_stored(tmp_path):
     assert sample["adj_matrices"].shape == (3, 4, 4)
 
 
-def test_training_adjacency_admits_edges_to_padding_nodes(tmp_path):
-    """Requirement: Training adjacency admits edges to padding nodes.
+def test_training_adjacency_excludes_padding_nodes(tmp_path):
+    """Requirement: Training and inference build the spatial graph by the same rule.
 
-    Pins divergence 17. Built by construction rather than measured: the defect only
-    manifests when a real cell lies within distance_threshold of the coordinate
-    origin, so one is placed there deliberately.
+    Divergence 17: padding slots carry centroid (0, 0), so without an exclusion every
+    real cell within distance_threshold of the origin was linked to every padding slot.
+    Built by construction: a real cell is placed near the origin deliberately.
     """
     from torch_tracking.loader import TrkDataset
 
@@ -658,7 +815,7 @@ def test_training_adjacency_admits_edges_to_padding_nodes(tmp_path):
     centroids = np.zeros((n_frames, max_cells, 2), dtype="float32")
     for t in range(n_frames):
         centroids[t, 0] = [10.0, 10.0]    # real, ~14 px from the origin
-        centroids[t, 1] = [300.0, 300.0]  # real, far away
+        centroids[t, 1] = [30.0, 30.0]    # real, 28 px from cell 0 and ~42 px from the origin
         # Slots 2 and 3 are padding, left at (0, 0) with zero morphology.
 
     path = make_processed_zarr(
@@ -679,15 +836,16 @@ def test_training_adjacency_admits_edges_to_padding_nodes(tmp_path):
     assert np.all(morphologies[0, 2] == 0)
     assert np.all(morphologies[0, 3] == 0)
 
-    assert adjacency[0, 0, 2] == 1 and adjacency[0, 0, 3] == 1, (
-        "Divergence 17: training adjacency applies no padding exclusion, so a real "
-        "cell within distance_threshold of the origin links to every padding slot. "
-        "Inference (tracker.py) does exclude padding. If these are now 0, the "
-        "disagreement was resolved - update the training-data spec and delete this "
-        "characterization."
-    )
-    # The far cell is outside the threshold of the origin, so it gains no padding edge.
-    assert adjacency[0, 1, 2] == 0
+    for real in (0, 1):
+        for pad in (2, 3):
+            assert adjacency[0, real, pad] == 0 and adjacency[0, pad, real] == 0, (
+                f"real cell {real} is linked to padding slot {pad}. Training and "
+                "inference must exclude padding nodes identically (divergence 17)."
+            )
+    assert adjacency[0, 2:, :].sum() == 0 and adjacency[0, :, 2:].sum() == 0
+
+    # Real cells within the threshold of each other are still linked.
+    assert adjacency[0, 0, 1] == 1 and adjacency[0, 1, 0] == 1
 
     # Self-links are excluded by the strict lower bound on distance.
     assert np.all(np.diagonal(adjacency[0]) == 0)
@@ -953,23 +1111,59 @@ def test_movie_with_an_undefined_ratio_still_contributes_its_counts():
 
 
 def test_frame_extent_rule_has_a_single_definition():
-    """Both evaluation entry points derive extents from one shared rule."""
+    """Requirement: Evaluation covers every non-empty frame (one shared extent rule).
+
+    Evaluation, the sweep and the training sampler all derive a movie's extent from
+    `utils.count_nonempty_frames`; none carries a private copy.
+    """
     from torch_tracking import eval as eval_module
-    from torch_tracking import eval_sweep
+    from torch_tracking import eval_sweep, loader, utils
 
     assert eval_sweep.build_indices is eval_module.build_indices, (
         "eval_sweep must import the shared rule, not define its own copy"
+    )
+    assert eval_module.count_nonempty_frames is utils.count_nonempty_frames, (
+        "evaluation must derive its extent from the shared count"
+    )
+    assert loader.count_nonempty_frames is utils.count_nonempty_frames, (
+        "the training sampler must derive its extent from the same count as evaluation"
     )
 
     y = np.zeros((2, 6, 4, 4, 1), dtype=np.int32)
     y[0, :5] = 1   # 5 non-empty frames
     y[1, :3] = 1   # 3 non-empty frames
 
-    assert eval_module.build_indices(y) == [4, 2]
+    assert eval_module.build_indices(y) == [5, 3]
 
 
-def test_final_non_empty_frame_is_excluded_from_evaluation():
-    """Divergence 25, pinned deliberately: the extent is one short of the frame count."""
+def test_the_external_reference_is_the_gt_row_and_nothing_else():
+    """Requirement: Accuracy is reported against the external reference.
+
+    Constraint 3: "Caliban - Caliban" includes segmentation error from a model this
+    package does not contain, so it is never the reference. Credential-free, since
+    benchmarks.csv is tracked.
+    """
+    import pandas as pd
+
+    from tests.conftest import REFERENCE_MODEL, REPO_ROOT, reference_rows
+    from torch_tracking.eval import pooled_metrics
+
+    rows = reference_rows()
+    benchmarks = pd.read_csv(REPO_ROOT / "metrics" / "benchmarks.csv", index_col=0)
+
+    assert REFERENCE_MODEL == "Caliban - GT"
+    assert set(rows["model"]) == {"Caliban - GT"}, "the reference holds only GT rows"
+    assert len(rows) == 12, "one reference row per test movie"
+
+    other = benchmarks[benchmarks["model"] == "Caliban - Caliban"]
+    assert len(other) == 12
+    assert pooled_metrics(rows) != pooled_metrics(other), (
+        "the two rows differ, so reading the wrong one would silently change the reference"
+    )
+
+
+def test_every_non_empty_frame_is_evaluated():
+    """Requirement: Evaluation covers every non-empty frame."""
     from torch_tracking.eval import build_indices
 
     y = np.zeros((1, 71, 4, 4, 1), dtype=np.int32)
@@ -977,20 +1171,90 @@ def test_final_non_empty_frame_is_excluded_from_evaluation():
 
     (end_frame,) = build_indices(y)
 
-    assert end_frame == 70, (
-        "Divergence 25: the frame extent is one fewer than the non-empty frame count "
-        "and is used as a slice bound, so frames 0..69 are evaluated and frame 70 is "
-        "dropped. This is retained ON PURPOSE so the harness reproduces the recorded "
-        "baseline exactly. If this changed, correct-scale-convention has landed - "
-        "update the tracking-metrics spec and delete this test."
-    )
-
+    assert end_frame == 71, "the extent is the non-empty frame count, not one fewer"
     evaluated = y[0, :end_frame]
-    assert evaluated.shape[0] == 70
-    assert y[0, end_frame].any(), (
-        "Divergence 25: the excluded frame is genuinely non-empty - 920 cell-instances "
-        "across the real test split lie in frames excluded this way."
+    assert evaluated.shape[0] == 71 and evaluated[70].any(), "frame 70 is evaluated"
+
+
+def test_trailing_empty_frames_stay_excluded_from_evaluation():
+    """Requirement: Evaluation covers every non-empty frame (empty frames stay out)."""
+    from torch_tracking.eval import build_indices
+
+    y = np.zeros((1, 10, 4, 4, 1), dtype=np.int32)
+    y[0, :7] = 1
+
+    (end_frame,) = build_indices(y)
+
+    assert end_frame == 7
+    assert not y[0, end_frame:].any(), "everything past the extent is empty padding"
+
+
+def test_the_non_empty_count_does_not_depend_on_the_channel_axis():
+    """The loader's old count reduced axes (1, 2, 3) of a 5-D array, which counts
+    correctly only when the channel axis is singleton."""
+    from torch_tracking.utils import count_nonempty_frames
+
+    frames = np.zeros((6, 3, 4, 4, 3), dtype=np.float32)   # (T, N, Y, X, C=3)
+    frames[:4, 0, 0, 0, 2] = 1.0                           # only the third channel is set
+
+    assert count_nonempty_frames(frames) == 4
+
+
+def test_a_frame_of_cancelling_values_is_still_non_empty():
+    """A sum-based count calls a frame holding +1 and -1 empty; a zero test does not."""
+    from torch_tracking.utils import count_nonempty_frames
+
+    frames = np.zeros((3, 2, 2), dtype=np.float32)
+    frames[0, 0, 0], frames[0, 1, 1] = 1.0, -1.0
+
+    assert count_nonempty_frames(frames) == 1
+
+
+def _padded_dataset(tmp_path, n, total=12, track_length=3, stride=1):
+    """A TrkDataset over a movie with `n` occupied frames followed by padding."""
+    from torch_tracking.loader import TrkDataset
+
+    path = make_processed_zarr(tmp_path / "padded_proc.zarr", n_frames=total)
+    zarr.open(str(path), mode="a")["appearances"][:, n:] = 0
+    return TrkDataset(path, track_length=track_length, stride=stride, augment=False)
+
+
+def test_the_final_non_empty_frames_are_reachable_by_a_window(tmp_path):
+    """Requirement: Samples are fixed-length windows slid across each movie.
+
+    Divergence 31: the old stop rule left the last two occupied frames in no sample.
+    """
+    n = 10
+    covered = set()
+    for sample in _padded_dataset(tmp_path, n).samples:
+        covered.update(range(sample["start_frame"], sample["end_frame"]))
+
+    assert {n - 2, n - 1} <= covered, (
+        f"frames {n - 2} and {n - 1} are occupied but appear in no training window; "
+        f"covered {sorted(covered)}"
     )
+    assert covered == set(range(n))
+
+
+def test_no_window_extends_into_padding(tmp_path):
+    """Requirement: Samples are fixed-length windows slid across each movie."""
+    n = 10
+    for sample in _padded_dataset(tmp_path, n).samples:
+        assert sample["end_frame"] <= n, f"window {sample} reaches into padding past frame {n}"
+
+
+def test_the_stop_rule_holds_at_any_stride(tmp_path):
+    """Requirement: Samples are fixed-length windows slid across each movie.
+
+    The old stop was an equality, which a stride > 1 can step straight over - here the
+    last window would have covered frames 8-11, two of them padding.
+    """
+    n = 10
+    dataset = _padded_dataset(tmp_path, n, track_length=4, stride=2)
+
+    assert dataset.samples, "the movie still yields windows"
+    for sample in dataset.samples:
+        assert sample["end_frame"] <= n, f"window {sample} reaches into padding past frame {n}"
 
 
 # ======================================================================================
@@ -1070,33 +1334,82 @@ def test_labels_are_made_unique_across_frames():
 
 def test_coarser_input_is_enlarged_to_the_model_resolution():
     """The inference convention is `mpp / MODEL_MPP`, which enlarges a coarse movie."""
-    from torch_tracking.utils import resize
+    from torch_tracking.utils import resize, scale_factor
 
-    model_mpp = 0.55
-    mpp = 0.65
-    scale = mpp / model_mpp
+    scale = scale_factor(0.65)
 
     X = np.ones((100, 100, 1), dtype=np.float32)
     new_shape = (int(scale * 100), int(scale * 100))
     out = resize(X, shape=new_shape, data_format="channels_last")
 
     assert out.shape[:2] == (118, 118), (
-        "Inference scales by mpp/MODEL_MPP, enlarging coarse data so each pixel spans "
-        "the model resolution. The training path scales by the RECIPROCAL "
-        "(MODEL_MPP/mpp), which shrinks it - that is divergence 12 and the training "
-        "side is the wrong one. If this test now expects (84, 84), the inference "
-        "convention was changed to match the defect rather than the physics."
+        "The rescaling rule is mpp/MODEL_MPP, which enlarges a movie coarser than the "
+        "model so that each pixel spans the model resolution. Conversion and inference "
+        "both apply it (divergence 12 was the reciprocal on the training side). If this "
+        "test now expects (84, 84), the rule was inverted: coarse data is being shrunk."
     )
 
 
 def test_matching_resolution_leaves_dimensions_unchanged():
-    from torch_tracking.utils import resize
+    from torch_tracking.utils import resize, scale_factor
 
     X = np.ones((100, 100, 1), dtype=np.float32)
-    scale = 0.55 / 0.55
+    scale = scale_factor(REFERENCE_MPP)
+    assert scale == 1.0
     out = resize(X, shape=(int(scale * 100), int(scale * 100)), data_format="channels_last")
 
     assert out.shape[:2] == (100, 100)
+
+
+def _first_cell_area(tmp_path, mpp):
+    """Convert a one-movie split declared at `mpp`; return its first cell's frame-0 area."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, split="train", mpp=mpp)
+    convert_trk_to_zarr(str(trks))
+    z = zarr.open(str(tmp_path / "train_proc.zarr"), mode="r")
+    return float(z["morphologies"][0, 0, 0, 0])
+
+
+def test_conversion_rescales_by_the_shared_rule(tmp_path):
+    """Requirement: Conversion rescales to the model resolution.
+
+    Observed through the output rather than the factor: a coarser movie is enlarged,
+    so the same physical cell covers more pixels, by the square of the shared factor.
+    Divergence 12 shrank it instead (area ratio 0.716 at 0.65 um/px).
+    """
+    from torch_tracking.utils import scale_factor
+
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "coarse").mkdir()
+    reference_area = _first_cell_area(tmp_path / "ref", REFERENCE_MPP)
+    coarse_area = _first_cell_area(tmp_path / "coarse", 0.65)
+
+    assert reference_area == 144.0, "a movie at the model resolution must be untouched"
+    expected = reference_area * scale_factor(0.65) ** 2
+    assert coarse_area > reference_area, (
+        "A movie coarser than the model must be ENLARGED so a pixel spans MODEL_MPP. "
+        "Its cells got smaller, which is the reciprocal rule of divergence 12."
+    )
+    # Nearest-neighbour label resampling rounds the edge to whole pixels.
+    assert coarse_area == pytest.approx(expected, rel=0.15)
+
+
+def test_a_stored_resolution_sizes_a_movie_exactly_as_the_declared_one_does(tmp_path):
+    """Both sides size a movie from the stored resolution, so storing it must be exact.
+
+    A float32 0.65 is 0.64999998..., and np.float32 / float stays float32 under NumPy 2,
+    so the rescaled size differed by a pixel at sizes such as 110, 121 and 132.
+    """
+    from torch_tracking.utils import scale_factor
+
+    path = tmp_path / "mpp.zarr"
+    zarr.open(str(path), mode="w").create_array("mpp", data=np.asarray([0.65]))
+    stored = zarr.open(str(path), mode="r")["mpp"][:][0]
+
+    for size in (110, 121, 132, 220):
+        assert int(scale_factor(stored) * size) == int(scale_factor(0.65) * size), size
+    assert scale_factor(np.float32(0.65)) != scale_factor(0.65), "float32 would not be exact"
 
 
 def test_rescaled_masks_introduce_no_new_labels():

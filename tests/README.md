@@ -47,6 +47,7 @@ pytest -m l1                      # model structural contracts
 pytest -m l2                      # end-to-end on the synthetic fixture
 pytest -m l3                      # accuracy; skips without gated assets
 pytest -m "l0 or l1 or l2"        # exactly what CI runs
+TORCH_TRACKING_WEIGHTS=/path/to/best_model.pt pytest -m l3   # l3 on a local, unpublished checkpoint
 ```
 
 Markers are declared in `pyproject.toml` and enforced with `--strict-markers`, so a
@@ -71,7 +72,11 @@ L3 needs **both** gated assets, and neither is available to an automated runner:
    that previously issued data API keys was removed. See `doc/model_access.md`.
 
 Both L3 fixtures call `pytest.skip` rather than failing, so a plain `pytest` run is
-green without them. Running L3 at all currently requires a local copy of the dataset.
+green without them. Running L3 at all currently requires a local copy of the dataset. L3 must use the
+retrained checkpoint: the `pinned_weights` fixture in `conftest.py` holds the revision,
+and the checkpoint trained before the scale correction must not be evaluated with the
+corrected pipeline. L3 reports each contract metric next to the reference rather than
+asserting a floor.
 
 ## Where the assertions are
 
@@ -96,4 +101,5 @@ cost matrix, the assignment, division detection, lineage construction — and no
 about accuracy.
 
 **A green suite is not evidence that the model still works.** Accuracy is L3's job,
-measured against the baseline recorded in `metrics/PROVENANCE.md`.
+reported against the `Caliban - GT` rows of `metrics/benchmarks.csv`. `metrics/PROVENANCE.md`
+records what produced the current figures; they are not a target to reproduce.

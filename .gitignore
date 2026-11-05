@@ -18,3 +18,7 @@ notebooks/
 
 # Docs cruft
 doc/_build
+
+# Claude Code local config and instructions
+.claude/
+CLAUDE.md

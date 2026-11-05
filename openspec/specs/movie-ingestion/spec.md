@@ -199,7 +199,7 @@ random state.
 
 ### Requirement: Appearance is a fixed-size crop that clips large cells
 
-**Pending-fix:** `correct-scale-convention` replaces this with an aspect-preserving
+**Pending-fix:** `redesign-feature-extraction` replaces this with an aspect-preserving
 resize. The system SHALL extract each cell's appearance as a fixed 32×32 pixel window
 centred on its centroid, taken from a zero-padded image. A cell larger than the window
 SHALL be clipped rather than resized, discarding its periphery.
@@ -216,7 +216,7 @@ SHALL be clipped rather than resized, discarding its periphery.
 
 ### Requirement: Centroids are reported in padded-crop coordinates
 
-**Pending-fix:** `correct-scale-convention` makes this moot. Centroids SHALL be reported
+**Pending-fix:** `redesign-feature-extraction` makes this moot. Centroids SHALL be reported
 offset by the appearance crop size, 32 pixels, on both spatial axes, because they are
 measured after an internal padding step. A consumer comparing a centroid against an image
 coordinate MUST subtract it. This is divergence 11 and is suspected incorrect.
@@ -235,7 +235,7 @@ coordinate MUST subtract it. This is divergence 11 and is suspected incorrect.
 
 ### Requirement: An all-zero appearance crop is left unnormalized
 
-**Pending-fix:** `correct-scale-convention` makes this moot by replacing the fixed-crop
+**Pending-fix:** `redesign-feature-extraction` makes this moot by replacing the fixed-crop
 branch it lives in. When a cell's appearance crop contains no non-zero pixels, the system
 SHALL emit `RuntimeWarning: Mean of empty slice` and SHALL leave the crop as zeros rather
 than normalizing it. The guard intended to prevent this tests the arity of an index tuple

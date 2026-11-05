@@ -7,9 +7,8 @@ from :mod:`torch_tracking.eval` so both harnesses evaluate the same frames.
 
 Importing this module performs no sweep.
 
-The two deliberately retained defects documented in :mod:`torch_tracking.eval` apply here
-too: each movie's final non-empty frame is excluded (divergence 25), and no per-movie
-``mpp`` reaches the tracker (divergences 12 and 28).
+It also shares the other evaluation rules: every non-empty frame is evaluated, and each
+movie is tracked at the resolution its zarr declares.
 """
 
 from pathlib import Path
@@ -23,6 +22,7 @@ import zarr
 from torch_tracking.eval import build_indices, _resolve_split
 from torch_tracking.metrics import TrackingMetrics
 from torch_tracking.tracker import CellTracker
+from torch_tracking.utils import require_mpp, DISTANCE_THRESHOLD
 
 __all__ = ['sweep', 'build_indices']
 
@@ -41,7 +41,7 @@ def sweep(
     birth_sweep=DEFAULT_BIRTH_SWEEP,
     death_sweep=DEFAULT_DEATH_SWEEP,
     track_length=8,
-    distance_threshold=64,
+    distance_threshold=DISTANCE_THRESHOLD,
     threshold=0.8,
     verbose=False,
     progress=True,
@@ -61,6 +61,7 @@ def sweep(
     zarr_path, lineage_path = _resolve_split(split_dir, split)
 
     z = zarr.open(str(zarr_path))
+    mpps = require_mpp(z, zarr_path)
     with open(lineage_path) as handle:
         gt_lineages = json.load(handle)
 
@@ -87,6 +88,7 @@ def sweep(
             tracker = CellTracker(
                 checkpoint_dir=checkpoint_path,
                 device=device,
+                mpp=float(mpps[batch]),
                 division=div_thresh,
                 birth=birth_thresh,
                 death=death_thresh,

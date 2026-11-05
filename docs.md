@@ -24,7 +24,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
   - `birth`: diagonal cost used in the birth sub-matrix of the LAP — higher values make new track creation less likely
   - `division`: minimum class-2 (daughter) probability required for a new track to be labelled a division rather than a fresh birth
   - `track_length`: number of historical frames fed to the `InferenceBranch` LSTM — shorter histories are zero-padded
-  - `mpp`: microns-per-pixel of the input data; the data is rescaled so that `model_mpp / mpp` matches the resolution the model was trained on
+  - `mpp`: microns-per-pixel of the input data; the data is rescaled by `mpp / model_mpp` (`model_mpp` is 0.55), so each pixel spans the resolution the model was trained on. A movie coarser than the model is enlarged
 
 - **Raises**: `ValueError` for rank != 4, mismatched spatial shapes
 
@@ -216,13 +216,11 @@ Document the internal schema of a single entry in `self.tracks`:
 
 - **Purpose**: per-movie frame extent, used to avoid running the tracker on zero-padded frames
 - **Parameters**: `y` — batched label array of shape `(B, T, H, W, C)`
-- **Logic**: counts frames whose mask holds any labelled pixel, and returns that count
-  **minus one**
-- **Returns**: list of `int`, one per movie
-- **Divergence 25**: callers use the returned value as a *slice bound*, so each movie's
-  final non-empty frame is never evaluated — 920 cell-instances across the test split.
-  This is retained deliberately so the harness reproduces the recorded baseline exactly;
-  `correct-scale-convention` removes it
+- **Logic**: counts frames whose mask holds any labelled pixel, via
+  `utils.count_nonempty_frames`, and returns that count
+- **Returns**: list of `int`, one per movie. It is the exclusive end of the occupied
+  frames, so used as a slice bound it includes every non-empty frame. The training
+  dataloader derives its extent from the same `count_nonempty_frames`
 
 #### `pretty_print(pooled)`
 
@@ -260,9 +258,9 @@ Document the internal schema of a single entry in `self.tracks`:
 - `build_indices` is called **once**, outside the loop; the result is constant
 - A fresh `CellTracker` is constructed per movie, so no state carries across movies and
   evaluation order cannot affect any result
-- **Divergences 12 and 28**: no `mpp` is supplied, so every movie is tracked at the
-  default 0.55 µm/px whatever it declares. Ten of the twelve test movies are declared at
-  0.65. Retained deliberately; `correct-scale-convention` removes it
+- Each tracker is constructed with the movie's declared `mpp`, read from the split's
+  `mpp` array, so it is rescaled by `mpp / model_mpp` exactly as conversion did. A zarr
+  holding no `mpp` raises `ValueError` rather than defaulting to 0.55 µm/px
 - Both lineage dicts are re-keyed as `int` before reaching `TrackingMetrics`, because JSON
   object keys are always strings while `get_lineage_dict()` returns `int` keys
 - `TrackingMetrics(...).stats` is the raw dict collected per movie

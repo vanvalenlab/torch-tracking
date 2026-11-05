@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import torchvision.transforms.v2.functional as F
 from scipy.spatial.distance import cdist
+
+from torch_tracking.utils import require_mpp, count_nonempty_frames, spatial_adjacency, DISTANCE_THRESHOLD
 warnings.filterwarnings("ignore") 
 
 
@@ -41,7 +43,7 @@ class TrkDataset(Dataset):
         track_length: int = 8,
         stride: int = 1,
         data_format: str = 'channels_first',
-        distance_threshold: float = 64,
+        distance_threshold: float = DISTANCE_THRESHOLD,
         augment: bool = True,
         rotation_range: int = 180,
         translation_range: float = 512,
@@ -62,6 +64,7 @@ class TrkDataset(Dataset):
         self.t_direction = t_direction
 
         features = zarr.open(self.trk_path)
+        require_mpp(features, self.trk_path)
 
         self.features = {}
         for k in tqdm.tqdm(features.keys()):
@@ -88,14 +91,13 @@ class TrkDataset(Dataset):
         B, T, N, Y, X, C = self.features['appearances'].shape
         
         for batch_idx in range(B):
-            # Slide window across time dimension
-            max_frames = np.sum(np.sum(self.features['appearances'][batch_idx], axis=(1, 2, 3)) != 0).item() - 1
+            # Slide window across the movie's occupied frames. The extent is the shared
+            # rule evaluation uses, and a window is kept while it ends within it, so
+            # every non-empty frame is reachable and none reaches into padding.
+            extent = min(T, count_nonempty_frames(self.features['appearances'][batch_idx]))
 
-            for start_frame in range(0, T - self.track_length + 1, self.stride):
+            for start_frame in range(0, extent - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
-
-                if end_frame == max_frames:
-                    break
 
                 samples.append({
                     'batch_idx': batch_idx,
@@ -133,15 +135,16 @@ class TrkDataset(Dataset):
 
         return appearances, centroids
     
-    def _get_adj_matrix(self, centroids):
+    def _get_adj_matrix(self, centroids, morphologies):
+        """Spatial graph for each frame of a window, by the rule inference also uses."""
 
         T, N, _ = centroids.shape
-        adj_matrix = np.zeros((T, N, N))
+        adj_matrix = np.zeros((T, N, N), dtype=bool)
 
         for time in range(T):
-            adj_matrix[time] = cdist(centroids[time], centroids[time], metric='euclidean')
-
-        adj_matrix = (adj_matrix > 0) & (adj_matrix < self.distance_threshold)
+            adj_matrix[time] = spatial_adjacency(
+                centroids[time], morphologies[time], self.distance_threshold
+            )
 
         return adj_matrix
     
@@ -218,7 +221,7 @@ class TrkDataset(Dataset):
             'morphologies': self.features['morphologies'][batch_idx, time_slice]
         }
 
-        items['adj_matrices'] = self._get_adj_matrix(items['centroids'])
+        items['adj_matrices'] = self._get_adj_matrix(items['centroids'], items['morphologies'])
         
         # Generate labels if in training mode
 
@@ -362,7 +365,7 @@ if __name__ == '__main__':
         train_path='data/DynamicNuclearNet-tracking-v1_0/train_proc.zarr',
         val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
         batch_size=config['batch_size'],
-        distance_threshold=64,
+        distance_threshold=DISTANCE_THRESHOLD,
         num_workers=config['num_workers'],
         truncate_dataset = config['truncate_dataset'],
         t_direction=config['t_direction'],
