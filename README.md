@@ -33,7 +33,7 @@ This is a PyTorch port of the cell tracking model from [Caliban](https://www.bio
 ## Installation
 
 ```bash
-git clone https://github.com/sholtzen/torch-tracking.git
+git clone https://github.com/vanvalenlab/torch-tracking.git
 cd torch-tracking
 pip install .
 pip install -r requirements.txt
