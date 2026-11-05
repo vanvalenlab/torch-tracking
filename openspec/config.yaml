@@ -42,7 +42,7 @@ context: |
   Specify current behavior, not intended behavior. Where documentation and code disagree,
   or two parts of the repository contradict each other, record the divergence explicitly
   and assign it to a capability rather than fixing it inline. The divergence register in
-  openspec/changes/seed-spec-campaign-groundwork/design.md is the running list.
+  openspec/DIVERGENCES.md is the running list.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
