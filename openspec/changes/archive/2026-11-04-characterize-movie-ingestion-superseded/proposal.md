@@ -1,5 +1,25 @@
 # Proposal
 
+> **Status: SUPERSEDED by `specify-movie-ingestion`. Never applied, never synced.**
+>
+> This change was planned under the campaign's original describe-current-behavior premise,
+> which `adopt-intended-behavior-stance` retired. `specify-movie-ingestion` replaces it
+> with an intended-first `movie-ingestion` spec, fixes divergence 13, and marks the
+> fixed-crop surface Pending-fix rather than characterizing it.
+>
+> Its findings stand. Divergences 11-14 were all found here and remain live in
+> `openspec/DIVERGENCES.md`; 13 is now fixed, and 11 and 14 are retained deliberately
+> until `correct-scale-convention`. Its technical decisions on test layering, resampling
+> assertions and fixtures were carried into the replacement's `design.md`.
+>
+> One claim below is now known to be wrong, and is left in place as the record of what was
+> believed at the time: divergence 12 does **not** condemn this capability's rescaling
+> requirement. Inference scales by `mpp/0.55`, which is the physically correct side; the
+> defect is `preprocess.py`'s reciprocal. That mis-assignment is part of why this change
+> was parked. Divergences 12 and 17 are now assigned to `training-data` alone.
+>
+> The original parking note follows.
+
 > **Status: parked. Do not apply this change yet.**
 >
 > Preparing it surfaced divergence 12 — the training pipeline scales by `0.55/mpp` while

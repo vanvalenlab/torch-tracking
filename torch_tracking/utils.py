@@ -392,7 +392,12 @@ def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
 
     # each feature will be ordered based on the label.
     # labels are also stored and can be fetched by index.
-    num_labels = len(np.unique(y)) - 1
+    #
+    # Count distinct non-zero labels directly. Deriving this as
+    # len(np.unique(y)) - 1 assumed every frame contains background, so a fully
+    # tiled mask - a confluent monolayer filling the field of view - sized these
+    # arrays one short and raised IndexError. Divergence 13.
+    num_labels = len(np.unique(y[y != 0]))
     labels = np.zeros((num_labels,), dtype='int32')
     centroids = np.zeros((num_labels, 2), dtype='float32')
     morphologies = np.zeros((num_labels, 3), dtype='float32')

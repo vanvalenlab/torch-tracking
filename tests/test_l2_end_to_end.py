@@ -271,3 +271,168 @@ def test_inference_resolution_is_fixed_not_read_from_the_movie(untrained_checkpo
         "correct-scale-convention has landed - update the tracking-metrics spec and "
         "delete this test."
     )
+
+
+# ======================================================================================
+# movie-ingestion: requirements observable only through CellTracker.
+# ======================================================================================
+
+
+def _two_frame_movie(frame_cells, size=128):
+    """Build `(T, H, W, 1)` movie and mask arrays from per-frame (label, row, col) specs."""
+    import numpy as np
+
+    n = len(frame_cells)
+    y = np.zeros((n, size, size, 1), dtype=np.int32)
+    for t, cells in enumerate(frame_cells):
+        for label, row, col in cells:
+            y[t, row - 4:row + 4, col - 4:col + 4, 0] = label
+    X = (y > 0).astype(np.float32)
+    return X, y
+
+
+def _tracker(checkpoint, **kwargs):
+    from torch_tracking.tracker import CellTracker
+
+    params = dict(BASELINE_INFERENCE_PARAMS)
+    params.update(kwargs)
+    return CellTracker(checkpoint_dir=str(checkpoint), device="cpu", verbose=False, **params)
+
+
+def test_rank_4_is_required_and_the_error_names_the_ranks(untrained_checkpoint, synthetic_movie):
+    tracker = _tracker(untrained_checkpoint)
+
+    with pytest.raises(ValueError) as excinfo:
+        tracker.preprocess_movie(movie=synthetic_movie.X[..., 0], annotation=synthetic_movie.y)
+
+    message = str(excinfo.value)
+    assert "rank 4" in message
+    assert "rank 3" in message, "the error must report the rank actually received"
+
+
+def test_shapes_must_agree_except_on_channels(untrained_checkpoint):
+    import numpy as np
+
+    tracker = _tracker(untrained_checkpoint)
+
+    movie = np.zeros((10, 100, 100, 1), dtype=np.float32)
+    masks = np.zeros((10, 200, 200, 1), dtype=np.int32)
+
+    with pytest.raises(ValueError) as excinfo:
+        tracker.preprocess_movie(movie=movie, annotation=masks)
+
+    message = str(excinfo.value)
+    assert "(10, 100, 100, 1)" in message and "(10, 200, 200, 1)" in message, (
+        "the error must report both shapes"
+    )
+
+
+def test_a_multi_channel_movie_passes_shape_validation(untrained_checkpoint, synthetic_movie):
+    import numpy as np
+
+    tracker = _tracker(untrained_checkpoint)
+
+    two_channel = np.concatenate([synthetic_movie.X, synthetic_movie.X], axis=-1)
+
+    # The appearance encoder is built for one channel, so a two-channel movie fails
+    # later in the model. That is `tracking-model`'s contract, not this comparison's.
+    # What this asserts is only that shape validation does not reject it.
+    try:
+        tracker.preprocess_movie(movie=two_channel, annotation=synthetic_movie.y.copy())
+    except ValueError as exc:
+        pytest.fail(f"shape validation rejected a multi-channel movie: {exc}")
+    except Exception:
+        pass
+
+    assert tracker.y_original is not None, (
+        "ingestion got past validation and stored the original-resolution masks"
+    )
+
+
+def test_original_resolution_masks_are_retained_across_a_rescale(
+    untrained_checkpoint, synthetic_movie
+):
+    """A rescaling tracker still keeps masks in the caller's coordinate space."""
+    tracker = _tracker(untrained_checkpoint, mpp=0.65)
+    assert tracker.scale_factor != 1.0, "fixture must actually rescale"
+
+    _, height, width, _ = synthetic_movie.y.shape
+    tracker.preprocess_movie(
+        movie=synthetic_movie.X.copy(), annotation=synthetic_movie.y.copy()
+    )
+
+    assert tracker.y_original.shape[1:3] == (height, width), (
+        "masks at the caller's resolution must survive the rescale"
+    )
+    assert tracker.y.shape[1:3] != (height, width), "the working copy should be rescaled"
+
+
+def test_adjacency_links_near_cells_and_not_distant_ones(untrained_checkpoint):
+    """Cells within distance_threshold connect; beyond it they do not."""
+    import numpy as np
+
+    # Two cells 20 px apart, one 300 px away is impossible in 128px, so use 110.
+    X, y = _two_frame_movie([[(1, 20, 20), (2, 20, 40), (3, 20, 118)]])
+
+    tracker = _tracker(untrained_checkpoint, distance_threshold=64)
+    tracker.preprocess_movie(movie=X, annotation=y)
+    adj, _, _, _ = tracker._extract_features()
+
+    frame = adj[0, 0]
+    assert frame[0, 1] == 1.0, "cells 20 px apart should be linked at threshold 64"
+    assert frame[0, 2] == 0.0, "cells ~98 px apart should not be linked at threshold 64"
+
+
+def test_no_cell_is_adjacent_to_itself(untrained_checkpoint):
+    import numpy as np
+
+    X, y = _two_frame_movie([[(1, 20, 20), (2, 20, 40)]])
+
+    tracker = _tracker(untrained_checkpoint)
+    tracker.preprocess_movie(movie=X, annotation=y)
+    adj, _, _, _ = tracker._extract_features()
+
+    assert np.diagonal(adj[0, 0]).sum() == 0, "the adjacency diagonal must be zero"
+
+
+def test_padding_entries_are_isolated(untrained_checkpoint):
+    """The property that separates inference from training's divergence 17."""
+    import numpy as np
+
+    # Frame 0 has three cells, frame 1 has one: frame 1 carries two padding slots.
+    X, y = _two_frame_movie([
+        [(1, 20, 20), (2, 20, 40), (3, 40, 20)],
+        [(1, 20, 20)],
+    ])
+
+    tracker = _tracker(untrained_checkpoint)
+    tracker.preprocess_movie(movie=X, annotation=y)
+    adj, _, morphologies, _ = tracker._extract_features()
+
+    padded_frame = adj[0, 1]
+    is_padding = morphologies[0, 1].sum(axis=-1) == 0
+    assert is_padding.any(), "fixture must produce padding slots"
+
+    assert padded_frame[is_padding].sum() == 0, (
+        "every padding slot must be disconnected. Inference applies this exclusion "
+        "(tracker.py:277-281); the training dataloader does not, which is divergence 17 "
+        "and belongs to training-data."
+    )
+    assert padded_frame[:, is_padding].sum() == 0, "padding columns must also be empty"
+
+
+def test_ingestion_is_deterministic(untrained_checkpoint, synthetic_movie):
+    import numpy as np
+
+    results = []
+    for _ in range(2):
+        tracker = _tracker(untrained_checkpoint)
+        tracker.preprocess_movie(
+            movie=synthetic_movie.X.copy(), annotation=synthetic_movie.y.copy()
+        )
+        results.append(tracker._extract_features())
+
+    for name, first, second in zip(
+        ("adjacency", "appearances", "morphologies", "centroids"), results[0], results[1]
+    ):
+        assert np.array_equal(first, second), f"{name} differed between identical runs"
