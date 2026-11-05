@@ -39,12 +39,51 @@ Every number in both files measures *tracking only*, on masks supplied as input.
 | Also published as | `vanvalenlab/torch-tracking` → `torch-tracking_2026-07-30.pt` (HuggingFace) |
 | HF revision | `038f1e6e47f28f0cc11f106a14c7e8bae9d5896c` |
 | Dataset | `DynamicNuclearNet-tracking` v1.0, `test` split (12 movies, up to 71 frames, 584×600) |
-| Harness | `torch_tracking/eval.py` |
-| Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=64`, `mpp=0.55` |
+| Harness | `torch_tracking.eval.evaluate()` — see the note on the entry point below |
+| Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=64`. **No `mpp` is supplied**, so the tracker's default of 0.55 applies to every movie — see below |
 | Metric match threshold | `TrackingMetrics(..., threshold=0.8)` |
-| Frames per movie | `end_frame = (count of non-empty frames) - 1`, per `build_indices` |
-| Device | `eval.py` specifies `cuda:1`; reproduced exactly on CPU |
+| Frames per movie | `end_frame = (count of non-empty frames) - 1`, per `build_indices`, used as a **slice bound** — so each movie's final non-empty frame is excluded. See below |
+| Device | Reproduced exactly on **both** CPU and GPU, as constraint 1 requires. The harness defaults to CPU and requires no GPU; the original figures were produced on `cuda:1` |
 | Verified at | commit `a1c39ff`, 2026-11-04 |
+| Re-verified at | `make-eval-harness-reproducible`, 2026-11-04 — reproduced exactly through the new entry point |
+| Verification environment | Python 3.14.3, torch 2.11.0+cu128, numpy 2.5.2, pandas 3.0.5, zarr 3.3.0, torch-geometric 2.8.0.post1 |
+
+### What these figures do and do not cover
+
+Three facts about how these numbers were produced, recorded here because they qualify
+every accuracy claim that cites them.
+
+**The entry point moved, the numbers did not.** `make-eval-harness-reproducible` replaced
+the `__main__` script with the importable `torch_tracking.eval.evaluate()`. That change was
+gated on reproducing this file exactly, so the figures above describe both the original
+script and the current harness. Reproduce them with:
+
+```bash
+python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking
+```
+
+**The figures are stable across dependency versions, as far as has been tested.** The
+original run used a different torch build from the one in the environment table above - the
+re-verification crossed a torch downgrade from 2.13.0+cu130 to 2.11.0+cu128 and reproduced
+every row to within 1e-9. That is one data point, not a guarantee, but it means a future
+reproduction failure is more likely to indicate a code change than a dependency bump. The
+environment is recorded from here on so that the distinction can be made at all: it could
+not be, before this entry existed.
+
+**Each movie's final non-empty frame was not evaluated.** The frame extent is one fewer
+than the count of non-empty frames and is used as a slice bound, so the last labelled frame
+of every movie is dropped — **920 cell-instances** across the twelve-movie test split, 241
+of them in movie 8 alone. This is divergence 25. The figures above therefore cover one
+frame less per movie than the dataset provides.
+
+**No per-movie resolution reached the tracker.** The harness supplies no `mpp`, so every
+movie is tracked at the default 0.55 um/px. The test split declares **ten of its twelve
+movies at 0.65 um/px**. Meanwhile training rescaled by `0.55/mpp` — the reciprocal of the
+inference convention — giving an effective training resolution of 0.768 um/px for those
+same movies. These two errors partially cancel, which is why the figures above look
+reasonable. They are divergences 12 and 28, and `correct-scale-convention` corrects both
+together with a retrain. Correcting either alone makes the mismatch worse, so these numbers
+cannot be improved on incrementally; they will be replaced wholesale.
 
 **The published weights and the baseline weights are the same file.** The checkpoint that
 produced these numbers is byte-identical to the one `CellTracker()` downloads by default, so
@@ -75,16 +114,22 @@ The file carried no checkpoint provenance, so it was determined empirically on 2
 4. Replaying all 12 movies with `20260607-083350` reproduced **every row identically**, and
    the aggregate division F1 to four decimal places.
 
-This agrees with the checkpoint path hardcoded in `torch_tracking/eval.py`.
+This agreed with the checkpoint path that `torch_tracking/eval.py` hardcoded at the time.
+That path is now a required argument, so the agreement is historical evidence for the
+identification above rather than something a reader can re-check in the source.
 
 ### Reproducing it
 
 Requires `DynamicNuclearNet-tracking` (see `doc/model_access.md`). The full test set takes
 roughly two minutes on CPU, so compute is not the barrier — dataset access is.
 
-Note that `eval.py` currently hardcodes its checkpoint path, device, and output location,
-and writes `eval_results.csv` to the repository root rather than to `metrics/`. The root
-copy is byte-identical to this one.
+`make-eval-harness-reproducible` replaced the hardcoded checkpoint path, device and output
+location with arguments, and removed the stray root-level copy of this file that the old
+harness produced. Reproduce the figures with:
+
+```bash
+python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking
+```
 
 ---
 

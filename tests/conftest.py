@@ -133,3 +133,52 @@ def pinned_weights():
         )
     except Exception as exc:  # network, auth, or gating failure
         pytest.skip(f"could not fetch pinned weights: {type(exc).__name__}")
+
+
+# --------------------------------------------------------------------------------------
+# Evaluation-harness fixtures. `tracking-metrics` evaluates a split on disk, so its tests
+# need a split - built from the synthetic movie, deriving from no dataset.
+# --------------------------------------------------------------------------------------
+
+
+def write_split(split_dir, X, y, lineages, split="test"):
+    """Write a `<split>.zarr` (X, y) and `<split>.json` (lineages) under `split_dir`.
+
+    Mirrors the layout `evaluate()` expects, so tests can build a split of any size
+    without the gated archive.
+    """
+    import json
+
+    import zarr
+
+    split_dir = Path(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    root = zarr.open(str(split_dir / f"{split}.zarr"), mode="w")
+    root["X"] = X
+    root["y"] = y
+
+    (split_dir / f"{split}.json").write_text(json.dumps(lineages))
+
+    return split_dir
+
+
+@pytest.fixture(scope="session")
+def synthetic_split(tmp_path_factory, synthetic_movie):
+    """A two-movie evaluation split on disk.
+
+    The second movie is the first flipped across the width axis: the same labels in
+    the same frames, so the ground-truth lineage stays valid, but different centroids,
+    so the two movies are genuinely distinct inputs rather than duplicates.
+    """
+    import numpy as np
+
+    movie_a_X, movie_a_y = synthetic_movie.X, synthetic_movie.y
+    movie_b_X = np.flip(movie_a_X, axis=2).copy()
+    movie_b_y = np.flip(movie_a_y, axis=2).copy()
+
+    X = np.stack([movie_a_X, movie_b_X])
+    y = np.stack([movie_a_y, movie_b_y])
+    lineages = [synthetic_movie.lineage, synthetic_movie.lineage]
+
+    return write_split(tmp_path_factory.mktemp("split"), X, y, lineages)

@@ -101,3 +101,173 @@ def test_lap_decisions_are_not_near_ties(tracked_synthetic):
         f"at or below {MIN_LAP_MARGIN:.0e}. Assignments are near ties, so frozen "
         "golden outputs would not be reproducible across platforms."
     )
+
+
+# ======================================================================================
+# tracking-metrics: the evaluation harness, end to end on the synthetic split.
+#
+# Accuracy is not asserted here - the checkpoint is untrained noise. What is asserted is
+# the harness contract: what it returns, where it writes, how it pools, and that it
+# carries no state between movies.
+# ======================================================================================
+
+
+@pytest.fixture(scope="module")
+def evaluated_split(untrained_checkpoint, synthetic_split, tmp_path_factory):
+    """One evaluation of the synthetic split, shared by the assertions below."""
+    from torch_tracking.eval import evaluate
+
+    return evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=synthetic_split,
+        output_dir=tmp_path_factory.mktemp("eval_out"),
+        progress=False,
+    )
+
+
+def test_evaluate_returns_per_movie_rows_and_pooled_figures(evaluated_split):
+    """The caller gets the results back, not only a file on disk."""
+    assert len(evaluated_split.per_movie) == 2, "one row per evaluated movie"
+
+    for key in ("division_f1", "aa_accuracy", "te_accuracy"):
+        assert key in evaluated_split.pooled, (
+            f"{key} must be reported by the harness, not aggregated outside it"
+        )
+
+
+def test_results_land_in_the_given_output_directory_not_the_cwd(
+    untrained_checkpoint, synthetic_split, tmp_path, monkeypatch
+):
+    """The directory the harness creates is the directory it writes into."""
+    from torch_tracking.eval import evaluate
+
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    output_dir = tmp_path / "chosen_output"
+    result = evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=synthetic_split,
+        output_dir=output_dir,
+        progress=False,
+    )
+
+    assert result.results_path == output_dir / "eval_results.csv"
+    assert result.results_path.exists()
+    assert list(workdir.iterdir()) == [], (
+        "nothing may be written to the process working directory; an earlier version "
+        "shadowed the output-directory name and wrote eval_results.csv to the CWD"
+    )
+
+
+def test_pooled_figures_are_recomputable_from_the_written_counts(evaluated_split):
+    """The CSV's count columns are the authoritative record."""
+    import pandas as pd
+
+    from torch_tracking.eval import COUNT_COLUMNS, pooled_metrics
+
+    written = pd.read_csv(evaluated_split.results_path)
+
+    for column in COUNT_COLUMNS:
+        assert column in written.columns, f"{column} must survive the round trip"
+
+    recomputed = pooled_metrics(written)
+
+    for key, value in evaluated_split.pooled.items():
+        if value == value:  # skip NaN, which is not comparable
+            assert recomputed[key] == pytest.approx(value)
+
+
+def test_target_effectiveness_column_keeps_its_published_name(evaluated_split):
+    """Renaming te_accuracy would break every consumer of the published baseline."""
+    import pandas as pd
+
+    written = pd.read_csv(evaluated_split.results_path)
+
+    assert "te_accuracy" in written.columns, (
+        "te_accuracy is a published interface: metrics/eval_results.csv is tracked and "
+        "cited in VISION.md. Divergence 9 is corrected in documentation, not by renaming."
+    )
+
+
+def test_evaluation_is_deterministic(untrained_checkpoint, synthetic_split, tmp_path):
+    """Constraint 1: identical inputs produce byte-identical results."""
+    from torch_tracking.eval import evaluate
+
+    second = evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=synthetic_split,
+        output_dir=tmp_path / "second",
+        progress=False,
+    )
+
+    third = evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=synthetic_split,
+        output_dir=tmp_path / "third",
+        progress=False,
+    )
+
+    assert second.results_path.read_bytes() == third.results_path.read_bytes()
+
+
+def test_each_movie_is_evaluated_from_fresh_tracker_state(
+    untrained_checkpoint, synthetic_split, synthetic_movie, tmp_path, evaluated_split
+):
+    """Evaluation order cannot affect any movie's result."""
+    import numpy as np
+
+    from tests.conftest import write_split
+    from torch_tracking.eval import evaluate
+
+    flipped_X = np.flip(synthetic_movie.X, axis=2).copy()
+    flipped_y = np.flip(synthetic_movie.y, axis=2).copy()
+
+    # The same two movies, in the opposite order.
+    reversed_split = write_split(
+        tmp_path / "reversed",
+        np.stack([flipped_X, synthetic_movie.X]),
+        np.stack([flipped_y, synthetic_movie.y]),
+        [synthetic_movie.lineage, synthetic_movie.lineage],
+    )
+
+    reordered = evaluate(
+        checkpoint_path=str(untrained_checkpoint),
+        split_dir=reversed_split,
+        output_dir=tmp_path / "reordered_out",
+        progress=False,
+    )
+
+    forward = evaluated_split.per_movie.reset_index(drop=True)
+    backward = reordered.per_movie.reset_index(drop=True)
+
+    for column in forward.columns:
+        assert forward.loc[0, column] == pytest.approx(
+            backward.loc[1, column], nan_ok=True
+        ), f"movie A's {column} changed when it was evaluated second"
+        assert forward.loc[1, column] == pytest.approx(
+            backward.loc[0, column], nan_ok=True
+        ), f"movie B's {column} changed when it was evaluated first"
+
+
+def test_inference_resolution_is_fixed_not_read_from_the_movie(untrained_checkpoint):
+    """Divergences 12 and 28, pinned deliberately."""
+    from torch_tracking.tracker import CellTracker
+
+    # This is how evaluate() constructs its tracker: no mpp= is supplied.
+    tracker = CellTracker(
+        checkpoint_dir=str(untrained_checkpoint),
+        device="cpu",
+        verbose=False,
+        **BASELINE_INFERENCE_PARAMS,
+    )
+
+    assert tracker.scale_factor == 1.0, (
+        "Divergences 12 and 28: the harness supplies no per-movie mpp, so every movie "
+        "is tracked at the default 0.55 um/px whatever it declares - ten of the twelve "
+        "test movies are declared at 0.65. This is retained ON PURPOSE so the harness "
+        "reproduces the recorded baseline exactly. If this changed, "
+        "correct-scale-convention has landed - update the tracking-metrics spec and "
+        "delete this test."
+    )

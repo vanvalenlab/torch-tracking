@@ -180,70 +180,105 @@ Document the internal schema of a single entry in `self.tracks`:
 
 ### 2.1 Module overview
 
-- Script that loads a test zarr dataset, runs `CellTracker` on each sample, computes `TrackingMetrics`, and aggregates results into a CSV
-- Also contains a visualization utility (`create_timelapse_gif`) for qualitative inspection
+- `torch_tracking.eval` exposes `evaluate()`: loads a split, runs `CellTracker` on each
+  movie, computes `TrackingMetrics`, pools the results and writes a per-movie CSV.
+  Importing the module performs no evaluation.
+- `torch_tracking.eval_sweep` exposes `sweep()`, the same evaluation across a grid of
+  postprocessing thresholds. It imports the frame-extent rule rather than redefining it.
+- Both also provide a `__main__` CLI. Neither reads any path fixed in source.
+- `create_timelapse_gif` remains available for qualitative inspection.
 
 ---
 
 ### 2.2 Functions
 
-#### `build_indices(X)`
+#### `evaluate(checkpoint_path, split_dir, ...)`
 
-- **Purpose**: Determines the last valid (non-empty) frame for each sample in a batched array, to avoid running the tracker on zero-padded frames
-- **Parameters**: `X` — batched label array of shape `(B, T, H, W, C)`
-- **Logic**: sums pixels across spatial and channel dimensions for each frame; the last frame with a non-zero sum is the end frame
-- **Returns**: list of `int`, one per batch entry
+- **Purpose**: evaluate a checkpoint against a ground-truth split
+- **Key parameters**: `checkpoint_path` and `split_dir` are required; `split` (default
+  `'test'`), `output_dir` (default `'metrics'`, or `None` to compute without writing),
+  `device` (default `'cpu'`), the tracking parameters, and `threshold`
+- **Returns**: `EvaluationResult` with `.per_movie` (one row per movie), `.pooled` (the
+  three contract metrics) and `.results_path`
+- **Raises**: `FileNotFoundError` naming the missing path when the split is absent
+- **Side effects**: writes `eval_results.csv` beneath `output_dir`, creating it if needed
 
-#### `pretty_print(df)`
+#### `pooled_metrics(df)`
 
-- **Purpose**: Prints a formatted summary of division detection performance (precision, recall, F1) aggregated across the full evaluation set
-- **Parameters**: `df` — the results DataFrame with columns `correct_division`, `false_positive_division`, `false_negative_division`
-- **Note**: computes macro-level (pooled) metrics rather than averaging per-sample, which is the appropriate choice when sample sizes vary
+- **Purpose**: pool division F1, association accuracy and target effectiveness across movies
+- **Parameters**: `df` — any frame carrying the columns in `eval.COUNT_COLUMNS`
+- **Logic**: sums each metric's numerator and denominator across movies and divides once.
+  A movie whose own ratio is undefined still contributes its counts
+- **Note**: this is deliberately *not* the mean of per-movie ratios. On the recorded test
+  split, pooling gives association accuracy 0.9728 where averaging gives 0.9715
+
+#### `build_indices(y)`
+
+- **Purpose**: per-movie frame extent, used to avoid running the tracker on zero-padded frames
+- **Parameters**: `y` — batched label array of shape `(B, T, H, W, C)`
+- **Logic**: counts frames whose mask holds any labelled pixel, and returns that count
+  **minus one**
+- **Returns**: list of `int`, one per movie
+- **Divergence 25**: callers use the returned value as a *slice bound*, so each movie's
+  final non-empty frame is never evaluated — 920 cell-instances across the test split.
+  This is retained deliberately so the harness reproduces the recorded baseline exactly;
+  `correct-scale-convention` removes it
+
+#### `pretty_print(pooled)`
+
+- **Purpose**: print every contract metric to the terminal
+- **Parameters**: `pooled` — the dict returned by `pooled_metrics`, i.e. `result.pooled`.
+  It previously took the results DataFrame and reported division metrics only
 
 #### `create_timelapse_gif(im1, im2, output_path, fps, titles, cmap)`
 
-- **Purpose**: Saves a side-by-side animated GIF comparing two label movies (typically predicted vs. ground truth) for qualitative review
+- **Purpose**: saves a side-by-side animated GIF comparing two label movies (typically
+  predicted vs. ground truth) for qualitative review
 - **Parameters**:
-  - `im1`, `im2`: arrays of shape `(T, H, W, C)` — note channels are not split, the whole slice is passed to `imshow`
+  - `im1`, `im2`: arrays of shape `(T, H, W, C)` — note channels are not split, the whole
+    slice is passed to `imshow`
   - `output_path`: destination path for the `.gif` file
   - `fps`: playback speed
   - `titles`: tuple of two strings for subplot titles
-  - `cmap`: matplotlib colourmap — `'viridis'` recommended for label images, `'gray'` for raw images
-- **Side effects**: writes a file to disk and prints the output path; closes the matplotlib figure to free memory
+  - `cmap`: matplotlib colourmap — `'viridis'` recommended for label images, `'gray'` for
+    raw images
+- **Side effects**: writes a file to disk and prints the output path; closes the matplotlib
+  figure to free memory. Imports matplotlib lazily, so importing `eval` does not
 
 ---
 
-### 2.3 `__main__` evaluation loop
-
-#### Setup
-
-- Config dict — document each key: `batch_size`, `n_layers`, `crop_size`, `crop_mode`, `write_movies`
-- Output directories (`movies/`, `metrics/`) created if absent
-- Model initialisation and checkpoint loading — note that `model_state_dict` is expected in the checkpoint
+### 2.3 The evaluation loop
 
 #### Data loading
 
-- Opens raw data (`test.zarr`, contains nuclear image `X` and segmentation ground truth segmentation image `y`)
-- Loads ground-truth lineage from a paired JSON file indexed by batch position
+- `split_dir` must hold `<split>.zarr` (nuclear image `X` and ground-truth masks `y`) and
+  `<split>.json` (ground-truth lineages, indexed by movie position)
+- A missing file raises `FileNotFoundError` naming it, rather than failing later
 
-#### Per-sample loop
+#### Per-movie loop
 
-- `build_indices` is called once on `y` to get all end frames; note it is called inside the loop but the result is constant — this could be moved outside
-- `CellTracker` is constructed and `track_cells()` called for each sample
-- `get_lineage_dict()` and `y_tracked` are retrieved from the tracker
-- Both lineage dicts are re-keyed as `int` before being passed to `TrackingMetrics` — explain why (JSON keys are strings)
-- `TrackingMetrics(...).stats` is the raw dict appended to `metrics_out`
+- `build_indices` is called **once**, outside the loop; the result is constant
+- A fresh `CellTracker` is constructed per movie, so no state carries across movies and
+  evaluation order cannot affect any result
+- **Divergences 12 and 28**: no `mpp` is supplied, so every movie is tracked at the
+  default 0.55 µm/px whatever it declares. Ten of the twelve test movies are declared at
+  0.65. Retained deliberately; `correct-scale-convention` removes it
+- Both lineage dicts are re-keyed as `int` before reaching `TrackingMetrics`, because JSON
+  object keys are always strings while `get_lineage_dict()` returns `int` keys
+- `TrackingMetrics(...).stats` is the raw dict collected per movie
 
 #### Post-loop aggregation
 
-- `metrics_out` is collected into a DataFrame
-- Division precision, recall, F1, association accuracy, and target effectiveness are computed as derived columns — document the formulas
-- Results written to `eval_results.csv`
-- `pretty_print(df)` called for a terminal summary
+- Rows are collected into a DataFrame; per-movie ratio columns are derived from the counts
+- `pooled_metrics` computes the three contract metrics from the count columns
+- Results are written to `<output_dir>/eval_results.csv` — the directory created is the
+  directory written into
+- `pretty_print(result.pooled)` gives a terminal summary of all three
 
 #### Optional GIF output
 
-- Controlled by `config['write_movies']`; when enabled, calls `_track_review_dict()` (note the private method access) and `create_timelapse_gif` per sample
+- Controlled by the `write_movies` argument; when enabled, calls `_track_review_dict()`
+  (note the private method access) and `create_timelapse_gif` per movie, beneath `movies_dir`
 
 ---
 

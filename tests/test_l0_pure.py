@@ -20,6 +20,7 @@ Each such assertion names its divergence number and says what a failure means.
 """
 
 import json
+import os
 import tarfile
 import tempfile
 from pathlib import Path
@@ -828,4 +829,165 @@ def test_test_loader_shuffles_and_augments(tmp_path):
         "loader, which makes a stable evaluation impossible. If it is now "
         "unaugmented and sequential, the defect was fixed - update the training-data "
         "spec and delete this characterization."
+    )
+
+
+# ======================================================================================
+# tracking-metrics: the evaluation harness. These need no model and no dataset.
+# ======================================================================================
+
+
+def test_importing_the_eval_module_runs_nothing(tmp_path, monkeypatch):
+    """Importing the harness loads no checkpoint and writes no file."""
+    import importlib
+
+    monkeypatch.chdir(tmp_path)
+    before = set(os.listdir(tmp_path))
+
+    module = importlib.import_module("torch_tracking.eval")
+    importlib.reload(module)
+
+    assert set(os.listdir(tmp_path)) == before, (
+        "importing torch_tracking.eval created a file; import must have no side effects"
+    )
+    assert callable(module.evaluate)
+
+
+def test_evaluate_requires_an_explicit_checkpoint_and_split():
+    """No input is read from a path fixed in source."""
+    import inspect
+
+    from torch_tracking.eval import evaluate
+
+    params = inspect.signature(evaluate).parameters
+
+    for required in ("checkpoint_path", "split_dir"):
+        assert params[required].default is inspect.Parameter.empty, (
+            f"{required} must be supplied by the caller, not defaulted to a fixed path"
+        )
+
+    assert params["device"].default == "cpu", (
+        "constraint 5: evaluation defaults to CPU and must not require a GPU"
+    )
+
+
+def test_missing_split_is_reported_with_the_path(tmp_path):
+    """A split that does not exist fails with an error naming the missing path."""
+    from torch_tracking.eval import evaluate
+
+    missing = tmp_path / "nowhere"
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        evaluate(checkpoint_path="unused.pt", split_dir=missing)
+
+    assert str(missing / "test.zarr") in str(excinfo.value), (
+        "the error must name the path that is missing, not merely that one is"
+    )
+
+
+def _recorded_count_table():
+    """The twelve-movie count table behind metrics/eval_results.csv."""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "correct_division": [1, 1, 5, 1, 2, 0, 0, 18, 48, 49, 15, 15],
+            "false_positive_division": [0, 0, 0, 0, 0, 1, 0, 0, 5, 0, 0, 0],
+            "false_negative_division": [2, 0, 2, 0, 0, 0, 1, 2, 5, 0, 0, 0],
+            "aa_tp": [964, 1053, 1997, 505, 672, 362, 197, 4878, 14457, 8913, 3736, 9505],
+            "aa_total": [997, 1080, 2057, 522, 690, 383, 199, 4949, 14843, 9122, 3855, 9865],
+            "te_tp": [997, 1082, 2062, 523, 694, 376, 202, 4985, 14796, 9154, 3861, 9786],
+            "te_total": [1030, 1109, 2122, 540, 712, 397, 206, 5056, 15174, 9357, 3975, 10097],
+        }
+    )
+
+
+def test_contract_metrics_are_pooled_not_averaged():
+    """Pooling sums counts once; averaging per-movie ratios gives a different answer."""
+    from torch_tracking.eval import pooled_metrics
+
+    df = _recorded_count_table()
+    pooled = pooled_metrics(df)
+
+    assert pooled["aa_accuracy"] == pytest.approx(0.9728, abs=5e-5)
+    assert pooled["te_accuracy"] == pytest.approx(0.9747, abs=5e-5)
+    assert pooled["division_f1"] == pytest.approx(0.9451, abs=5e-5)
+
+    mean_of_ratios = (df["aa_tp"] / df["aa_total"]).mean()
+    assert mean_of_ratios == pytest.approx(0.9715, abs=5e-5)
+    assert pooled["aa_accuracy"] != pytest.approx(mean_of_ratios, abs=5e-5), (
+        "pooled and mean-of-ratios must not be conflated; they differ by ~0.0013 here"
+    )
+
+
+def test_movie_with_an_undefined_ratio_still_contributes_its_counts():
+    """A movie whose own division recall is undefined still reaches the pooled figure."""
+    import pandas as pd
+
+    from torch_tracking.eval import pooled_metrics
+
+    base = {"aa_tp": 1, "aa_total": 1, "te_tp": 1, "te_total": 1}
+
+    # Movie 1 has a false positive and nothing to find: its own recall is 0/0.
+    undefined = {
+        "correct_division": 0,
+        "false_positive_division": 1,
+        "false_negative_division": 0,
+        **base,
+    }
+    ordinary = {
+        "correct_division": 3,
+        "false_positive_division": 0,
+        "false_negative_division": 0,
+        **base,
+    }
+
+    with_undefined = pooled_metrics(pd.DataFrame([ordinary, undefined]))
+    without = pooled_metrics(pd.DataFrame([ordinary]))
+
+    assert with_undefined["division_precision"] == pytest.approx(3 / 4)
+    assert without["division_precision"] == pytest.approx(1.0)
+    assert with_undefined["division_precision"] != without["division_precision"], (
+        "the undefined-ratio movie's false positive must reach the pooled figure"
+    )
+
+
+def test_frame_extent_rule_has_a_single_definition():
+    """Both evaluation entry points derive extents from one shared rule."""
+    from torch_tracking import eval as eval_module
+    from torch_tracking import eval_sweep
+
+    assert eval_sweep.build_indices is eval_module.build_indices, (
+        "eval_sweep must import the shared rule, not define its own copy"
+    )
+
+    y = np.zeros((2, 6, 4, 4, 1), dtype=np.int32)
+    y[0, :5] = 1   # 5 non-empty frames
+    y[1, :3] = 1   # 3 non-empty frames
+
+    assert eval_module.build_indices(y) == [4, 2]
+
+
+def test_final_non_empty_frame_is_excluded_from_evaluation():
+    """Divergence 25, pinned deliberately: the extent is one short of the frame count."""
+    from torch_tracking.eval import build_indices
+
+    y = np.zeros((1, 71, 4, 4, 1), dtype=np.int32)
+    y[0, :71] = 1
+
+    (end_frame,) = build_indices(y)
+
+    assert end_frame == 70, (
+        "Divergence 25: the frame extent is one fewer than the non-empty frame count "
+        "and is used as a slice bound, so frames 0..69 are evaluated and frame 70 is "
+        "dropped. This is retained ON PURPOSE so the harness reproduces the recorded "
+        "baseline exactly. If this changed, correct-scale-convention has landed - "
+        "update the tracking-metrics spec and delete this test."
+    )
+
+    evaluated = y[0, :end_frame]
+    assert evaluated.shape[0] == 70
+    assert y[0, end_frame].any(), (
+        "Divergence 25: the excluded frame is genuinely non-empty - 920 cell-instances "
+        "across the real test split lie in frames excluded this way."
     )

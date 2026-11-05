@@ -282,7 +282,7 @@ These are set on the `CellTracker` object and control the post-processing decisi
 
 **Tuning guidance:**
 
-- `division` is the most impactful parameter. Run `torch_tracking/eval_sweep.py` to sweep over values (e.g. `0.3`–`0.8`) and pick the threshold that maximizes division F1 on a held-out set.
+- `division` is the most impactful parameter. Run `python -m torch_tracking.eval_sweep` to sweep over values (e.g. `0.3`–`0.8`) and pick the threshold that maximizes division F1 on a held-out set.
 - `birth` and `death` rarely need to be changed from `0.999` unless you see many spurious track births or premature track terminations.
 - `mpp` must be set correctly for your microscope. An incorrect value shifts the spatial scale of appearance crops and degrades accuracy.
 
@@ -293,19 +293,43 @@ These are set on the `CellTracker` object and control the post-processing decisi
 To evaluate on a test set and produce metrics:
 
 ```bash
-python -m torch_tracking.eval
+python -m torch_tracking.eval \
+    --checkpoint path/to/best_model.pt \
+    --split-dir ~/.deepcell/tracking
 ```
 
-This reads `~/.deepcell/tracking/test.zarr` and `~/.deepcell/tracking/test.json` and writes results to `eval_results.csv`. Reported metrics include:
+This reads `<split-dir>/test.zarr` and `<split-dir>/test.json` and writes per-movie
+results to `metrics/eval_results.csv`. Pass `--output-dir` to write elsewhere, `--split`
+to evaluate a split other than `test`, and `--device` to select a device; evaluation runs
+on CPU by default and never requires a GPU.
+
+The harness is importable, so the same evaluation is available from Python:
+
+```python
+from torch_tracking.eval import evaluate
+
+result = evaluate(checkpoint_path="best_model.pt", split_dir="~/.deepcell/tracking")
+print(result.pooled)          # pooled division F1, aa_accuracy, te_accuracy
+result.per_movie              # one row per movie
+```
+
+Reported metrics include:
 
 - **Division precision / recall / F1** — how accurately the tracker detects mitotic events
-- **`aa_accuracy`** — assignment accuracy (fraction of cells correctly linked frame-to-frame)
-- **`te_accuracy`** — track-end accuracy
+- **`aa_accuracy`** — association accuracy (fraction of cells correctly linked frame-to-frame)
+- **`te_accuracy`** — target effectiveness, after Hayashida et al. 2020: the fraction of each
+  ground-truth track's cells captured by the single result track that best covers it. Despite
+  the column name it is not an accuracy of track *ends*
+
+All three are pooled across movies by summing each metric's numerator and denominator and
+dividing once — not by averaging per-movie ratios, which gives a different answer.
 
 To sweep over post-processing thresholds and find the best combination:
 
 ```bash
-python -m torch_tracking.eval_sweep
+python -m torch_tracking.eval_sweep \
+    --checkpoint path/to/best_model.pt \
+    --split-dir ~/.deepcell/tracking
 ```
 
 Results are saved to `metrics/postprocess_sweep.csv`.
