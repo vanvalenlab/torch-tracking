@@ -88,6 +88,27 @@ def require_mpp(store, path):
     return np.asarray(store['mpp'][:], dtype='float64')
 
 
+#: Where a processed zarr keeps each movie's corrected lineage (a list, one per movie).
+LINEAGES_KEY = 'lineages'
+
+
+def require_lineages(store, path):
+    """Return a processed zarr's per-movie lineages, failing if it carries none.
+
+    The dataloader builds each sample's training targets from the lineage, so a zarr
+    converted before the lineage travelled with it cannot drive training. It is rejected
+    rather than served from a sibling ``<split>.json``, which nothing guarantees agrees
+    with it.
+    """
+    if LINEAGES_KEY not in store.attrs:
+        raise ValueError(
+            f"{path} carries no '{LINEAGES_KEY}'. It was converted before the corrected "
+            "lineage was stored in the processed zarr, and must be regenerated with "
+            "convert_trk_to_zarr. No sibling .json is read in its place."
+        )
+    return store.attrs[LINEAGES_KEY]
+
+
 def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_format = 'channels_last'):
     """Pre-process images using Contrast Limited Adaptive
     Histogram Equalization (CLAHE).

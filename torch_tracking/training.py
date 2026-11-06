@@ -35,6 +35,7 @@ class TrainingConfig:
     batch_size: int = 8
     learning_rate: float = 0.001
     patience: int = 5
+    early_stopping_patience: int = 10
     enable_early_stopping: bool = False
     log_and_save: bool = True
     class_weights: list[float] = field(default_factory=lambda: [1, 10, 100])
@@ -65,6 +66,7 @@ class TrainingConfig:
         "clipnorm": self.clipnorm,
         "step_size": self.step_size,
         "patience": self.patience,
+        "early_stopping_patience": self.early_stopping_patience,
         "log_and_save": self.log_and_save,
         "enable_early_stopping": self.enable_early_stopping,
         "crop_size": self.crop_size,
@@ -114,6 +116,7 @@ class Trainer:
         self.gradient_clip = self.config.clipnorm
         self.enable_early_stopping = self.config.enable_early_stopping
         self.patience = self.config.patience
+        self.early_stopping_patience = self.config.early_stopping_patience
         self.log_and_save = self.config.log_and_save
         self.loss=self.config.loss
         self.stopping_metric = self.config.stopping_metric
@@ -160,7 +163,7 @@ class Trainer:
         
         # Early stopping
         self.early_stopping = EarlyStopping(
-            patience=self.patience,
+            patience=self.early_stopping_patience,
             mode='min'
         )
         

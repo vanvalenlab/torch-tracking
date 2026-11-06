@@ -280,6 +280,77 @@ Document the internal schema of a single entry in `self.tracks`:
 
 ---
 
+### 2.4 Training data — `preprocess.py` and `loader.py`
+
+#### Conversion: `convert_trk_to_zarr(filename, out_dir=None, track_length=8, mpps=None)`
+
+Turns a `<split>.trks` archive into three files, all written into `out_dir` (which must
+already exist) or beside the `.trks` file when `out_dir` is `None`:
+
+- `<split>.zarr` — `X`, `y` and `mpp` at native resolution
+- `<split>_proc.zarr` — the arrays the dataloader reads (below)
+- `<split>.json` — the corrected lineage of every movie
+
+Both zarrs are written together or not at all: each is staged as `<name>.partial` inside the
+output directory and renamed into place once both are complete.
+
+#### Per-movie resolution
+
+Each movie's declared resolution (µm/px) comes from one of two places:
+
+- **`mpps=`** — a sequence with exactly one value per movie. When given, nothing else is read.
+- **`data-source.npz`** — otherwise, a file of exactly that name **beside the `.trks`
+  file** (not in `out_dir`). It is keyed by split name (`train`, `val`, `test`); each value
+  is a per-movie metadata array whose **third column (index 2)** is that movie's resolution.
+
+If neither is available, or the number of resolutions differs from the number of movies,
+conversion fails naming what is missing. No default resolution is ever assumed. The values
+are stored in both zarrs, so nothing after conversion needs `data-source.npz`.
+
+#### The processed zarr
+
+Exactly four arrays, plus the lineage:
+
+| Key | Shape | Content |
+| --- | --- | --- |
+| `appearances` | `(B, T, N, 32, 32, 1)` | per-cell crops |
+| `morphologies` | `(B, T, N, 3)` | area, perimeter, eccentricity |
+| `centroids` | `(B, T, N, 2)` | centroid coordinates |
+| `mpp` | `(B,)` | declared resolution, µm/px |
+
+`N` is the largest cell count of any movie; unused slots are all zero. The corrected
+lineage of every movie is stored in the zarr's attributes under `lineages`. A processed zarr
+without it is rejected by the dataloader with an error naming it; no sibling `.json` is read
+in its place. Neither the training targets nor the spatial graph is stored.
+
+#### Training targets are built per window
+
+The dataloader builds each sample's `labels` from the lineage when the sample is drawn,
+for just the frames in that window: `(track_length - 1, N, N)`, one matrix per step from a
+frame to the next.
+
+Rows are the cells of one frame (the tracks) and columns are the cells of the next frame
+(the candidates). An entry is graded only when both of its slots carry a cell: the row's
+cell in the first frame and the column's cell in the next.
+
+| Value | Meaning |
+| --- | --- |
+| `1` | same cell: the cell is in both frames |
+| `2` | daughter: from a dividing parent to each daughter, at the parent's final frame |
+| `0` | different cell: both slots carry a cell and they are not the same cell |
+| `-1` | padding, ignored by the loss: the row has no cell in the first frame, or the column has none in the next |
+
+A slot with no cell, whether unused capacity, a cell not yet born, or a cell that has ended,
+holds all-zero features, so all of them are padding. Two consequences are deliberate: a
+newborn cell's column is graded in the step into its first frame (it is not any existing
+track), and a cell that ends has its row graded in its last frame (it matches no candidate).
+The `2` entries are written after padding so it can never erase one.
+
+The test dataloader is unshuffled and unaugmented, like validation. Only the training
+loader shuffles and augments.
+
+---
+
 ## 3. `Trainer` - `training.py`
 
 ### 3.1 Module overview

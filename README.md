@@ -82,30 +82,34 @@ python -m torch_tracking.preprocess
 By default this scans `~/.deepcell/tracking/` for `*.trks` files. For each file it produces:
 
 - `<split>.zarr` — raw arrays (`X`, `y`) at native resolution, plus `mpp`
-- `<split>_proc.zarr` — pre-extracted features ready for the dataloader
+- `<split>_proc.zarr` — pre-extracted features and the lineage, ready for the dataloader
 - `<split>.json` — ground-truth lineage records
+
+Each movie's resolution is read from a `data-source.npz` beside the `.trks` file, or passed
+as `mpps=`. See [docs.md](docs.md) §2.4 for the layout.
 
 The `convert_trk_to_zarr` function in [torch_tracking/preprocess.py](torch_tracking/preprocess.py) can also be called directly:
 
 ```python
 from torch_tracking.preprocess import convert_trk_to_zarr
 
-convert_trk_to_zarr('path/to/train.trks', out_dir='data/')
+convert_trk_to_zarr('path/to/train.trks', out_dir='data/', mpps=[0.55, 0.55])  # one per movie
 ```
 
 ---
 
 ### Processed Zarr Layout
 
-The processed Zarr file (`*_proc.zarr`) stores pre-extracted per-cell features:
+The processed Zarr file (`*_proc.zarr`) stores pre-extracted per-cell features, and each
+movie's corrected lineage in its attributes. The training targets (`labels`: `1` = same
+cell, `2` = daughter, `0` = different cell, `-1` = padding) are built from that lineage by
+the dataloader, window by window, and are not stored:
 
 | Key | Shape | Description |
 | --- | --- | --- |
 | `appearances` | `(B, T, N, 32, 32, 1)` | 32×32 image crop centered on each cell nucleus |
 | `morphologies` | `(B, T, N, 3)` | Per-cell morphological features: area, perimeter, eccentricity |
 | `centroids` | `(B, T, N, 2)` | Y and X centroid coordinates in pixels |
-| `labels` | `(B, T-1, N, N)` | Temporal adjacency matrix (ground truth): `1` = same cell, `2` = daughter, `0` = different cell, `-1` = padding |
-| `track_length` | `(B, N, 2)` | Allocated but never populated (all zeros) |
 | `mpp` | `(B,)` | Each movie's declared resolution in µm/px, as float64 |
 
 - `B` — number of movies in the batch
@@ -259,6 +263,7 @@ Checkpoints are saved to `./checkpoints/<timestamp>/best_model.pt`. TensorBoard 
 | `optimizer` | `"radam"` | Optimizer type. Options: `"radam"`, `"adam"`, `"sgd"` |
 | `scheduler` | `"reduce_on_plateau"` | LR scheduler. Options: `"reduce_on_plateau"`, `"step"`, `"cosine"` |
 | `patience` | `5` | Epochs without improvement before LR is reduced (ReduceLROnPlateau) |
+| `early_stopping_patience` | `10` | Epochs without improvement before training stops (only if `enable_early_stopping` is on). Independent of `patience` |
 | `max_epochs` | `50` | Maximum number of training epochs |
 | `batch_size` | `8` | Number of sequences per batch |
 | `clipnorm` | `1.0` | Maximum gradient norm for clipping. Lower values (e.g. `0.001`) stabilize training if gradients are exploding |

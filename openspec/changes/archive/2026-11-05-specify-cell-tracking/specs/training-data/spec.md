@@ -7,10 +7,8 @@
 The system SHALL relabel each movie's masks so labels are sequential from 1, and SHALL
 rewrite that movie's lineage dictionary to the new labels. Keys of the rewritten lineage
 SHALL be integers, and each entry's `label` SHALL equal its key. The input lineage SHALL
-be accepted whether its keys are integers or the strings a JSON document yields, so that
-relabelling is idempotent in key type and a lineage produced by this package can be
-passed back through it. This closes the input half of divergence 1: the output convention
-was already integers, while the input was resolved only as strings.
+be accepted keyed by integers or by the strings a JSON document yields, so a lineage this
+package produced can be relabelled again. This closes the input half of divergence 1.
 
 #### Scenario: Non-sequential labels are compacted
 

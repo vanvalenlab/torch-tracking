@@ -118,7 +118,7 @@ def write_sidecar(directory, split, mpps):
     """Write the data-source.npz the conversion path requires beside a .trks file.
 
     Only column 2 is read (the per-movie mpp); the rest is padding that mirrors the
-    real file's six-column shape. Divergence 20: this coupling is documented nowhere.
+    real file's six-column shape. The layout is documented in docs.md.
     """
     rows = np.array(
         [["path", "source", mpp, "Not screened", "6 min", "synthetic"] for mpp in mpps],
@@ -146,13 +146,17 @@ def make_split(tmp_path, split="train", n_movies=1, n_frames=4, mpp=REFERENCE_MP
 
 
 def make_processed_zarr(path, n_movies=1, n_frames=6, max_cells=4, centroids=None,
-                        n_real=2, crop=32):
+                        n_real=2, crop=32, lineages=None, with_lineages=True):
     """Write a processed zarr directly, skipping conversion.
 
     Windowing and augmentation tests use this: they exercise the dataloader, which
     reads the processed arrays and never sees a .trks file. `centroids` may be given
     as (n_frames, max_cells, 2) to place cells at chosen coordinates; slots at or
     beyond `n_real` are padding, carrying zero morphology.
+
+    The lineage is stored in the zarr's attributes, as conversion does. By default every
+    real cell lives the whole movie; pass `lineages` (one dict per movie) to override, or
+    `with_lineages=False` to write a zarr of the kind conversion no longer produces.
     """
     path = Path(path)
     shape = (n_movies, n_frames, max_cells)
@@ -160,12 +164,6 @@ def make_processed_zarr(path, n_movies=1, n_frames=6, max_cells=4, centroids=Non
     appearances = np.zeros(shape + (crop, crop, 1), dtype="float32")
     morphologies = np.zeros(shape + (3,), dtype="float32")
     cents = np.zeros(shape + (2,), dtype="float32")
-    labels = np.zeros((n_movies, n_frames - 1, max_cells, max_cells), dtype="float32")
-    # Deliberately asymmetric, so that a transposed label matrix is detectable:
-    # a division marker from slot 0 to slot 1, never the reverse.
-    labels[:, :, 0, 1] = 2.0
-    track_length = np.zeros((n_movies, max_cells, 2), dtype="int32")
-
     for b in range(n_movies):
         for t in range(n_frames):
             for n in range(n_real):
@@ -183,11 +181,18 @@ def make_processed_zarr(path, n_movies=1, n_frames=6, max_cells=4, centroids=Non
         ("appearances", appearances),
         ("morphologies", morphologies),
         ("centroids", cents),
-        ("labels", labels),
-        ("track_length", track_length),
         ("mpp", np.full(n_movies, REFERENCE_MPP, dtype="float64")),
     ):
         z.create_array(name, data=arr)
+    if with_lineages:
+        if lineages is None:
+            lineages = [
+                {str(n + 1): {"label": n + 1, "frames": list(range(n_frames)),
+                              "daughters": [], "parent": None}
+                 for n in range(n_real)}
+                for _ in range(n_movies)
+            ]
+        z.attrs["lineages"] = lineages
     return path
 
 
@@ -399,42 +404,27 @@ def test_capacity_comes_from_the_busiest_lineage(converted_split):
     assert z["morphologies"].shape[2] == 3
     assert z["centroids"].shape[2] == 3
     assert z["appearances"].shape[2] == 3
-    assert z["labels"].shape[2] == z["labels"].shape[3] == 3
 
     # The two-cell movie is zero-padded into the third slot.
     morph = z["morphologies"][:]
     assert np.all(morph[1, :, 2] == 0)
 
 
-def test_processed_zarr_holds_exactly_six_arrays(converted_split):
-    """Requirement: The processed zarr holds exactly six arrays.
+def test_processed_zarr_holds_exactly_four_arrays(converted_split):
+    """Requirement: The processed zarr holds exactly four arrays.
 
-    Pins divergence 15: conversion computes a spatial adjacency and a validity mask
-    for every frame and returns neither, so no adjacency reaches the zarr.
+    Closes divergences 15 and 16: no spatial adjacency, no `track_length`, and no
+    temporal adjacency - the training targets are built per window by the dataloader.
     """
     tmp_path, split = converted_split
     z = zarr.open(str(tmp_path / f"{split}_proc.zarr"), mode="r")
 
-    assert set(z.keys()) == {
-        "appearances",
-        "morphologies",
-        "centroids",
-        "labels",
-        "track_length",
-        "mpp",
-    }, (
-        "Divergence 15: the processed zarr holds no spatial adjacency, because "
-        "get_features computes one per frame and returns it to nobody. If an "
-        "adjacency array now appears here, the defect was fixed - update the "
-        "training-data spec and delete this characterization."
-    )
+    assert set(z.keys()) == {"appearances", "morphologies", "centroids", "mpp"}
 
     b, t, n = 2, 4, 3
     assert z["appearances"].shape == (b, t, n, 32, 32, 1)
     assert z["morphologies"].shape == (b, t, n, 3)
     assert z["centroids"].shape == (b, t, n, 2)
-    assert z["labels"].shape == (b, t - 1, n, n)
-    assert z["track_length"].shape == (b, n, 2)
     assert z["mpp"].shape == (b,)
 
 
@@ -505,7 +495,7 @@ def test_reading_a_converted_split_does_not_need_the_sidecar(tmp_path):
     assert len(dataset) > 0
 
 
-FRAME_INDEXED = ("appearances", "morphologies", "centroids", "labels")
+FRAME_INDEXED = ("appearances", "morphologies", "centroids")
 
 
 def _chunks_touched(arr, movie, start, frames):
@@ -592,26 +582,8 @@ def test_chunk_length_follows_the_configured_window(tmp_path):
         assert z[name].chunks[1] == min(4, z[name].shape[1]), name
 
 
-def test_track_length_is_stored_but_never_populated(converted_split):
-    """Requirement: `track_length` is stored but never populated.
-
-    Pins divergence 16.
-    """
-    tmp_path, split = converted_split
-    z = zarr.open(str(tmp_path / f"{split}_proc.zarr"), mode="r")
-
-    track_length = z["track_length"][:]
-
-    assert np.issubdtype(track_length.dtype, np.integer)
-    assert np.count_nonzero(track_length) == 0, (
-        "Divergence 16: track_length is allocated, returned and stored, but nothing "
-        "ever writes to it. If this is now populated, the defect was fixed - update "
-        "the training-data spec and delete this characterization."
-    )
-
-
 def test_conversion_writes_sibling_zarr_and_lineage_json(converted_split):
-    """Requirement: The processed zarr holds exactly six arrays (sibling layout)."""
+    """Requirement: The processed zarr holds exactly four arrays (sibling layout)."""
     tmp_path, split = converted_split
 
     raw = zarr.open(str(tmp_path / f"{split}.zarr"), mode="r")
@@ -648,20 +620,23 @@ def test_morphology_is_unnormalized_pixel_space_scalars():
 
 
 # --------------------------------------------------------------------------------------
-# 5. Temporal adjacency
+# 5. Temporal adjacency (built per window by the dataloader)
 # --------------------------------------------------------------------------------------
 
 
-def _adjacency_for_division(max_frames=5, max_cells=4):
+def _division_lineage():
     """Cell 1 runs frames 0-2 and divides into cells 2 and 3, which run frames 3-4."""
-    from torch_tracking.preprocess import get_temporal_adjacency
-
-    lineage = {
+    return {
         1: {"label": 1, "frames": [0, 1, 2], "daughters": [2, 3], "parent": None},
         2: {"label": 2, "frames": [3, 4], "daughters": [], "parent": 1},
         3: {"label": 3, "frames": [3, 4], "daughters": [], "parent": 1},
     }
-    return get_temporal_adjacency(lineage, max_frames=max_frames, max_cells=max_cells)
+
+
+def _adjacency_for_division(start=0, end=5, max_cells=4):
+    from torch_tracking.loader import get_temporal_adjacency
+
+    return get_temporal_adjacency(_division_lineage(), start, end, max_cells)
 
 
 def test_surviving_cell_is_marked_on_the_diagonal():
@@ -671,8 +646,8 @@ def test_surviving_cell_is_marked_on_the_diagonal():
     # Cell 1 occupies slot 0 and continues into the next frame at frames 0 and 1.
     assert adjacency[0, 0, 0] == 1
     assert adjacency[1, 0, 0] == 1
-    # Its final frame is 2, from which the diagonal returns to 0.
-    assert adjacency[2, 0, 0] == 0
+    # Its final frame is 2, from which the diagonal is not 1.
+    assert adjacency[2, 0, 0] != 1
 
 
 def test_division_is_marked_from_parent_to_each_daughter():
@@ -683,61 +658,243 @@ def test_division_is_marked_from_parent_to_each_daughter():
     assert adjacency[2, 0, 1] == 2
     assert adjacency[2, 0, 2] == 2
     # A division is written only at the parent's final frame.
-    assert adjacency[1, 0, 1] == 0
+    assert adjacency[1, 0, 1] != 2
 
 
 def test_unused_capacity_is_marked_as_padding():
-    """Requirement: Temporal adjacency encodes lineage as a four-valued matrix."""
+    """Requirement: Padding marks every slot carrying no cell in that frame."""
     adjacency = _adjacency_for_division(max_cells=4)
 
     # Three cells occupy slots 0-2; slot 3 is unused and padded with -1.
-    assert np.all(adjacency[2, 3, :] == -1)
-    assert np.all(adjacency[2, :, 3] == -1)
+    assert np.all(adjacency[:, 3, :] == -1)
+    assert np.all(adjacency[:, :, 3] == -1)
     assert set(np.unique(adjacency).tolist()) <= {-1, 0, 1, 2}
 
 
-def test_adjacency_frame_axis_is_one_shorter_than_the_movie():
-    """Requirement: Temporal adjacency encodes lineage as a four-valued matrix."""
-    adjacency = _adjacency_for_division(max_frames=5, max_cells=4)
+def test_adjacency_frame_axis_is_one_shorter_than_the_window():
+    """Requirement: Temporal adjacency is built per window when the sample is drawn."""
+    adjacency = _adjacency_for_division(start=0, end=5, max_cells=4)
+    assert adjacency.shape == (4, 4, 4), "a window of T frames carries T - 1 transitions"
 
-    assert adjacency.shape == (4, 4, 4), (
-        "the array encodes frame transitions, so it carries max_frames - 1 frames"
-    )
-
+    assert _adjacency_for_division(start=1, end=4, max_cells=4).shape == (2, 4, 4)
 
 
-def test_lone_live_cell_outside_the_first_slot_aborts_conversion():
-    """Requirement: A lone live cell outside the first slot aborts conversion.
+def test_a_window_is_the_matching_slice_of_the_whole_movie():
+    """Requirement: Temporal adjacency is built per window when the sample is drawn.
 
-    Pins divergence 23, found while implementing this change. The padding search
-    collapses a single match to one dimension and then indexes it as two.
+    Building a window directly must agree with slicing the same transitions out of a
+    build of the whole movie, so no window is built on different rules from any other.
     """
-    from torch_tracking.preprocess import get_temporal_adjacency
+    whole = _adjacency_for_division(start=0, end=5)
+    for start in range(0, 3):
+        window = _adjacency_for_division(start=start, end=start + 3)
+        assert np.array_equal(window, whole[start:start + 2]), start
 
-    def lineage_for(label):
-        return {label: {"label": label, "frames": [0, 1, 2], "daughters": [],
-                        "parent": None}}
 
-    # Slot 0 survives only by luck: argwhere yields [[0, 0]], whose .any() is False,
-    # so the branch that would index it as 2-D is never entered.
-    get_temporal_adjacency(lineage_for(1), max_frames=4, max_cells=3)
+def test_no_frame_axis_padding_is_produced():
+    """Requirement: Temporal adjacency is built per window when the sample is drawn.
 
-    for label, slot in ((2, 1), (3, 2)):
-        with pytest.raises(IndexError, match="1-dimensional"):
-            get_temporal_adjacency(lineage_for(label), max_frames=4, max_cells=3)
-        assert slot > 0  # documents which slot the failure belongs to
+    The old whole-movie array padded every transition past the longest track. A window
+    within the movie's extent has none: every transition holds at least one real cell.
+    """
+    adjacency = _adjacency_for_division(start=0, end=5)
 
-    # Stated as its own assertion so a fix reads clearly in the failure output.
-    try:
-        get_temporal_adjacency(lineage_for(2), max_frames=4, max_cells=3)
-    except IndexError:
-        pass
-    else:  # pragma: no cover - only reachable once the defect is fixed
-        pytest.fail(
-            "Divergence 23: a movie with exactly one live cell in a slot other than "
-            "the first cannot be converted. If this no longer raises, the defect was "
-            "fixed - update the training-data spec and delete this characterization."
-        )
+    for step in range(adjacency.shape[0]):
+        assert (adjacency[step] != -1).any(), f"transition {step} is entirely padding"
+
+
+@pytest.mark.parametrize("slot", [0, 1, 2])
+def test_a_lone_live_cell_is_handled_in_any_slot(slot):
+    """Requirement: Temporal adjacency is built per window when the sample is drawn.
+
+    Closes divergence 23: the old padding search raised IndexError for a single live cell
+    anywhere but the first slot, and gave the first slot no padding at all.
+    """
+    from torch_tracking.loader import get_temporal_adjacency
+
+    label = slot + 1
+    lineage = {label: {"label": label, "frames": [0, 1, 2], "daughters": [], "parent": None}}
+
+    adjacency = get_temporal_adjacency(lineage, 0, 3, 3)
+
+    assert adjacency.shape == (2, 3, 3)
+    for step in range(2):
+        assert adjacency[step, slot, slot] == 1
+        # Every other slot carries no cell, in every case including slot 0.
+        expected = np.full((3, 3), -1)
+        expected[slot, slot] = 1
+        assert np.array_equal(adjacency[step], expected)
+
+
+def test_a_cell_not_yet_born_an_ended_cell_and_unused_capacity_are_all_padding():
+    """Requirement: Padding marks every slot carrying no cell in that frame."""
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1, 2, 3, 4], "daughters": [], "parent": None},
+        2: {"label": 2, "frames": [0, 1], "daughters": [], "parent": None},      # ends early
+        3: {"label": 3, "frames": [3, 4], "daughters": [], "parent": None},      # born late
+    }
+    adjacency = get_temporal_adjacency(lineage, 0, 5, 4)   # slot 3 is unused
+
+    def row_is_padding(step, slot):
+        return bool(np.all(adjacency[step, slot, :] == -1))
+
+    def col_is_padding(step, slot):
+        return bool(np.all(adjacency[step, :, slot] == -1))
+
+    # Step 0 (frame 0 -> 1): cells 1 and 2 in both frames; 3 is unborn; slot 3 is unused.
+    assert row_is_padding(0, 2) and col_is_padding(0, 2)
+    assert row_is_padding(0, 3) and col_is_padding(0, 3)
+    assert adjacency[0, 0, 1] == 0 and adjacency[0, 1, 0] == 0   # two present cells: 0
+    assert adjacency[0, 0, 0] == 1 and adjacency[0, 1, 1] == 1
+
+    # Step 2 (frame 2 -> 3): cell 2 has ended, so it is padding both ways.
+    assert row_is_padding(2, 1) and col_is_padding(2, 1)
+    assert adjacency[2, 0, 0] == 1
+    # Cell 3 is not in frame 2, so it is no track; it is a candidate in frame 3.
+    assert row_is_padding(2, 2)
+    assert not col_is_padding(2, 2)
+
+    # Step 3 (frame 3 -> 4): cells 1 and 3 are both present throughout.
+    assert adjacency[3, 0, 2] == 0 and adjacency[3, 2, 0] == 0
+    assert adjacency[3, 2, 2] == 1
+
+
+def test_a_newborn_cell_is_graded_as_not_any_existing_track():
+    """Requirement: Padding marks every slot carrying no cell in that frame.
+
+    The newborn's column holds its real features in the next frame, so the model can see
+    it and is told it matches none of the tracks - the signal birth is priced from.
+    """
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1, 2], "daughters": [], "parent": None},
+        2: {"label": 2, "frames": [1, 2], "daughters": [], "parent": None},   # born in frame 1
+    }
+    adjacency = get_temporal_adjacency(lineage, 0, 3, 2)
+
+    # Step 0 (frame 0 -> 1): track 1 against candidates 1 and the newborn 2.
+    assert adjacency[0, 0, 0] == 1
+    assert adjacency[0, 0, 1] == 0, "the newborn is not the existing track"
+    assert np.all(adjacency[0, 1, :] == -1), "cell 2 is not a track yet"
+
+
+def test_a_cell_that_ends_is_graded_as_matching_no_candidate():
+    """Requirement: Padding marks every slot carrying no cell in that frame.
+
+    The ending cell's row is real in its last frame, so it is told it matches nothing -
+    the signal death is priced from.
+    """
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1, 2], "daughters": [], "parent": None},
+        2: {"label": 2, "frames": [0, 1], "daughters": [], "parent": None},   # last frame 1
+    }
+    adjacency = get_temporal_adjacency(lineage, 0, 3, 2)
+
+    # Step 1 (frame 1 -> 2): cell 2 is a track but is gone from the next frame.
+    assert adjacency[1, 1, 0] == 0, "the ending track is not cell 1"
+    assert adjacency[1, 1, 1] == -1, "and there is no cell 2 to compare it with"
+    assert adjacency[1, 0, 0] == 1
+
+
+def test_a_cell_missing_from_the_next_frame_is_not_labelled_the_same():
+    """Requirement: Padding marks every slot carrying no cell in that frame.
+
+    A lineage may skip a frame for a cell. Its candidate slot in the missing frame holds
+    all-zero features, so it cannot be graded "same cell" there. (The old rule kept a `1`
+    across the gap: 172 such labels in the test split.)
+    """
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {1: {"label": 1, "frames": [0, 2, 3], "daughters": [], "parent": None}}
+    adjacency = get_temporal_adjacency(lineage, 0, 4, 1)
+
+    assert adjacency[:, 0, 0].tolist() == [-1, -1, 1]
+
+
+def test_a_dividing_parent_keeps_its_daughter_entries():
+    """Requirement: Padding marks every slot carrying no cell in that frame.
+
+    A padding rule that lost a `2` would silently erase a division label, the signal
+    division F1 is made of. The entries are written after padding for that reason.
+    """
+    adjacency = _adjacency_for_division()
+
+    assert adjacency[2, 0, 1] == 2 and adjacency[2, 0, 2] == 2
+    assert int((adjacency == 2).sum()) == 2
+
+
+def test_a_multipolar_division_keeps_every_daughter_entry():
+    """More than two daughters is real biology and occurs in the dataset."""
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1], "daughters": [2, 3, 4], "parent": None},
+        2: {"label": 2, "frames": [2, 3], "daughters": [], "parent": 1},
+        3: {"label": 3, "frames": [2, 3], "daughters": [], "parent": 1},
+        4: {"label": 4, "frames": [2, 3], "daughters": [], "parent": 1},
+    }
+    adjacency = get_temporal_adjacency(lineage, 0, 4, 4)
+
+    assert adjacency[1, 0, 1:].tolist() == [2, 2, 2]
+
+
+def test_a_present_cell_is_never_padding():
+    """Requirement: Padding marks every slot carrying no cell in that frame."""
+    adjacency = _adjacency_for_division()
+
+    # Step 0 (frame 0 -> 1): only cell 1 is present, and its own entry is not padding.
+    assert adjacency[0, 0, 0] == 1
+    # Frame 3: cells 2 and 3 are present, so no entry between them is padding.
+    assert adjacency[3, 1, 1] == 1 and adjacency[3, 2, 2] == 1
+    assert adjacency[3, 1, 2] == 0 and adjacency[3, 2, 1] == 0
+
+
+def test_a_cell_alive_in_its_last_step_keeps_its_diagonal():
+    """Requirement: Temporal adjacency encodes lineage as a four-valued matrix.
+
+    The old padding search took the highest slot alive in the *next* frame as the edge of
+    the real cells, so a cell present in a frame but ending in the next, and holding the
+    highest slot, lost its `1`. Fifteen such labels were destroyed in the test split.
+    """
+    from torch_tracking.loader import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1, 2], "daughters": [], "parent": None},
+        2: {"label": 2, "frames": [0, 1], "daughters": [], "parent": None},   # highest slot
+    }
+    adjacency = get_temporal_adjacency(lineage, 0, 3, 2)
+
+    # Cell 2 is alive at frame 0 and ends at frame 1: its diagonal at step 0 stays 1.
+    assert adjacency[0, 1, 1] == 1
+
+
+def test_the_window_build_stays_within_budget():
+    """Requirement: Temporal adjacency is built per window when the sample is drawn.
+
+    The per-sample budget is ~213 ms across the training epoch; the build is allowed a
+    small fraction of it. A generous ceiling, so a loaded machine does not flake.
+    """
+    import time
+
+    from torch_tracking.loader import get_temporal_adjacency
+
+    n = 405
+    lineage = {
+        i + 1: {"label": i + 1, "frames": list(range(i % 40, 71)), "daughters": [],
+                "parent": None}
+        for i in range(n)
+    }
+    get_temporal_adjacency(lineage, 0, 8, n)       # warm up
+    start = time.perf_counter()
+    for _ in range(5):
+        get_temporal_adjacency(lineage, 30, 38, n)
+    assert (time.perf_counter() - start) / 5 < 0.1
+
 
 # --------------------------------------------------------------------------------------
 # 6. Dataloader windowing and adjacency
@@ -902,51 +1059,6 @@ def test_morphology_is_untransformed_and_adjacency_is_unaffected(tmp_path):
     )
 
 
-def test_backward_direction_discards_augmentation(tmp_path):
-    """Requirement: Backward temporal direction discards augmentation.
-
-    Pins divergence 22.
-    """
-    from torch_tracking.loader import TrkDataset
-
-    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
-    dataset = TrkDataset(
-        path, track_length=3, stride=1, augment=True, t_direction="backward"
-    )
-
-    stored = dataset.features["centroids"][0, 0:3]
-    sample = dataset[0]
-
-    assert np.allclose(sample["centroids"].numpy(), stored[::-1]), (
-        "Divergence 22: in backward mode, centroids and appearances are rebuilt from "
-        "the stored values, silently discarding the augmentation computed moments "
-        "earlier. If these are now augmented, the defect was fixed - update the "
-        "training-data spec and delete this characterization."
-    )
-
-
-def test_backward_direction_transposes_each_label_matrix(tmp_path):
-    """Requirement: Backward temporal direction discards augmentation."""
-    from torch_tracking.loader import TrkDataset
-
-    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
-
-    forward = TrkDataset(path, track_length=3, stride=1, augment=False)[0]
-    backward = TrkDataset(
-        path, track_length=3, stride=1, augment=False, t_direction="backward"
-    )[0]
-
-    # The fixture marks a division from slot 0 to slot 1 and never the reverse.
-    assert forward["labels"][0, 0, 1] == 2.0
-    assert forward["labels"][0, 1, 0] == 0.0
-
-    assert backward["labels"][0, 1, 0] == 2.0, (
-        "backward mode transposes each frame's label matrix, so parent-to-daughter "
-        "entries become daughter-to-parent"
-    )
-    assert backward["labels"][0, 0, 1] == 0.0
-
-
 # --------------------------------------------------------------------------------------
 # 8. Dataloader construction
 # --------------------------------------------------------------------------------------
@@ -968,12 +1080,12 @@ def test_validation_loader_is_unaugmented_and_unshuffled(tmp_path):
     )
 
 
-def test_test_loader_shuffles_and_augments(tmp_path):
-    """Requirement: Validation batches are unaugmented; test batches are not.
+def test_test_loader_is_unaugmented_and_unshuffled(tmp_path):
+    """Requirement: Validation and test batches are both unaugmented and ordered.
 
-    Pins divergence 21.
+    Closes divergence 21. Constructed without overrides, as a caller would.
     """
-    from torch.utils.data import RandomSampler
+    from torch.utils.data import SequentialSampler
     from torch_tracking.loader import create_trk_dataloaders
 
     path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
@@ -981,13 +1093,268 @@ def test_test_loader_shuffles_and_augments(tmp_path):
         test_path=path, batch_size=1, num_workers=0, track_length=3
     )
 
-    assert test_loader.dataset.augment is True and isinstance(
-        test_loader.sampler, RandomSampler
-    ), (
-        "Divergence 21: the test loader shuffles and augments, unlike the validation "
-        "loader, which makes a stable evaluation impossible. If it is now "
-        "unaugmented and sequential, the defect was fixed - update the training-data "
-        "spec and delete this characterization."
+    assert test_loader.dataset.augment is False
+    assert isinstance(test_loader.sampler, SequentialSampler)
+
+
+def test_two_passes_over_the_test_loader_agree(tmp_path):
+    """Requirement: Validation and test batches are both unaugmented and ordered."""
+    import torch
+    from torch_tracking.loader import create_trk_dataloaders
+
+    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
+    _, _, test_loader = create_trk_dataloaders(
+        test_path=path, batch_size=2, num_workers=0, track_length=3
+    )
+
+    first = list(test_loader)
+    second = list(test_loader)
+
+    assert len(first) == len(second) > 1
+    for a, b in zip(first, second):
+        for key in a:
+            assert torch.equal(a[key], b[key]), key
+
+
+def test_training_loader_still_shuffles_and_augments(tmp_path):
+    """Requirement: Validation and test batches are both unaugmented and ordered."""
+    from torch.utils.data import RandomSampler
+    from torch_tracking.loader import create_trk_dataloaders
+
+    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
+    train_loader, _, _ = create_trk_dataloaders(
+        train_path=path, batch_size=1, num_workers=0, track_length=3
+    )
+
+    assert train_loader.dataset.augment is True
+    assert isinstance(train_loader.sampler, RandomSampler)
+
+
+def test_backward_direction_is_no_longer_selectable(tmp_path):
+    """Requirement: removed - backward temporal direction (divergence 22, Moot)."""
+    import inspect
+    from torch_tracking.loader import TrkDataset
+
+    assert "t_direction" not in inspect.signature(TrkDataset.__init__).parameters
+
+
+# --------------------------------------------------------------------------------------
+# 9. Training targets come from the lineage; the dataloader reads only what it uses
+# --------------------------------------------------------------------------------------
+
+
+def test_a_drawn_sample_carries_labels_built_from_the_lineage(tmp_path):
+    """Requirement: Temporal adjacency is built per window when the sample is drawn."""
+    from torch_tracking.loader import TrkDataset, get_temporal_adjacency
+
+    lineage = {
+        "1": {"label": 1, "frames": [0, 1, 2], "daughters": [2, 3], "parent": None},
+        "2": {"label": 2, "frames": [3, 4, 5], "daughters": [], "parent": 1},
+        "3": {"label": 3, "frames": [3, 4, 5], "daughters": [], "parent": 1},
+    }
+    path = make_processed_zarr(
+        tmp_path / "proc.zarr", n_frames=6, max_cells=4, n_real=3, lineages=[lineage]
+    )
+
+    stored = zarr.open(str(path), mode="r")
+    assert not any("adj" in k or k == "labels" for k in stored.keys()), (
+        "no temporal adjacency may be stored in the processed zarr"
+    )
+
+    dataset = TrkDataset(path, track_length=3, stride=1, augment=False)
+    sample = dataset[1]                       # frames 1-3
+
+    assert sample["labels"].shape == (2, 4, 4)
+    expected = get_temporal_adjacency(lineage, 1, 4, 4)
+    assert np.array_equal(sample["labels"].numpy(), expected)
+    assert sample["labels"][1, 0, 1] == 2.0   # the division at frame 2 is step 1 of this window
+
+
+def test_a_converted_split_carries_the_corrected_lineage(converted_split):
+    """Requirement: The processed zarr carries the corrected lineage."""
+    from torch_tracking.utils import require_lineages
+
+    tmp_path, split = converted_split
+    z = zarr.open(str(tmp_path / f"{split}_proc.zarr"), mode="r")
+
+    lineages = require_lineages(z, "train_proc.zarr")
+    sibling = json.loads((tmp_path / f"{split}.json").read_text())
+
+    assert lineages == sibling, "the stored lineage is the corrected one written beside it"
+    assert sorted(lineages[0]) == ["1", "2", "3"]
+
+
+def test_a_zarr_without_the_lineage_is_rejected_naming_it(tmp_path):
+    """Requirement: The processed zarr carries the corrected lineage."""
+    from torch_tracking.loader import TrkDataset
+
+    path = make_processed_zarr(tmp_path / "old_proc.zarr", with_lineages=False)
+    # A sibling lineage must not rescue it.
+    (tmp_path / "old.json").write_text("[]")
+
+    with pytest.raises(ValueError, match=r"lineages.*old_proc\.zarr|old_proc\.zarr.*lineages"):
+        TrkDataset(path, track_length=3, augment=False)
+
+
+def test_retired_arrays_are_not_loaded(tmp_path):
+    """Requirement: The dataloader reads only the arrays it uses."""
+    from torch_tracking.loader import TrkDataset
+
+    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
+    zarr.open(str(path), mode="a").create_array("labels", data=np.zeros((1, 5, 4, 4), "float32"))
+
+    dataset = TrkDataset(path, track_length=3, augment=False)
+
+    assert set(dataset.features) == {"appearances", "morphologies", "centroids", "mpp"}
+
+
+@pytest.mark.parametrize("name", ["appearances", "morphologies", "centroids"])
+def test_a_missing_required_array_is_an_error_naming_it(tmp_path, name):
+    """Requirement: The dataloader reads only the arrays it uses."""
+    from torch_tracking.loader import TrkDataset
+
+    path = make_processed_zarr(tmp_path / "proc.zarr", n_frames=6, max_cells=4)
+    del zarr.open(str(path), mode="a")[name]
+
+    with pytest.raises(ValueError, match=name):
+        TrkDataset(path, track_length=3, augment=False)
+
+
+# --------------------------------------------------------------------------------------
+# 10. Conversion: output directory and resolutions
+# --------------------------------------------------------------------------------------
+
+
+def test_conversion_writes_all_three_outputs_to_an_explicit_directory(tmp_path):
+    """Requirement: Conversion writes to an output directory it is given. (divergence 19)"""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    trks, _, _, _ = make_split(src)
+
+    convert_trk_to_zarr(str(trks), out_dir=str(out))
+
+    assert sorted(p.name for p in out.iterdir()) == ["train.json", "train.zarr", "train_proc.zarr"]
+    assert sorted(p.name for p in src.iterdir()) == ["data-source.npz", "train.trks"]
+
+
+def test_the_default_output_location_is_beside_the_archive(tmp_path):
+    """Requirement: Conversion writes to an output directory it is given."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path)
+    convert_trk_to_zarr(str(trks))
+
+    names = {p.name for p in tmp_path.iterdir()}
+    assert {"train.json", "train.zarr", "train_proc.zarr"} <= names
+
+
+def test_an_unwritable_output_directory_is_an_error_not_a_fallback(tmp_path):
+    """Requirement: Conversion writes to an output directory it is given."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path)
+    missing = tmp_path / "nowhere"
+
+    with pytest.raises(NotADirectoryError, match="nowhere"):
+        convert_trk_to_zarr(str(trks), out_dir=str(missing))
+
+    assert not any(p.name.startswith("train") and p.suffix != ".trks" for p in tmp_path.iterdir())
+
+
+def test_staging_happens_beside_the_destination_not_the_source(tmp_path, monkeypatch):
+    """Requirement: Conversion writes to an output directory it is given.
+
+    os.rename is atomic only within one filesystem, so a partial written beside the
+    source and renamed into another directory could cross a mount.
+    """
+    from torch_tracking import preprocess
+
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    trks, _, _, _ = make_split(src)
+
+    staged = []
+    real = zarr.open
+
+    def spy(path, *args, **kwargs):
+        staged.append(Path(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(preprocess.zarr, "open", spy)
+    preprocess.convert_trk_to_zarr(str(trks), out_dir=str(out))
+
+    partials = [p for p in staged if p.name.endswith(".partial")]
+    assert len(partials) == 2
+    assert all(p.parent == out for p in partials)
+
+
+def test_supplied_resolutions_bypass_the_sidecar(tmp_path):
+    """Requirement: Per-movie resolution is supplied directly or read from a documented sidecar."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_movies=2)
+    (tmp_path / "data-source.npz").unlink()
+
+    convert_trk_to_zarr(str(trks), mpps=[0.55, 0.65])
+
+    for name in ("train.zarr", "train_proc.zarr"):
+        mpp = zarr.open(str(tmp_path / name), mode="r")["mpp"][:]
+        assert mpp.tolist() == [0.55, 0.65], name
+
+
+def test_the_sidecar_is_read_from_the_third_column_of_the_splits_entry(tmp_path):
+    """Requirement: Per-movie resolution is supplied directly or read from a documented sidecar."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_movies=2)
+    write_sidecar(tmp_path, "train", [0.55, 0.65])
+    convert_trk_to_zarr(str(trks))
+
+    mpp = zarr.open(str(tmp_path / "train_proc.zarr"), mode="r")["mpp"][:]
+    assert mpp.tolist() == [0.55, 0.65]
+
+
+def test_conversion_fails_without_resolutions_and_without_a_sidecar(tmp_path):
+    """Requirement: Per-movie resolution is supplied directly or read from a documented sidecar."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path)
+    (tmp_path / "data-source.npz").unlink()
+
+    with pytest.raises(FileNotFoundError, match="data-source.npz"):
+        convert_trk_to_zarr(str(trks))
+    assert not (tmp_path / "train_proc.zarr").exists(), "no default resolution is assumed"
+
+
+@pytest.mark.parametrize("given", [[0.55], [0.55, 0.55, 0.55]])
+def test_supplied_resolutions_must_cover_every_movie(tmp_path, given):
+    """Requirement: Per-movie resolution is supplied directly or read from a documented sidecar."""
+    from torch_tracking.preprocess import convert_trk_to_zarr
+
+    trks, _, _, _ = make_split(tmp_path, n_movies=2)
+
+    with pytest.raises(ValueError, match="2 movies"):
+        convert_trk_to_zarr(str(trks), mpps=given)
+    assert not (tmp_path / "train_proc.zarr").exists()
+
+
+def test_conversion_no_longer_computes_a_spatial_graph_or_a_threshold():
+    """Requirement: Spatial adjacency is reconstructed at sampling time, not stored."""
+    import inspect
+
+    from torch_tracking import preprocess
+
+    assert "distance_threshold" not in inspect.signature(preprocess.get_features).parameters
+    source = inspect.getsource(preprocess)
+    for name in ("adj_matrix", "cdist", "DISTANCE_THRESHOLD", "track_length = np.zeros"):
+        assert name not in source, name
+    assert not hasattr(preprocess, "get_temporal_adjacency"), (
+        "conversion builds no temporal adjacency; the dataloader does"
     )
 
 
@@ -1804,20 +2171,22 @@ def test_training_targets_order_the_classes_different_same_daughter():
 
     Divergence 36: the documentation named the first two classes in the opposite order.
     The order is fixed here, by the targets the model is trained on: 0 different, 1 same
-    cell, 2 daughter. Cell 1 lives in frames 0-1 and divides into cells 2 and 3.
+    cell, 2 daughter. Cell 1 lives in frames 0-1 and divides into cells 2 and 3; cell 4
+    lives throughout, so that two unrelated cells coexist.
     """
-    from torch_tracking.preprocess import get_temporal_adjacency
+    from torch_tracking.loader import get_temporal_adjacency
 
     lineage = {
         1: {"label": 1, "frames": [0, 1], "daughters": [2, 3], "parent": None},
         2: {"label": 2, "frames": [2, 3], "daughters": [], "parent": 1},
         3: {"label": 3, "frames": [2, 3], "daughters": [], "parent": 1},
+        4: {"label": 4, "frames": [0, 1, 2, 3], "daughters": [], "parent": None},
     }
 
-    adj = get_temporal_adjacency(lineage, max_frames=4, max_cells=3)
+    adj = get_temporal_adjacency(lineage, 0, 4, 4)
 
     assert adj[0, 0, 0] == 1, "a cell alive in this frame is 'same' as itself: class 1"
-    assert adj[0, 0, 1] == 0, "two unrelated cells are 'different': class 0"
+    assert adj[0, 0, 3] == 0, "two unrelated cells are 'different': class 0"
     assert adj[1, 0, 1] == 2 and adj[1, 0, 2] == 2, (
         "at the parent's last frame, each daughter is class 2"
     )
