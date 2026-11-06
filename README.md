@@ -23,7 +23,9 @@ This is a PyTorch port of the cell tracking model from [Caliban](https://www.bio
     - [Running the Tracker](#running-the-tracker)
     - [Outputs](#outputs)
   - [Training](#training)
-    - [Training Hyperparameters](#training-hyperparameters)
+    - [What a run writes](#what-a-run-writes)
+    - [Choosing the best epoch](#choosing-the-best-epoch)
+    - [Training Settings](#training-settings)
   - [Inference Hyperparameters](#inference-hyperparameters)
   - [Evaluation](#evaluation)
   - [Model Architecture](#model-architecture)
@@ -182,101 +184,101 @@ df = tracker.dataframe()             # pandas DataFrame summary
 
 ## Training
 
-Training requires processed Zarr files (see [Preprocessing](#preprocessing-trk--zarr)).
+Training needs processed Zarr files (see [Preprocessing](#preprocessing-trk--zarr)): a directory holding `train_proc.zarr` and `val_proc.zarr`.
 
-```python
-from pathlib import Path
-from torch_tracking.model import GNNTrackingModel
-from torch_tracking.loader import create_trk_dataloaders
-from torch_tracking.training import Trainer
-from torch_tracking.utils import create_optimizer, create_scheduler
+Launch a run from the command line. No source file needs editing:
 
-config = {
-    "optimizer": "radam",
-    "learning_rate": 1e-3,
-    "weight_decay": 0,
-    "scheduler": "reduce_on_plateau",
-    "patience": 5,
-    "max_epochs": 50,
-    "batch_size": 8,
-    "n_layers": 2,
-    "num_workers": 4,
-    "clipnorm": 1.0,
-    "loss": "wcce",
-    "gamma": 1.0,
-    "dropout": 0,
-    "device": "cuda:0",
-    "data_precision": "bfloat16",
-    "stopping_metric": "loss",
-    "log_and_save": True,
-}
+```bash
+# On a shared machine, say which card is yours: the default device "cuda" is card 0.
+export CUDA_VISIBLE_DEVICES=0
 
-model = GNNTrackingModel(
-    graph_layer='gat',
-    data_format='channels_last',
-    encoder_dim=64,
-    n_layers=config['n_layers'],
-    crop_size=32,
-    dropout=config['dropout'],
-)
-
-train_loader, val_loader, _ = create_trk_dataloaders(
-    train_path=Path.home() / '.deepcell/tracking/train_proc.zarr',
-    val_path=Path.home() / '.deepcell/tracking/val_proc.zarr',
-    batch_size=config['batch_size'],
-    distance_threshold=89,
-    num_workers=config['num_workers'],
-)
-
-optimizer = create_optimizer(model, config)
-scheduler = create_scheduler(optimizer, config)
-
-trainer = Trainer(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    device=config['device'],
-    checkpoint_dir='./checkpoints/',
-    log_dir='./logs/',
-    max_epochs=config['max_epochs'],
-    gradient_clip=config['clipnorm'],
-    loss=config['loss'],
-    gamma=config['gamma'],
-    class_weights=[1, 10, 100],   # upweight mitosis class
-    data_precision=config['data_precision'],
-    stopping_metric=config['stopping_metric'],
-    config=config,
-)
-
-trainer.train()
+torch-tracking-train --data-dir ~/.deepcell/tracking
+# the same thing without the installed command:
+python -m torch_tracking.training --data-dir ~/.deepcell/tracking
 ```
 
-Checkpoints are saved to `./checkpoints/<timestamp>/best_model.pt`. TensorBoard logs are written to `./logs/<timestamp>/`.
+`--data-dir` has no default, because there is no location that is right on every machine. Every setting in the [table below](#training-settings) is also a flag, and `--help` lists them. For example, a shorter run with a different loss:
 
-### Training Hyperparameters
+```bash
+torch-tracking-train --data-dir ~/.deepcell/tracking --max-epochs 30 \
+    --loss focal_wcce --class-weights 1 10 100 --checkpoint-dir ./my_run/
+```
 
-| Parameter | Default | Description |
+From Python, the same run is a configuration object and one call:
+
+```python
+from torch_tracking.training import TrainingConfig, run_training
+
+config = TrainingConfig(data_dir="~/.deepcell/tracking", max_epochs=30, device="cuda")
+trainer = run_training(config)   # builds the model and dataloaders, trains, returns the Trainer
+```
+
+To assemble the pieces yourself, `Trainer(model, train_loader, val_loader, config)` takes exactly those four arguments. The configuration is a `TrainingConfig`, not a dictionary, and the trainer builds its own optimizer and scheduler from it.
+
+**Memory.** Each dataloader worker holds its own copy of the training arrays in RAM, about 15 GB per worker for DynamicNuclearNet-tracking, so the default `--num-workers 4` needs on the order of 60 to 80 GB of RAM. Lower it on a busy machine.
+
+### What a run writes
+
+Beneath `--checkpoint-dir` (default `./checkpoints/`), in a folder named for the start time:
+
+| File | Contents |
+| --- | --- |
+| `config.json` | Every setting the run used, including the loss class weights |
+| `checkpoint_epoch_NNNN.pt` | One per finished epoch. All are kept unless `--max-checkpoints N` caps them to the most recent N |
+| `best_model.pt` | A copy of the checkpoint for the best epoch. Never removed by the cap |
+| `training_history.json` | Per-epoch training and validation metrics, plus `best_epoch`, `best_value` and `stopping_metric`. Written when the run ends; if a run is killed, the same lists are in the latest checkpoint |
+
+TensorBoard logs go to `--log-dir` (default `./logs/`). With `--no-log-and-save` a run writes none of this, and still runs to the end.
+
+To continue an interrupted run, call `trainer.load_checkpoint(path)` and then `trainer.train()`. Training resumes with the epoch *after* the one the checkpoint recorded, and restores the optimizer, the learning-rate schedule, the gradient scaler and the early-stopping counter.
+
+### Choosing the best epoch
+
+`--stopping-metric` names the validation metric that picks the best epoch, drives early stopping and drives the plateau scheduler. The default is `loss`, which is minimized. Every other metric (`accuracy` and the `precision_class_*`, `recall_class_*` and `f1_class_*` keys) is maximized, and the direction is applied consistently to all three. An unrecognized name is rejected when the trainer is built, with the list of valid names.
+
+Validation loss is **not** a good ranking of epochs by the metrics this project is judged on. Across 297 epochs in seven past runs, the rank correlation between validation loss and validation F1 for the mitosis class is about -0.40: lower loss does tend toward higher F1, but weakly, and the epoch picked by lowest loss scored below the best available in six of seven runs. Keeping every epoch (the default) is what lets a better rule be tested against the real evaluation. The rule itself is not changed here; `correct-checkpoint-selection` will replace it.
+
+Three further limits are known and left for that change. Runs are **not reproducible**, because no random stream is seeded. A recorded loss is **one third of the per-entry cross-entropy**, because the loss averages over the three classes as well as the graded entries; correcting that would change what training minimizes, so it is done together with the retrain. And training runs under mixed precision while validation does not, so a run's training and validation losses come from different numeric paths and should not be compared digit for digit. Recorded validation losses are pooled by the number of entries each batch graded, so they also differ slightly from those recorded before this was changed.
+
+### Training Settings
+
+Every field of `TrainingConfig`. Each is recorded in `config.json`.
+
+| Setting (`--flag`) | Default | Description |
 | --- | --- | --- |
-| `learning_rate` | `1e-3` | Initial learning rate for the optimizer |
-| `optimizer` | `"radam"` | Optimizer type. Options: `"radam"`, `"adam"`, `"sgd"` |
-| `scheduler` | `"reduce_on_plateau"` | LR scheduler. Options: `"reduce_on_plateau"`, `"step"`, `"cosine"` |
-| `patience` | `5` | Epochs without improvement before LR is reduced (ReduceLROnPlateau) |
-| `early_stopping_patience` | `10` | Epochs without improvement before training stops (only if `enable_early_stopping` is on). Independent of `patience` |
-| `max_epochs` | `50` | Maximum number of training epochs |
-| `batch_size` | `8` | Number of sequences per batch |
-| `clipnorm` | `1.0` | Maximum gradient norm for clipping. Lower values (e.g. `0.001`) stabilize training if gradients are exploding |
-| `n_layers` | `2` | Number of GNN message-passing layers in the neighborhood encoder |
-| `encoder_dim` | `64` | Feature dimension for all encoders and the GNN hidden state |
-| `dropout` | `0` | Dropout rate in the decoder |
-| `loss` | `"wcce"` | Loss function. `"wcce"` = weighted cross-entropy; `"focal"` = focal loss |
-| `gamma` | `1.0` | Focal loss exponent (only used when `loss="focal"`) |
-| `class_weights` | `[1, 10, 100]` | Per-class weights for `[no-link, same-cell, mitosis]`. Mitosis events are rare so a high weight (e.g. `100`) is recommended |
-| `data_precision` | `"bfloat16"` | Mixed-precision training mode. Options: `"bfloat16"`, `"float16"`, `"float32"` |
-| `distance_threshold` | `64` | Pixel radius for GNN edges (cells farther apart are disconnected). Should match the value used at inference |
-| `track_length` | `8` | Number of frames per training window. Should match the inference `track_length` |
-| `stride` | `1` | Temporal stride when sliding the training window |
+| `data_dir` (`--data-dir`) | *required* | directory holding train_proc.zarr and val_proc.zarr (required) |
+| `optimizer` (`--optimizer`) | `"radam"` | one of radam, adamw |
+| `scheduler` (`--scheduler`) | `"reduce_on_plateau"` | one of reduce_on_plateau, cosine, step, exp, none |
+| `device` (`--device`) | `"cuda"` | torch device; on a shared machine pick the card with CUDA_VISIBLE_DEVICES |
+| `checkpoint_dir` (`--checkpoint-dir`) | `"./checkpoints/"` | parent directory for per-run checkpoint folders |
+| `log_dir` (`--log-dir`) | `"./logs/"` | parent directory for per-run TensorBoard logs |
+| `step_size` (`--step-size`) | `5` | epochs between decays under the 'step' scheduler |
+| `step_gamma` (`--step-gamma`) | `0.1` | learning-rate multiplier at each decay under the 'step' scheduler |
+| `max_epochs` (`--max-epochs`) | `50` | number of epochs to train |
+| `num_workers` (`--num-workers`) | `4` | dataloader worker processes; each holds its own copy of the training set in RAM |
+| `n_layers` (`--n-layers`) | `2` | graph layers in the model |
+| `clipnorm` (`--clipnorm`) | `1.0` | gradient-norm clip; 0 disables clipping |
+| `batch_size` (`--batch-size`) | `8` | windows per batch |
+| `learning_rate` (`--learning-rate`) | `0.001` | initial learning rate |
+| `patience` (`--patience`) | `5` | epochs without improvement before 'reduce_on_plateau' decays |
+| `early_stopping_patience` (`--early-stopping-patience`) | `10` | epochs without improvement before stopping (with --enable-early-stopping) |
+| `enable_early_stopping` (`--enable-early-stopping`) | `False` | stop when the stopping metric stops improving |
+| `log_and_save` (`--log-and-save`) | `True` | write checkpoints, history and TensorBoard logs; off writes nothing |
+| `class_weights` (`--class-weights`) | `[1, 10, 100]` | loss weight per class, in [different, same, mitosis] order |
+| `loss` (`--loss`) | `"wcce"` | one of wcce, focal, focal_wcce |
+| `stopping_metric` (`--stopping-metric`) | `"loss"` | validation metric that selects the best epoch and drives early stopping; loss is minimized, every other metric maximized |
+| `gamma` (`--gamma`) | `1.0` | focusing parameter of the focal loss modes |
+| `truncate_dataset` (`--truncate-dataset`) | `None` | use only the first N movies (for smoke tests) |
+| `data_precision` (`--data-precision`) | `"bfloat16"` | one of bfloat16, float16, float32 |
+| `dropout` (`--dropout`) | `0` | dropout rate in the model |
+| `crop_size` (`--crop-size`) | `32` | appearance crop size the model expects |
+| `decay` (`--decay`) | `0.99` | learning-rate multiplier per epoch under the 'exp' scheduler |
+| `weight_decay` (`--weight-decay`) | `0.0` | weight decay passed to the optimizer |
+| `max_checkpoints` (`--max-checkpoints`) | `None` | keep only the most recent N per-epoch checkpoints; default keeps every epoch |
+
+Three further values are fixed by the entry point rather than configured: `distance_threshold` (89, `utils.DISTANCE_THRESHOLD`), `track_length` (8) and `stride` (1) are dataloader arguments. `distance_threshold` and `track_length` must match the values used at inference.
+
+`class_weights` applies in `wcce` and `focal_wcce`. The `focal` loss has no use for weights: asking for them from `TrackingLoss` directly is an error, and the trainer prints a note that the recorded weights have no effect.
 
 ---
 
@@ -289,7 +291,7 @@ These are set on the `CellTracker` object and control the post-processing decisi
 | `death` | `0.999` | Minimum model confidence to call a track "dead" (cell exited the field of view). Higher values make deaths rarer |
 | `birth` | `0.999` | Minimum model confidence to call a detection a "new cell" rather than assigning it to an existing track. Higher values make spontaneous births rarer |
 | `division` | `0.5` | Minimum model confidence for a new-cell event to be attributed to a cell division (mitosis). Lower values increase division sensitivity at the cost of more false positives |
-| `distance_threshold` | `64` | Pixel radius for GNN adjacency at inference. Should match the value used during training |
+| `distance_threshold` | `89` | Pixel radius for GNN adjacency at inference. Should match the value used during training |
 | `track_length` | `8` | Number of historical frames used to build the LSTM context for each track. Longer histories give more context but require more memory |
 | `mpp` | `0.55` | Microns per pixel of your input movie. The model was trained at `0.55 µm/pixel`; images are rescaled to match this before inference |
 | `device` | `"cuda"` | PyTorch device string (`"cuda"`, `"cuda:1"`, `"cpu"`, `"mps"`) |

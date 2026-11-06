@@ -738,6 +738,36 @@ def trk_to_graph(lineage, node_key=None):
 
     return G
 
+#: Which way is "better" for every metric `MetricsTracker.get_metrics` reports. This is the
+#: single place the direction of improvement is decided: best-checkpoint selection, early
+#: stopping and the metric-driven learning-rate schedule all read it through
+#: `metric_direction`, so none of them can disagree about it.
+METRIC_DIRECTIONS = {
+    'loss': 'min',
+    'accuracy': 'max',
+    **{f'{kind}_class_{c}': 'max' for kind in ('precision', 'recall', 'f1') for c in range(3)},
+}
+
+
+def check_choice(setting, value, accepted):
+    """Return `value` if it is one of `accepted`, else raise naming both.
+
+    Used wherever a configuration setting selects among named options, so that a bad value
+    fails where it is given instead of surfacing later as a missing attribute.
+    """
+    if value not in accepted:
+        raise ValueError(
+            f"Unknown {setting} {value!r}; accepted values: {', '.join(map(str, accepted))}"
+        )
+    return value
+
+
+def metric_direction(metric_name):
+    """'min' if a lower value of `metric_name` is better, 'max' if a higher one is."""
+    check_choice('stopping_metric', metric_name, list(METRIC_DIRECTIONS))
+    return METRIC_DIRECTIONS[metric_name]
+
+
 class MetricsTracker:
     
     def __init__(self):
@@ -746,7 +776,7 @@ class MetricsTracker:
     
     def reset(self):
         self.total_loss = 0.0
-        self.total_samples = 0
+        self.total_graded = 0
         self.correct = 0
         self.total_predictions = 0
         
@@ -755,25 +785,25 @@ class MetricsTracker:
         self.class_total = {0: 0, 1: 0, 2: 0}
         self.class_predicted = {0: 0, 1: 0, 2: 0}
 
-        self.cm = np.zeros((3,3))
-
-    
     def update(self, loss, predictions, targets):
         """
         Args:
-            loss: scalar loss value
-            predictions: (B, T, N, M, 3) logits
-            targets: (B, T, N, M, 3) one hot encoding of labels
+            loss: scalar loss for the batch, averaged over its graded entries (and over the
+                class axis; see divergence 53 for what that does to its scale)
+            predictions: (B, T, N, M, 3) class probabilities
+            targets: (B, T, N, M) integer class labels, -1 marking an ungraded entry
         """
-
-        batch_size = predictions.shape[0]
-        self.total_loss += loss.item() * batch_size
-        self.total_samples += batch_size
 
         # Get predicted classes
         pred_classes = predictions.argmax(dim=-1).view(-1)  # (B*T*N*M)
         target_classes = targets.view(-1)
         valid_mask = target_classes.view(-1) >= 0
+
+        # The batch loss is already a mean over graded entries, so weight it by how many
+        # there were. Weighting by batch size would over-count a batch that graded little.
+        n_graded = valid_mask.sum().item()
+        self.total_loss += loss.item() * n_graded
+        self.total_graded += n_graded
 
         # Overall accuracy
         correct = (pred_classes == target_classes) & valid_mask
@@ -792,7 +822,7 @@ class MetricsTracker:
     
     def get_metrics(self):
         """Compute and return current metrics."""
-        avg_loss = self.total_loss / max(self.total_samples, 1)
+        avg_loss = self.total_loss / max(self.total_graded, 1)
         accuracy = self.correct / max(self.total_predictions, 1)
         
         metrics = {
@@ -800,8 +830,6 @@ class MetricsTracker:
             'accuracy': accuracy
         }
 
-        running_f1 = 0
-        
         # Add per-class metrics
         for class_idx in range(3):
             # Recall: of all true class_idx, how many did we predict correctly?
@@ -818,8 +846,7 @@ class MetricsTracker:
             metrics[f'recall_class_{class_idx}'] = recall
             metrics[f'precision_class_{class_idx}'] = precision
             metrics[f'f1_class_{class_idx}'] = f1
-            running_f1 *= f1
-                
+
         return metrics
     
 class EarlyStopping:
@@ -832,6 +859,7 @@ class EarlyStopping:
             min_delta: Minimum change to qualify as improvement
             mode: 'min' for loss, 'max' for accuracy
         """
+        check_choice('early-stopping mode', mode, ('min', 'max'))
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -860,10 +888,14 @@ class EarlyStopping:
         return self.should_stop
     
 
+OPTIMIZERS = ('radam', 'adamw')
+SCHEDULERS = ('reduce_on_plateau', 'cosine', 'step', 'exp', 'none')
+
+
 def create_optimizer(model, config):
     """Create optimizer based on config."""
 
-    optimizer_name = config.optimizer
+    optimizer_name = check_choice('optimizer', config.optimizer, OPTIMIZERS)
     
     if optimizer_name == 'radam':
         optimizer = optim.RAdam(
@@ -877,24 +909,21 @@ def create_optimizer(model, config):
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
+            weight_decay=config.weight_decay,
         )
 
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer_name}")
-    
     return optimizer
 
 
 def create_scheduler(optimizer, config):
     """Create learning rate scheduler."""
 
-    scheduler_name = config.scheduler
+    scheduler_name = check_choice('scheduler', config.scheduler, SCHEDULERS)
 
-    
     if scheduler_name == 'reduce_on_plateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode=metric_direction(config.stopping_metric),
             factor=0.2,
             patience=config.patience
             )
@@ -907,11 +936,10 @@ def create_scheduler(optimizer, config):
         )
 
     elif scheduler_name == 'step':
-        step_size = config.get('step_size', 30)
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=step_size,
-            gamma=config.gamma
+            step_size=config.step_size,
+            gamma=config.step_gamma
         )
 
     elif scheduler_name == 'exp':
@@ -920,8 +948,7 @@ def create_scheduler(optimizer, config):
             gamma=config.decay
         )
 
-    elif scheduler_name == 'none':
+    else:  # 'none'
         scheduler = None
 
-        
     return scheduler

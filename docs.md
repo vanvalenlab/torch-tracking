@@ -351,96 +351,117 @@ loader shuffles and augments.
 
 ---
 
-## 3. `Trainer` - `training.py`
+## 3. Training - `training.py`
 
 ### 3.1 Module overview
 
-- Encapsulates the full supervised training loop: forward pass, loss computation, gradient update, validation, learning rate scheduling, early stopping, TensorBoard logging, and checkpoint management
-- Wraps a `GNNTrackingModel` and is configured entirely through constructor arguments — no global config file is required at runtime
+- Holds the whole supervised training loop (forward pass, loss, gradient update, validation, learning-rate scheduling, early stopping, TensorBoard logging, checkpointing), the `TrainingConfig` that describes a run, and the command-line entry point that launches one.
+- Three ways in, from highest to lowest level: the command `torch-tracking-train` (also `python -m torch_tracking.training`); `run_training(config)`, which builds the model and dataloaders a configuration describes; and `Trainer(model, train_loader, val_loader, config)` for a caller who assembles the pieces.
+- Everything that varies between runs is one `TrainingConfig`. There is no other configuration channel, and no file is read at run time.
+- The README's Training section is the user-facing recipe. This section is the contract behind it; the requirements are in `openspec/specs/model-training/spec.md`.
 
 ---
 
-### 3.2 `Trainer` class
+### 3.2 `TrainingConfig`
 
-#### Constructor — `__init__`
+A dataclass with one field per setting. Three properties are guaranteed and tested:
 
-- **Parameters** — document each:
-  - `model`: `GNNTrackingModel` instance — moved to `device` in the constructor
-  - `train_loader`, `val_loader`: PyTorch `DataLoader` objects producing batches with keys `appearances`, `morphologies`, `centroids`, `adj_matrices`, `labels`
-  - `optimizer`: pre-built optimizer (use `create_optimizer` from `utils.py`)
-  - `scheduler`: optional LR scheduler (use `create_scheduler` from `utils.py`); `ReduceLROnPlateau` is handled separately from step-based schedulers
-  - `device`: device string passed to `torch.amp.autocast` — must match the device the model is on
-  - `checkpoint_dir`, `log_dir`: base directories; a timestamp suffix is appended automatically to avoid overwriting runs
-  - `max_epochs`: hard ceiling on training duration
-  - `gradient_clip`: maximum gradient norm; set to 0 to disable clipping
-  - `early_stopping_patience`: number of validation epochs without improvement before stopping (only active if `enable_early_stopping=True`)
-  - `enable_early_stopping`: flag to turn early stopping on or off without changing patience
-  - `log_and_save`: when `False`, TensorBoard writer is not created and no checkpoints are written — useful for quick debugging runs
-  - `config`: arbitrary dict saved as `config.json` alongside checkpoints for reproducibility
-  - `loss`: one of `'wcce'`, `'focal'`, `'focal_wcce'` — passed to `TrackingLoss`
-  - `class_weights`: optional list of per-class weights passed to `TrackingLoss`; when `None`, weights are computed dynamically from each batch, but leads to unstable training. The default is 1:10:100 for different:same:mitosis.
-  - `stopping_metric`: key from the metrics dict used to determine best model — typically `'loss'`
-  - `gamma`: focal loss focusing parameter (only used when `loss` contains `'focal'`)
-  - `data_precision`: `'float32'`, `'float16'`, or `'bfloat16'` — controls `torch.amp.autocast` dtype and whether `GradScaler` is active
-- **Side effects**: creates checkpoint and log directories, writes `config.json`, instantiates `SummaryWriter`, `TrackingLoss`, `MetricsTracker`, and `EarlyStopping`
+- **It is recorded completely.** `to_dict()` is built from the dataclass fields, so every setting appears in the run's `config.json`, including `class_weights`. A field cannot be added without being recorded.
+- **Every field is read.** A setting no code path reads is removed, not left to be set in the belief that it acts.
+- **Every field is a flag.** The parser is generated from the fields (`--max-epochs` for `max_epochs`), so a new field is settable from the command line with no further edit.
+
+Choices are checked when the `Trainer` is built (`validate_config`): `optimizer` (`radam`, `adamw`), `scheduler` (`reduce_on_plateau`, `cosine`, `step`, `exp`, `none`), `loss` (`wcce`, `focal`, `focal_wcce`), `data_precision` (`bfloat16`, `float16`, `float32`) and `stopping_metric` (any key of the validation metrics). A bad value raises `ValueError` naming the value and the accepted set, rather than failing later as a missing attribute.
+
+Two settings that look alike are separate: `gamma` is the focal-loss focusing parameter, and `step_gamma` is the learning-rate multiplier of the `step` scheduler. The `exp` scheduler uses `decay`. `weight_decay` is passed to both optimizers.
 
 ---
+
+### 3.3 `Trainer` class
+
+#### Constructor
+
+`Trainer(model, train_loader, val_loader, config)`. The constructor:
+
+- validates the configuration (above);
+- builds the optimizer and scheduler from it with `create_optimizer` and `create_scheduler`;
+- builds `TrackingLoss`, passing `class_weights` only to the loss modes that apply them (`wcce`, `focal_wcce`); for `focal` it prints a note that the recorded weights have no effect;
+- moves the model and loss to `config.device`;
+- sets up mixed precision for that device's type. `bfloat16` and `float16` autocast with a `GradScaler`; `float32` disables autocasting and the scaler entirely;
+- resolves the direction of improvement once from `stopping_metric` (`loss` minimizes, every other metric maximizes) and gives it to best-epoch selection, `EarlyStopping` and the plateau scheduler;
+- when `log_and_save` is on, creates `<checkpoint_dir>/<timestamp>/` and `<log_dir>/<timestamp>/`, writes `config.json` and opens a `SummaryWriter`. When it is off none of that happens.
 
 #### `train_epoch()`
 
-- **Purpose**: Runs one full pass over the training set
-- **Workflow**:
-  1. Sets model to `train()` mode
-  2. For each batch: moves tensors to device, calls `model.training_forward()` under `autocast`, computes loss, scales and calls `backward()`, checks for NaN/Inf, unscales gradients, clips norm, steps scaler and optimizer
-  3. Updates `MetricsTracker` and refreshes the tqdm progress bar with per-class F1 and loss
-- **Returns**: metrics dict from `MetricsTracker.get_metrics()` — resets the tracker before returning
-- **Note on precision**: when `data_precision='float32'`, `GradScaler` is instantiated with `enabled=False`, making it a no-op — so the scaler calls are safe regardless of precision mode
+- Sets the model to `train()` and walks the training loader.
+- Per batch: forward under autocast (the model returns **probabilities**, which `TrackingLoss` requires), loss, then a finite-loss check. A batch whose loss is NaN or infinite is skipped with a message naming the batch, **before** any gradient scaling, so the scaler is never left half-updated.
+- For a finite loss: scaled `backward()`, unscale, gradient clipping (`clipnorm`, 0 disables), scaler and optimizer step, scaler update, metrics update.
+- Returns the metrics dict from `MetricsTracker.get_metrics()` and resets the tracker.
 
 #### `validate()`
 
-- **Purpose**: Runs one full pass over the validation set without gradient computation
-- Decorated with `@torch.no_grad()` — no need to call `torch.no_grad()` manually inside
-- Identical structure to `train_epoch()` except no backward pass, no scaler, and NaN batches are silently skipped
-- **Returns**: metrics dict; resets tracker before returning
+- `@torch.no_grad()`, model in `eval()`. Same shape as `train_epoch()` without a backward pass.
+- **Runs without autocast**, so validation is full precision while training is mixed precision. This is a recorded divergence, not intended behavior; see section 3.6.
+- A batch with a NaN loss is skipped.
 
-#### `save_checkpoint(is_best)`
+#### `save_checkpoint(is_best=False)`
 
-- **Purpose**: Persists model and optimizer state to disk
-- Saves the full checkpoint dict (epoch, model state, optimizer state, best val loss, history) to `checkpoint_epoch_N.pt` for regular saves, or `best_model.pt` when `is_best=True`
-- Only the best checkpoint overwrites; regular checkpoints are pruned to keep only the last 3
+- Writes `checkpoint_epoch_NNNN.pt` (zero-padded to four digits) for the epoch just completed. When `is_best`, the same file is also copied to `best_model.pt`. Returns the path.
+- Does nothing, and returns `None`, when `log_and_save` is off.
+- Applies `max_checkpoints`: only the most recent N per-epoch files are kept, ordered by epoch number. `best_model.pt` is never pruned. The default keeps every epoch.
 
 #### `load_checkpoint(checkpoint_path)`
 
-- **Purpose**: Restores a training run from a saved checkpoint
-- Restores model weights, optimizer state, epoch counter, best val loss, and full history
-- Allows resuming training by calling `train()` after loading
+- Restores model, optimizer, learning-rate schedule, gradient scaler, early-stopping counter, best value, best epoch and both histories.
+- Sets `current_epoch` to the checkpoint's epoch **plus one**: a checkpoint records a finished epoch, so `train()` continues with the next. A checkpoint from before this was added holds no schedule or scaler state; the trainer says so and restarts the schedule from the optimizer's current rate.
 
 #### `train()`
 
-- **Purpose**: Main training loop — calls `train_epoch()` and `validate()` for each epoch, steps the scheduler, saves checkpoints, and triggers early stopping
-- **Scheduler step logic**: `ReduceLROnPlateau` is stepped with the current stopping metric; all other schedulers are stepped without arguments — document that list schedulers (the `'caliban'` case) are not handled
-- **Best model logic**: `is_best` is determined by comparing `val_metrics[stopping_metric]` against `self.best_val_loss`; note that `save_checkpoint(is_best=True)` is always called at the end of training, saving whatever state the model is in at the final epoch (not necessarily the best)
-- **TensorBoard**: all keys in `train_metrics` and `val_metrics` are logged under `train/` and `val/` namespaces
-- **History**: `train_history` and `val_history` are written to `training_history.json` at the end
+- Loops `range(current_epoch, max_epochs)`: train, validate, step the scheduler, decide whether the epoch is the best, decide early stopping, save the checkpoint, log to TensorBoard, print a summary.
+- **Scheduler**: `ReduceLROnPlateau` is stepped with the validation value of `stopping_metric`, in the direction that metric improves; every other scheduler is stepped with no argument.
+- **Best epoch**: an epoch is best if `val_metrics[stopping_metric]` improves on the best so far, in the metric's direction. The default is minimized validation loss.
+- **Early stopping**: only when `enable_early_stopping` is on. It is decided before the epoch's checkpoint is written, so the checkpoint holds the counter as it stood after that epoch.
+- **Every epoch writes a checkpoint**, best or not.
+- **History**: when `log_and_save` is on, `training_history.json` is written at the end with `train`, `val`, `stopping_metric`, `best_epoch` and `best_value`.
+- With `log_and_save` off the run writes nothing and still completes.
 
 ---
 
-### 3.3 `__main__` example script
+### 3.4 Command line
 
-- Shows a minimal end-to-end training run using `create_trk_dataloaders`, `create_optimizer`, and `create_scheduler` from `utils.py`
-- Document the config keys used and their meaning: `optimizer`, `learning_rate`, `weight_decay`, `decay`, `scheduler`, `max_epochs`, `batch_size`, `n_layers`, `num_workers`, `clipnorm`, `step_size`, `crop_mode`, `patience`, `log_and_save`, `enable_early_stopping`, `crop_size`, `truncate_dataset`, `loss`, `dropout`, `device`, `label_smoothing`, `stopping_metric`, `data_precision`, `gamma`
+`torch-tracking-train --data-dir <dir> [--<setting> value ...]`, or `python -m torch_tracking.training`. `--data-dir` is required and has no default; it must hold `train_proc.zarr` and `val_proc.zarr`, and it is recorded in `config.json`.
+
+`main(argv)` returns an exit status; `config_from_args(argv)` parses to a `TrainingConfig` without running anything; `build_parser()` returns the parser. `run_training(config)` builds the model (`build_model`, whose architecture is fixed to what `CellTracker` loads) and dataloaders, trains, and returns the `Trainer`.
+
+The device is whatever `--device` names (default `cuda`). No card index is written in source: on a shared machine, choose a card with `CUDA_VISIBLE_DEVICES` and leave the device as `cuda` or `cuda:0`.
 
 ---
 
-### 3.4 Checkpoints
+### 3.5 Checkpoints
 
-Document the schema of a saved checkpoint file:
+Each `checkpoint_epoch_NNNN.pt`, and `best_model.pt`, is a dictionary:
 
 | Key | Description |
 | --- | --- |
-| `epoch` | Last completed epoch index |
-| `model_state_dict` | `model.state_dict()` — load with `model.load_state_dict()` |
-| `optimizer_state_dict` | Optimizer state — load with `optimizer.load_state_dict()` |
-| `best_val_loss` | Best observed validation metric across all epochs |
-| `train_history` | List of per-epoch train metric dicts |
-| `val_history` | List of per-epoch val metric dicts |
+| `epoch` | Index of the last **completed** epoch (0-based). A resumed run continues at `epoch + 1` |
+| `model_state_dict` | `model.state_dict()`; load with `model.load_state_dict()` |
+| `optimizer_state_dict` | Optimizer state |
+| `scheduler_state_dict` | Learning-rate schedule state, or `None` for `scheduler='none'` |
+| `scaler_state_dict` | Gradient-scaler state; empty when the scaler is disabled (`float32`) |
+| `early_stopping_state` | `best_value`, `counter` and `should_stop` of the early-stopping tracker |
+| `stopping_metric` | Name of the metric that selected the best epoch |
+| `best_metric` | Best value of that metric so far, at the end of this epoch. (Older checkpoints call this `best_val_loss`; `load_checkpoint` reads either.) |
+| `best_epoch` | Epoch index of that best value, or `None` before any epoch has improved |
+| `train_history`, `val_history` | Lists of per-epoch metric dicts up to and including this epoch |
+
+The metrics in each dict are `loss`, `accuracy`, and `precision_class_{0,1,2}`, `recall_class_{0,1,2}`, `f1_class_{0,1,2}`, for class order `[different, same, mitosis]`. `loss` is each batch's loss as `TrackingLoss` returns it, pooled across batches with each weighted by how many entries it graded (padding is not graded). The batch loss itself is a third of the per-entry cross-entropy; see section 3.6.
+
+---
+
+### 3.6 Known limits
+
+- **Selection by validation loss is weak.** Over 297 epochs in seven runs the rank correlation between validation loss and mitosis-class F1 is about -0.40, and the loss-selected epoch trailed the best epoch in six of seven. The default rule is unchanged here; `correct-checkpoint-selection` replaces it, using the per-epoch checkpoints this change makes available. (Divergence 54.)
+- **Runs are not reproducible.** No random stream is seeded. (Divergence 42, also for `correct-checkpoint-selection`.)
+- **A recorded loss is a third of the per-entry cross-entropy.** `TrackingLoss` averages over the class axis as well as the graded entries. The same value is what training minimizes, so correcting the scale also rescales the gradients that clipping acts on; it is left for `correct-checkpoint-selection`, which retrains. Tests pin the current value and gradients. (Divergence 53.)
+- **Recorded validation losses are pooled by graded entries**, not by batch size, so they differ slightly from those recorded before this was changed. Their scale is the same.
+- **Validation does not run under autocast**, so a run's training and validation losses come from different numeric paths. (Divergence 71.)
+- **CPU training is not a supported mode.** The device type follows `--device`, so a CPU run works in tests, but only CPU *inference* is a project guarantee.

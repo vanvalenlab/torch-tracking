@@ -1,5 +1,5 @@
 import torch
-from torch_tracking.utils import weighted_categorical_crossentropy_v2
+from torch_tracking.utils import check_choice
 from torch import nn
 from torch.nn import functional as F
 
@@ -22,13 +22,43 @@ def multiclass_focal_loss(probs, targets_one_hot, gamma=2.0):
     return modulator * ce
 
 
+LOSSES = ('wcce', 'focal', 'focal_wcce')
+
+#: Loss modes that apply `class_weights`. `focal` does not, and refuses them.
+WEIGHTED_LOSSES = ('wcce', 'focal_wcce')
+
+
 class TrackingLoss(nn.Module):
+    """Classification loss over the track-by-cell score grid.
+
+    The loss takes the logarithm of its input, so it requires **probabilities** (a softmax
+    over the three classes), never logits. `GNNTrackingModel.training_forward` returns
+    probabilities by default for exactly this reason.
+
+    Args:
+        loss: one of `LOSSES`.
+        gamma: focusing parameter for the focal modes. Unrelated to any learning-rate
+            schedule; the step schedule has its own `step_gamma`.
+        class_weights: per-class weights, in the model's `[different, same, mitosis]`
+            class order. Applied by `wcce` and `focal_wcce`; `focal` has no use for them
+            and raises rather than accepting and discarding them.
+
+    The returned loss is a mean over the graded entries **and** over the class axis, so it
+    is one third of the per-entry weighted cross-entropy. That is divergence 53, left as it
+    is on purpose: this value is what training minimizes, so rescaling it rescales the
+    gradients that gradient clipping acts on. `correct-checkpoint-selection` corrects it
+    together with the retrain that reports the effect.
+    """
 
     def __init__(self, loss='wcce', gamma=2.0, class_weights = None):
         super().__init__()
 
-        assert loss in ('wcce', 'focal', 'focal_wcce'), \
-            f"loss must be 'wcce', 'focal', or 'focal_wcce', got '{loss}'"
+        check_choice('loss', loss, LOSSES)
+        if loss not in WEIGHTED_LOSSES and class_weights is not None:
+            raise ValueError(
+                f"loss {loss!r} does not apply class_weights; pass class_weights=None, "
+                f"or use one of {', '.join(WEIGHTED_LOSSES)}"
+            )
 
         self.loss = loss
         self.gamma = gamma

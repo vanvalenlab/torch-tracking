@@ -51,6 +51,9 @@ dependencies = [
     "huggingface_hub"
 ]
 
+[project.scripts]
+torch-tracking-train = "torch_tracking.training:main"
+
 [[project.authors]]
 name = 'Van Valen Lab'
 email = 'vanvalenlab@gmail.com'

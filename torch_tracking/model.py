@@ -40,9 +40,9 @@ class GNNTrackingModel(nn.Module):
         ...     appearance_shape=(1, 32, 32, 1)
         ... )
         >>> 
-        >>> # Training
-        >>> logits = model.training_forward(appearances, morphologies, 
-        ...                                  centroids, adj_matrices)
+        >>> # Training (returns probabilities, which TrackingLoss requires)
+        >>> probs = model.training_forward(appearances, morphologies,
+        ...                                centroids, adj_matrices)
         >>> 
         >>> # Inference
         >>> probs = model.inference_forward(current_emb, current_cent,
@@ -213,7 +213,7 @@ class GNNTrackingModel(nn.Module):
         )
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
-                        return_logits=True):
+                        return_logits=False):
         """Forward pass for training.
         
         Args:
@@ -221,7 +221,10 @@ class GNNTrackingModel(nn.Module):
             morphologies: (batch, track_length, max_cells, 3)
             centroids: (batch, track_length, max_cells, 2)
             adj_matrices: (batch, track_length, max_cells, max_cells)
-            return_logits: If True, return logits; if False, return probabilities
+            return_logits: If True, return logits; if False (the default), return
+                probabilities. The default is probabilities because `TrackingLoss` takes
+                the logarithm of its input and so requires them; passing logits to it
+                yields NaN.
         
         Returns:
             Tensor of shape (batch, track_length-1, max_cells, max_cells, n_classes)
