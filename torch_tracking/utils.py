@@ -284,9 +284,13 @@ def is_valid_lineage(y, lineage):
 
     is_valid = True
 
+    # Integer keys are the in-memory convention; a lineage decoded from JSON arrives with
+    # string keys. Normalize once here so every lookup below, including parent and
+    # daughter references, resolves against the same key type.
+    lineage = {int(k): v for k, v in lineage.items()}
+
     # every lineage should have valid fields
     for cell_label, cell_lineage in lineage.items():
-        cell_label = int(cell_label)
         # Get last frame of parent
         if cell_label not in all_cells:
             warnings.warn('Cell {} not found in the label image.'.format(
@@ -309,7 +313,7 @@ def is_valid_lineage(y, lineage):
         last_parent_frame = cell_lineage['frames'][-1]
 
         for daughter in cell_lineage['daughters']:
-            daughter=str(daughter)
+            daughter = int(daughter)
             if daughter not in lineage:
                 warnings.warn('Lineage {} has daughter {} not in lineage'.format(
                     cell_label, daughter))
@@ -335,7 +339,7 @@ def is_valid_lineage(y, lineage):
         # TODO: test parent in lineage
         parent = cell_lineage.get('parent')
         if parent:
-            parent = str(parent)
+            parent = int(parent)
             try:
                 parent_lineage = lineage[parent]
             except KeyError:
@@ -381,6 +385,11 @@ def relabel_sequential_lineage(y, lineage):
     
     y_relabel, fw, _ = relabel_sequential(y)
 
+    # Accept either key spelling: a lineage decoded from JSON is keyed by strings, one
+    # produced by this package by integers. The output is always integer-keyed, so the
+    # function can be applied to its own result.
+    lineage = {int(k): v for k, v in lineage.items()}
+
     new_lineage = {}
 
     cell_ids = np.unique(y)
@@ -396,7 +405,6 @@ def relabel_sequential_lineage(y, lineage):
         # Fix label
         # TODO: label == track ID?
         new_lineage[new_cell_id]['label'] = new_cell_id
-        cell_id = str(cell_id)
         # Fix parent
         parent = lineage[cell_id]['parent']
         new_parent = int(fw[parent]) if parent is not None else parent
@@ -414,7 +422,7 @@ def relabel_sequential_lineage(y, lineage):
                 new_lineage[new_cell_id]['daughters'].append(new_daughter)
                 
         # Fix frames
-        y_true = np.any(y == np.int64(cell_id), axis=(1, 2))
+        y_true = np.any(y == cell_id, axis=(1, 2))
         y_index = np.nonzero(y_true)[0]
 
         new_lineage[new_cell_id]['frames'] = y_index.tolist()

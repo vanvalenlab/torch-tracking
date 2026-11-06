@@ -52,7 +52,7 @@ nothing about whether the model is any good; that is the L3 layer's job, and L3 
 both gated assets. L2 is a change-detector, not a benchmark. A green L2 run is not
 evidence that the model still works.
 
-Its ground-truth lineage is keyed by **str** label, matching the `.trk` format and what
-`is_valid_lineage` expects. `CellTracker.get_lineage_dict()` returns **int** keys
-instead; that mismatch is recorded as divergence 1 in the campaign's divergence register
-and belongs to the `lineage-output` capability.
+Its ground-truth lineage is keyed by **str** label, as it would be after a round trip
+through a `.trk` JSON document. Inside the package keys are integers
+(`CellTracker.get_lineage_dict()` returns them), and the lineage functions accept either
+spelling; see the `cell-tracking` spec.

@@ -1663,3 +1663,161 @@ def test_resizing_the_same_cell_twice_is_bit_identical():
     second = get_image_features(X.copy(), y.copy())["appearances"]
 
     assert first.tobytes() == second.tobytes()
+
+
+# ======================================================================================
+# cell-tracking: lineage keys (specify-cell-tracking)
+#
+# Integers are the in-memory convention; strings appear only inside a JSON document.
+# Both lineage functions accept either spelling. Divergence 1.
+# ======================================================================================
+
+
+def _dividing_masks_and_lineage():
+    """Cell 1 runs frames 0-1, then divides into 2 and 3 in frames 2-3 (integer keys)."""
+    y = np.zeros((4, 64, 64, 1), dtype="int32")
+    for f in (0, 1):
+        _rect(y, f, 1, 4, 4)
+    for f in (2, 3):
+        _rect(y, f, 2, 4, 4)
+        _rect(y, f, 3, 4, 30)
+    lineage = {
+        1: {"label": 1, "frames": [0, 1], "daughters": [2, 3], "parent": None,
+            "frame_div": 1, "capped": True},
+        2: {"label": 2, "frames": [2, 3], "daughters": [], "parent": 1,
+            "frame_div": None, "capped": False},
+        3: {"label": 3, "frames": [2, 3], "daughters": [], "parent": 1,
+            "frame_div": None, "capped": False},
+    }
+    return y, lineage
+
+
+def _as_json_keys(lineage):
+    """The spelling a lineage has after a round trip through a JSON document."""
+    return json.loads(json.dumps(lineage))
+
+
+@pytest.mark.parametrize("spelling", ["int", "str"])
+def test_validation_accepts_either_key_spelling(spelling):
+    """Requirement: Lineage keys are integers (validation resolves parents and daughters).
+
+    Divergence 1: parent and daughter lookups were made as strings, so an integer-keyed
+    lineage - which is what the tracker exports - was reported invalid in every cell.
+    """
+    from torch_tracking.utils import is_valid_lineage
+
+    y, lineage = _dividing_masks_and_lineage()
+    if spelling == "str":
+        lineage = _as_json_keys(lineage)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert is_valid_lineage(y[..., 0], lineage) is True
+
+
+def test_validation_still_rejects_a_dangling_daughter():
+    """Normalizing keys must not make validation permissive."""
+    from torch_tracking.utils import is_valid_lineage
+
+    y, lineage = _dividing_masks_and_lineage()
+    lineage[1]["daughters"] = [2, 99]
+
+    with pytest.warns(UserWarning, match="daughter 99"):
+        assert is_valid_lineage(y[..., 0], lineage) is False
+
+
+@pytest.mark.parametrize("spelling", ["int", "str"])
+def test_relabelling_accepts_either_key_spelling(spelling):
+    """Requirement: Labels are relabelled sequentially per movie (either input spelling)."""
+    from torch_tracking.utils import relabel_sequential_lineage
+
+    y, lineage = _dividing_masks_and_lineage()
+    expected = relabel_sequential_lineage(y, _as_json_keys(lineage))[1]
+    given = lineage if spelling == "int" else _as_json_keys(lineage)
+
+    _, new_lineage = relabel_sequential_lineage(y, given)
+
+    assert new_lineage == expected
+    assert all(isinstance(k, int) for k in new_lineage)
+
+
+def test_relabelling_its_own_output_is_a_no_op():
+    """Requirement: Labels are relabelled sequentially per movie (idempotent in key type).
+
+    Divergence 1: the function read string keys and wrote integers, so feeding it its own
+    output raised KeyError.
+    """
+    from torch_tracking.utils import relabel_sequential_lineage
+
+    y, lineage = _dividing_masks_and_lineage()
+    y1, once = relabel_sequential_lineage(y, _as_json_keys(lineage))
+
+    y2, twice = relabel_sequential_lineage(y1, once)
+
+    assert twice == once
+    assert np.array_equal(y2, y1)
+
+
+# ======================================================================================
+# cell-tracking: threshold bounds (specify-cell-tracking)
+#
+# Birth and death are costs in the per-frame assignment, and a divided track's linking cost
+# is pinned at 1.0. These tests need no checkpoint: construction refuses before one is read.
+# ======================================================================================
+
+
+@pytest.mark.parametrize("name", ["birth", "death"])
+@pytest.mark.parametrize("value", [1.0, 1.5, float("inf"), float("nan")])
+def test_birth_and_death_at_or_above_the_maximum_cost_are_rejected(name, value):
+    """Requirement: Assignment prices continuation, birth and death together."""
+    from torch_tracking.tracker import CellTracker
+
+    with pytest.raises(ValueError, match=rf"`{name}` must be below 1\.0"):
+        CellTracker(checkpoint_dir="not-read-because-validation-comes-first", **{name: value})
+
+
+@pytest.mark.parametrize("name", ["death", "birth", "division", "track_length"])
+def test_documented_defaults_match_the_signature(name):
+    """Requirement: Threshold defaults are documented as implemented.
+
+    Divergence 2: the docstring advertised birth=0.99 and division=0.05 while the
+    signature said 0.999 and 0.5 - a factor of ten on the division threshold.
+    """
+    import inspect
+    import re
+
+    from torch_tracking.tracker import CellTracker
+
+    doc = inspect.getdoc(CellTracker)
+    # one documented argument runs from "name (" to the next blank line
+    block = re.search(rf"^[ ]+{name} \(.*?(?:\n\n|\Z)", doc, re.S | re.M)
+    assert block, f"`{name}` is not documented in the class docstring"
+    documented = re.search(r"Default is ([0-9.]+)", block.group(0))
+    assert documented, f"`{name}` documents no default"
+
+    implemented = inspect.signature(CellTracker.__init__).parameters[name].default
+    assert float(documented.group(1).rstrip(".")) == pytest.approx(implemented)
+
+
+def test_training_targets_order_the_classes_different_same_daughter():
+    """Requirement: The model scores each track against each cell in three classes.
+
+    Divergence 36: the documentation named the first two classes in the opposite order.
+    The order is fixed here, by the targets the model is trained on: 0 different, 1 same
+    cell, 2 daughter. Cell 1 lives in frames 0-1 and divides into cells 2 and 3.
+    """
+    from torch_tracking.preprocess import get_temporal_adjacency
+
+    lineage = {
+        1: {"label": 1, "frames": [0, 1], "daughters": [2, 3], "parent": None},
+        2: {"label": 2, "frames": [2, 3], "daughters": [], "parent": 1},
+        3: {"label": 3, "frames": [2, 3], "daughters": [], "parent": 1},
+    }
+
+    adj = get_temporal_adjacency(lineage, max_frames=4, max_cells=3)
+
+    assert adj[0, 0, 0] == 1, "a cell alive in this frame is 'same' as itself: class 1"
+    assert adj[0, 0, 1] == 0, "two unrelated cells are 'different': class 0"
+    assert adj[1, 0, 1] == 2 and adj[1, 0, 2] == 2, (
+        "at the parent's last frame, each daughter is class 2"
+    )

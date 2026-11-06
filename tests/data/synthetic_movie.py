@@ -51,10 +51,10 @@ class SyntheticMovie:
     Attributes:
         X: ``(T, H, W, 1)`` float32 image.
         y: ``(T, H, W, 1)`` int32 label mask; 0 is background.
-        lineage: ground-truth lineage keyed by **str** label, matching the ``.trk``
-            format and what ``is_valid_lineage`` expects. Note that
-            ``CellTracker.get_lineage_dict()`` returns **int** keys instead - that
-            mismatch is recorded as divergence 1 and belongs to ``lineage-output``.
+        lineage: ground-truth lineage keyed by **str** label, as it would be after a
+            round trip through a ``.trk`` JSON document. Inside the package keys are
+            integers (``CellTracker.get_lineage_dict()`` returns them), and the lineage
+            functions accept either spelling - see the ``cell-tracking`` spec.
     """
 
     X: np.ndarray

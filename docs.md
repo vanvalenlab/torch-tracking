@@ -6,7 +6,7 @@
 
 ### 1.1 Module overview
 
-The `CellTracker` module is the object where all the steps of cell tracking happens. `CellTracker` takes in a time-lapse movie of nuclei to track and their corresponding labeled masks. Features about each object (appearance, morphology, centroid) are extracted: appearance is a 32x32 crop of each nucleus; morphology contains eccentricity, area, and perimeter information; and centroid specifies where in the field of view the cell is located. These features are used to build the embeddings of each cell (a high-dimensional representation of the cells, taking into account their morphology, location, and appearance) using the `CellTracker.get_embeddings()` method. For each frame of the time-lapse, `CellTracker.inference_forward()` will analyze a 7-frame history of the movie and the curent frame. It then returns a prediction of whether a cell and a track are the same, different, or have a mother/daughter cell relationship. The model then assigns tracks to cells using the Hungarian algorithm, which assigns one cell to one track to minimize cost.
+The `CellTracker` module is the object where all the steps of cell tracking happens. `CellTracker` takes in a time-lapse movie of nuclei to track and their corresponding labeled masks. Features about each object (appearance, morphology, centroid) are extracted: appearance is a 32x32 crop of each nucleus; morphology contains eccentricity, area, and perimeter information; and centroid specifies where in the field of view the cell is located. These features are used to build the embeddings of each cell (a high-dimensional representation of the cells, taking into account their morphology, location, and appearance) using the `CellTracker.get_embeddings()` method. For each frame of the time-lapse, `CellTracker.inference_forward()` will analyze the previous `track_length` frames of each track (8 by default) together with the current frame. It then returns a prediction of whether a cell and a track are different, the same, or have a mother/daughter cell relationship, in that order. The model then assigns tracks to cells using the Hungarian algorithm, which assigns one cell to one track to minimize cost.
 
 After tracking the full time-lapse movie, the `CellTracker` object contains the tracked masks (`CellTracker.y_tracked()`), the original movie (`CellTracker.X`), and the original untracked masks (`CellTracker.y`). In addition, the cell lineage information can be returned in the form of a dictionary with the `CellTracker.get_lineage_dict()` method.
 
@@ -23,7 +23,7 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
   - `death`: diagonal cost used in the death sub-matrix of the LAP — higher values make track termination less likely
   - `birth`: diagonal cost used in the birth sub-matrix of the LAP — higher values make new track creation less likely
   - `division`: minimum class-2 (daughter) probability required for a new track to be labelled a division rather than a fresh birth
-  - `track_length`: number of historical frames fed to the `InferenceBranch` LSTM — shorter histories are zero-padded
+  - `track_length`: number of preceding frames of each track fed to the `InferenceBranch` LSTM — a younger track is padded by repeating its most recent frame. The default of 8 is the window the processed training data is built for, so change the two together
   - `mpp`: microns-per-pixel of the input data; the data is rescaled by `mpp / model_mpp` (`model_mpp` is 0.55), so each pixel spans the resolution the model was trained on. A movie coarser than the model is enlarged
 
 - **Raises**: `ValueError` for rank != 4, mismatched spatial shapes
@@ -121,14 +121,14 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 - For each active track, collects the most recent `track_length` frames of the specified feature (embedding or centroid) from `self.tracks`
 - Pads with the last known value if fewer than `track_length` frames are available (e.g. for newly-created tracks)
-- Returns a dict mapping a sequential index (not track ID) to a `(track_length, feature_dim)` array
+- Returns a dict mapping each track's number to a `(track_length, feature_dim)` array. A track with no frame before `before_frame` is absent; the remaining keys still name their own tracks, so a key is never a position in the iteration
 
 ##### `_update_tracks(assignments, frame, predictions)`
 
 - Iterates over the LAP solution row by row:
-  - If `track_idx` maps to an existing track → appends frame, label, embedding, centroid to that track's history and updates `self.y`
-  - If `track_idx` is out of range of existing tracks → a birth occurred; calls `_create_new_track()` and then `_get_parent()` to test for division
-- After processing all assignments, iterates over tracks with daughters and calls the division-correction logic to cap parent tracks and reroute any incorrect post-division assignments into new daughter tracks
+  - Each assignment pairs a cost-matrix row with a cell. Rows below the number of scored tracks are existing tracks, resolved to a track number through `predictions['track_ids']`: the cell's frame, label, embedding and centroid are appended to that track's history
+  - Later rows are birth rows → a birth occurred; calls `_create_new_track()`, which assigns the next track number, and then `_get_parent()` to test for division
+- After processing all assignments, iterates over tracks with daughters and calls the division-correction logic to cap parent tracks and reroute any incorrect post-division assignments into new daughter tracks. A parent may have two or more daughters (multipolar mitosis occurs in the data). If rerouting would remove a track's only frame, it raises rather than leave an empty track
 
 ##### `_get_parent(frame, cell_id, predictions)`
 

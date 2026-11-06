@@ -31,22 +31,26 @@ class CellTracker:
             Default is 89 pixels (`utils.DISTANCE_THRESHOLD`)
 
             
-        death (float, optional): The threshold probability for a 
-            linkage to be considered a "death"
+        death (float, optional): The cost of ending a track instead of continuing it.
+            Continuing a track into a cell costs 1 - P(same cell), so a track ends when
+            no cell is cheaper than this. Higher values make ends rarer.
+            Must be below 1.0, the cost of continuing a track that has already divided.
             Default is 0.999
 
+        birth (float, optional): The cost of starting a new track instead of continuing
+            one, on the same scale as `death`. Higher values make births rarer.
+            Must be below 1.0.
+            Default is 0.999
 
-        birth (float, optional): The threshold probability for a 
-            linkage to be considered a new cell, or "birth"
-            Default is 0.99
+        division (float, optional): The minimum daughter probability (the model's class 2)
+            at which a newly appeared cell is attributed to a dividing parent.
+            Default is 0.5
 
-        division (float, optional): The threshold probability for a 
-            linkage to be considered a mitosis
-            Default is 0.05
-
-        track_length (int, optional): The frames of the movie used to 
-            make an educated guess on the next frame
-            Default is 8.
+        track_length (int, optional): The number of frames of each track's history shown
+            to the model, taken from the frames before the one being tracked. A younger
+            track is padded by repeating its most recent frame.
+            Default is 8, the window the training data is built for; change the two
+            together.
 
         mpp (float, optional): The microns per pixel of the movie, 
             used to resize the input image to
@@ -67,6 +71,17 @@ class CellTracker:
         mpp = 0.55,
         verbose=True,
     ):
+        
+        # Birth and death are costs in an assignment problem where continuing a track
+        # that has already divided costs 1.0. At or above that, ending or restarting is
+        # no cheaper than continuing a divided track, and the preference for ending it
+        # that the division logic relies on disappears.
+        for name, value in (('birth', birth), ('death', death)):
+            if not value < 1.0:
+                raise ValueError(
+                    f'`{name}` must be below 1.0, the cost of continuing a track that '
+                    f'has already divided. Got {value}.'
+                )
         
         # Store model and config
         if device is None:
@@ -356,8 +371,14 @@ class CellTracker:
             frame_features[cell_id] = self._get_feature(frame, cell_id, feature_name)
         return frame_features
     
-    def _create_new_track(self, frame: int, old_label: int):
-        track_id = len(self.tracks)
+    def _create_new_track(self, frame: int, old_label: int) -> int:
+        """Start a track from one cell and return its track number.
+
+        This is the only place track numbers are assigned: the next number is one more
+        than the highest in use, so numbers run 0, 1, 2, ... and are never reused.
+        Callers take the number from the return value rather than deriving it again.
+        """
+        track_id = max(self.tracks) + 1 if self.tracks else 0
         new_label = track_id + 1
 
         embedding = self._get_feature(frame, old_label, feature_name='embedding')
@@ -378,6 +399,7 @@ class CellTracker:
         }
 
         self.relabel_map.setdefault(frame, {})[old_label] = new_label
+        return track_id
 
     def _initialize_tracks(self):
         """Initialize tracks from first frame."""
@@ -399,7 +421,10 @@ class CellTracker:
             feature_name: Which feature to fetch
         
         Returns:
-            Dictionary mapping track_idx -> feature array of shape (track_length, feature_dim)
+            Dictionary mapping track number -> feature array of shape
+            (track_length, feature_dim). Keys are track numbers, never positions in this
+            iteration: a track with no frame before `before_frame` is simply absent, and
+            every other key still names the track whose history it holds.
         """
         self._validate_feature_name(feature_name)
         
@@ -415,7 +440,7 @@ class CellTracker:
         
         # Fetch features with padding if needed
         tracked_features = {}
-        for i, (n, valid_frames) in enumerate(tracks_with_frames):
+        for n, valid_frames in tracks_with_frames:
             frame_dict = {frame: j for j, frame in enumerate(valid_frames)}
             frames = valid_frames[-self.track_length:]
             
@@ -426,7 +451,7 @@ class CellTracker:
             
             # Get feature data
             fetched = self.tracks[n][feature_name][[frame_dict[f] for f in frames]]
-            tracked_features[i] = fetched
+            tracked_features[n] = fetched
         return tracked_features
     
     def _build_cost_matrix(self, assignment_matrix: np.ndarray) -> np.ndarray:
@@ -485,8 +510,6 @@ class CellTracker:
             predictions_dict: Dict with predictions and track IDs
         """
         # Prepare inputs for inference branch
-        relevant_tracks = []
-        
         # Get embeddings for tracked cells (history)
         current_embeddings = self._fetch_tracked_features(
             before_frame=frame, feature_name='embedding'
@@ -499,13 +522,13 @@ class CellTracker:
         future_embeddings = self._get_frame_features(frame, 'embedding')
         future_centroids = self._get_frame_features(frame, 'centroid')
         
-        # Track which tracks we're considering
-        for track_id in current_embeddings:
-            relevant_tracks.append(track_id)
+        # The tracks being scored, in cost-matrix row order. Row r is track
+        # relevant_tracks[r]; this list is the only mapping from rows to track numbers.
+        relevant_tracks = list(current_embeddings)
         
-        # Convert to arrays
-        current_emb_arr = np.stack([v for k,v in current_embeddings.items()], axis=1)
-        current_cent_arr = np.stack([v for k,v in current_centroids.items()], axis=1)
+        # Convert to arrays, rows in that same order
+        current_emb_arr = np.stack([current_embeddings[n] for n in relevant_tracks], axis=1)
+        current_cent_arr = np.stack([current_centroids[n] for n in relevant_tracks], axis=1)
         future_emb_arr = np.stack([v for k,v in future_embeddings.items()], axis=0)
         future_cent_arr = np.stack([v for k,v in future_centroids.items()], axis=0)
         
@@ -534,14 +557,14 @@ class CellTracker:
         # Extract probabilities: (1, 1, N, M, 3) -> (N, M, 3)
         predictions = predictions[0, 0].cpu().numpy()
         
-        # Build assignment matrix from "different cell" probabilities (class 1)
-        # Cost = 1 - P(same cell)
+        # Classes are ordered (different, same, daughter) = (0, 1, 2), fixed by the training
+        # targets. Linking cost = 1 - P(same cell), so it comes from class 1.
         assignment_matrix = 1 - predictions[..., 1]
         
         # Set high cost for capped tracks (already divided)
-        for i, track_id in enumerate(relevant_tracks):
+        for row, track_id in enumerate(relevant_tracks):
             if self.tracks[track_id]['capped']:
-                assignment_matrix[i, :] = 1.0
+                assignment_matrix[row, :] = 1.0
         
         # Store predictions for division detection
         self.a_matrix.append(predictions)
@@ -561,7 +584,9 @@ class CellTracker:
         """Update tracks based on LAP solution.
         
         Args:
-            assignments: (K, 2) array of (track_idx, cell_idx) assignments
+            assignments: (K, 2) array of (row, cell_idx) assignments, where row indexes
+                the cost matrix. Rows below len(predictions['track_ids']) are existing
+                tracks, resolved through that list; later rows are birth rows.
             frame: Current frame
             predictions: Dict with prediction probabilities and track IDs
         """
@@ -569,8 +594,10 @@ class CellTracker:
         
         self.assignments.append(assignments)
         
+        track_ids = predictions['track_ids']
+        
         # Process each assignment
-        for track_idx, cell_idx in assignments:
+        for row, cell_idx in assignments:
             # Map cell index to cell ID
             try:
                 cell_id = cells_in_frame[cell_idx]
@@ -584,8 +611,9 @@ class CellTracker:
             cell_embedding = np.expand_dims(cell_embedding, axis=0)
             cell_centroid = np.expand_dims(cell_centroid, axis=0)
             
-            if track_idx in self.tracks:
-                # Add to existing track
+            if row < len(track_ids):
+                # Add to existing track; the row is a position, so resolve the number
+                track_idx = track_ids[row]
                 self.tracks[track_idx]['frames'].append(frame)
                 self.tracks[track_idx]['frame_labels'].append(cell_id)
                 self.tracks[track_idx]['embedding'] = np.concatenate([
@@ -603,9 +631,7 @@ class CellTracker:
             
             else:
                 # Create new track (birth)
-                self._create_new_track(frame, cell_id)   # already relabels y_original now
-                new_track_id = max(self.tracks)
-                
+                new_track_id = self._create_new_track(frame, cell_id)
                 
                 # Check for parent (division detection)
                 parent = self._get_parent(frame, cell_id, predictions)
@@ -632,11 +658,20 @@ class CellTracker:
             except ValueError:
                 continue
             
+            # A track must always keep at least one frame: its history, its cost-matrix
+            # row and its lineage entry are all derived from its frames. Refuse before
+            # changing anything rather than leave an empty track that still has a number.
+            if len(self.tracks[track_id]['frames']) == 1:
+                raise RuntimeError(
+                    f"Division handling would remove the only frame ({frame}) of track "
+                    f"{track_id} (label {self.tracks[track_id]['label']}), leaving it "
+                    f"empty. A track must keep at least one frame."
+                )
+            
             # Create new track for this cell
-            new_track_id = len(self.tracks)
             old_label = self.tracks[track_id]['frame_labels'][-1]
             
-            self._create_new_track(frame, old_label)
+            new_track_id = self._create_new_track(frame, old_label)
             self.tracks[new_track_id]['parent'] = track_id
             
             # Remove from old track
@@ -685,7 +720,8 @@ class CellTracker:
         track_ids = predictions['track_ids']
         preds = predictions['predictions']
         
-        for track_idx, track_id in enumerate(track_ids):
+        # `row` is a position in the prediction array; `track_id` is the track's number.
+        for row, track_id in enumerate(track_ids):
             # Skip capped tracks
             if self.tracks[track_id]['capped']:
                 continue
@@ -699,7 +735,7 @@ class CellTracker:
                         continue
                     
                     # Check daughter probability (class 2)
-                    prob = preds[track_idx, cell_idx, 2]
+                    prob = preds[row, cell_idx, 2]
                     
                     if prob > max_prob:
                         parent_id = track_id

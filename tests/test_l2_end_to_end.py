@@ -11,10 +11,11 @@ anything the model learned; a green run here is not evidence that the model stil
 Accuracy belongs to L3.
 
 The golden values themselves - frozen `y_tracked` arrays and lineage dictionaries - are
-deliberately not asserted here. They arrive with `characterize-cell-tracking` and
-`characterize-lineage-output`, next to the requirements that explain what they mean.
-What is asserted here is the two properties those goldens depend on: that the pipeline
-is deterministic, and that its decisions are not near ties.
+deliberately not asserted here, because untrained weights make them a change-detector
+rather than a measurement. What is asserted is the two properties a golden depends on:
+that the pipeline is deterministic, and that its decisions are not near ties. The
+`cell-tracking` requirements (track identity, lineage export, thresholds) are asserted
+below, each next to the requirement it verifies.
 """
 
 import numpy as np
@@ -553,3 +554,288 @@ def test_ingestion_is_deterministic(untrained_checkpoint, synthetic_movie):
         ("adjacency", "appearances", "morphologies", "centroids"), results[0], results[1]
     ):
         assert np.array_equal(first, second), f"{name} differed between identical runs"
+
+
+# --------------------------------------------------------------------------------------
+# cell-tracking: lineage export (specify-cell-tracking)
+# --------------------------------------------------------------------------------------
+
+
+def test_exported_lineage_has_integer_keys_matching_its_labels(tracked_synthetic):
+    """Requirement: Lineage keys are integers."""
+    lineage = tracked_synthetic.get_lineage_dict()
+
+    assert lineage, "the synthetic movie must yield at least one track"
+    assert all(isinstance(k, int) for k in lineage)
+    assert all(entry["label"] == key for key, entry in lineage.items())
+
+
+def test_an_exported_lineage_validates_against_its_own_masks(tracked_synthetic):
+    """Requirement: Lineage keys are integers (validation resolves every reference).
+
+    Divergence 1: validation resolved parents and daughters as strings, so a lineage in
+    the exact shape `get_lineage_dict` returns was reported invalid in every cell.
+    """
+    import warnings
+
+    from torch_tracking.utils import is_valid_lineage
+
+    lineage = tracked_synthetic.get_lineage_dict()
+    y_tracked = tracked_synthetic.y_tracked.squeeze()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert is_valid_lineage(y_tracked, lineage) is True
+
+
+# --------------------------------------------------------------------------------------
+# cell-tracking: track identity (specify-cell-tracking) - divergences 8 and 35
+#
+# These build a tracker's state by hand, because the states they probe are ones a real run
+# is not expected to reach. Embeddings are filled with a track-specific constant so a test
+# can tell *which* track's history it was handed.
+# --------------------------------------------------------------------------------------
+
+EMBED_DIM = 64  # the encoder width CellTracker hardcodes
+
+
+def _tracker_at_frame_3(untrained_checkpoint, synthetic_movie):
+    """A preprocessed tracker, no tracking yet, plus the labels present in frame 3."""
+    from torch_tracking.tracker import CellTracker
+
+    tracker = CellTracker(
+        checkpoint_dir=str(untrained_checkpoint),
+        device="cpu",
+        verbose=False,
+        **BASELINE_INFERENCE_PARAMS,
+    )
+    tracker.preprocess_movie(
+        movie=synthetic_movie.X.copy(), annotation=synthetic_movie.y.copy()
+    )
+    present = sorted(lbl for (f, lbl) in tracker.id_to_idx if f == 3)
+    return tracker, present
+
+
+def _track_record(number, frames, frame_labels, daughters=(), capped=False, parent=None):
+    """A track record whose embedding rows all equal `10 + number`."""
+    n = len(frames)
+    return {
+        "label": number + 1,
+        "frames": list(frames),
+        "frame_labels": list(frame_labels),
+        "daughters": list(daughters),
+        "capped": capped,
+        "frame_div": None,
+        "parent": parent,
+        "embedding": np.full((n, EMBED_DIM), 10.0 + number, dtype=np.float32),
+        "centroid": np.full((n, 2), float(number), dtype=np.float32),
+    }
+
+
+def test_track_numbers_run_from_zero_without_gaps(tracked_synthetic):
+    """Requirement: Track numbers are assigned by one rule and are gapless.
+
+    The fixture holds one division, so this covers births (frame 0) and divisions both.
+    """
+    tracks = tracked_synthetic.tracks
+
+    assert sorted(tracks) == list(range(len(tracks)))
+    assert all(track["label"] == number + 1 for number, track in tracks.items())
+
+
+def test_a_new_track_takes_the_next_number(untrained_checkpoint, synthetic_movie):
+    """Requirement: Track numbers are assigned by one rule and are gapless."""
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        n: _track_record(n, [2], [present[0]]) for n in range(3)
+    }
+
+    new_number = tracker._create_new_track(3, present[0])
+
+    assert new_number == 3
+    assert tracker.tracks[3]["label"] == 4
+    assert sorted(tracker.tracks) == [0, 1, 2, 3]
+
+
+def test_history_keys_are_track_numbers_not_positions(untrained_checkpoint, synthetic_movie):
+    """Requirement: Track history is addressed by track number, never by position.
+
+    Divergence 35: with one track excluded from the fetch, every later track was keyed
+    one position too low, so key 1 held track 2's history.
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        0: _track_record(0, [2], [present[0]]),
+        1: _track_record(1, [3], [present[1]]),   # born in frame 3: no frame *before* 3
+        2: _track_record(2, [2], [present[2]]),
+    }
+
+    fetched = tracker._fetch_tracked_features(before_frame=3, feature_name="embedding")
+
+    assert list(fetched) == [0, 2], "the excluded track must be absent, not renumbered"
+    for number, history in fetched.items():
+        assert history.shape == (tracker.track_length, EMBED_DIM)
+        assert (history == 10.0 + number).all(), (
+            f"key {number} holds the history of a different track"
+        )
+
+
+def test_assignment_rows_are_resolved_through_the_track_list(
+    untrained_checkpoint, synthetic_movie
+):
+    """Requirement: Track history is addressed by track number, never by position.
+
+    Row 1 of the cost matrix is track 2 here, because track 1 was excluded. Reading the
+    row as a track number would extend track 1 instead.
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        0: _track_record(0, [2], [present[0]]),
+        1: _track_record(1, [3], [present[1]]),
+        2: _track_record(2, [2], [present[2]]),
+    }
+    predictions = {"predictions": None, "track_ids": [0, 2]}
+
+    # cells_in_frame is sorted by label, so cell index 2 is present[2]
+    tracker._update_tracks(np.array([[1, 2]]), frame=3, predictions=predictions)
+
+    assert tracker.tracks[2]["frames"] == [2, 3], "row 1 is track 2, so track 2 continues"
+    assert tracker.tracks[1]["frames"] == [3], "track 1 must be untouched"
+
+
+def test_a_birth_row_is_never_mistaken_for_an_existing_track(
+    untrained_checkpoint, synthetic_movie
+):
+    """Requirement: Track numbers are assigned by one rule and are gapless.
+
+    With only two tracks scored, rows 0-1 are tracks and row 2 is a birth row - even
+    though 2 is the number of an existing track.
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        0: _track_record(0, [2], [present[0]]),
+        1: _track_record(1, [3], [present[1]]),
+        2: _track_record(2, [2], [present[2]]),
+    }
+    predictions = {
+        "predictions": np.zeros((2, len(present), 3), dtype=np.float32),
+        "track_ids": [0, 2],
+    }
+
+    tracker._update_tracks(np.array([[2, 3]]), frame=3, predictions=predictions)
+
+    assert tracker.tracks[2]["frames"] == [2], "track 2 must not gain a frame"
+    assert sorted(tracker.tracks) == [0, 1, 2, 3], "the birth row must create track 3"
+    assert tracker.tracks[3]["frames"] == [3]
+
+
+def test_division_handling_refuses_to_empty_a_track(untrained_checkpoint, synthetic_movie):
+    """Requirement: A track always holds at least one frame.
+
+    Division handling used to delete a track's only frame silently, leaving a track that
+    still had a number but no history.
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        0: _track_record(0, [3], [present[0]], daughters=[1]),
+        1: _track_record(1, [3], [present[1]], parent=0),
+    }
+    predictions = {"predictions": None, "track_ids": []}
+
+    with pytest.raises(RuntimeError, match=r"track 0\b"):
+        tracker._update_tracks(
+            np.zeros((0, 2), dtype=int), frame=3, predictions=predictions
+        )
+
+    assert sorted(tracker.tracks) == [0, 1], "nothing may be created before refusing"
+    assert tracker.tracks[0]["frames"] == [3], "the frame must not have been removed"
+
+
+def test_division_handling_keeps_a_track_that_still_has_a_frame(
+    untrained_checkpoint, synthetic_movie
+):
+    """Requirement: A track always holds at least one frame."""
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {
+        0: _track_record(0, [2, 3], [present[0], present[1]], daughters=[1]),
+        1: _track_record(1, [3], [present[2]], parent=0),
+    }
+    predictions = {"predictions": None, "track_ids": []}
+
+    tracker._update_tracks(np.zeros((0, 2), dtype=int), frame=3, predictions=predictions)
+
+    assert tracker.tracks[0]["frames"] == [2], "the parent keeps the frame before the split"
+    assert tracker.tracks[0]["capped"] is True
+    assert 2 in tracker.tracks[0]["daughters"], "the surrendered cell became a daughter"
+
+
+def test_thresholds_just_below_the_maximum_cost_are_accepted(untrained_checkpoint):
+    """Requirement: Assignment prices continuation, birth and death together.
+
+    The boundary is strict, so 1.0 is rejected (an L0 test) and the largest value below it
+    is not. The documented defaults must also construct.
+    """
+    from torch_tracking.tracker import CellTracker
+
+    CellTracker(checkpoint_dir=str(untrained_checkpoint), device="cpu", verbose=False)
+    CellTracker(
+        checkpoint_dir=str(untrained_checkpoint),
+        device="cpu",
+        verbose=False,
+        birth=np.nextafter(1.0, 0.0),
+        death=np.nextafter(1.0, 0.0),
+    )
+
+
+def _fixed_probabilities(n_tracks, n_cells, different, same, daughter):
+    """Model output of shape (1, 1, N, M, 3) with the same probabilities everywhere."""
+    import torch
+
+    p = torch.tensor([different, same, daughter], dtype=torch.float32)
+    return p.expand(1, 1, n_tracks, n_cells, 3).clone()
+
+
+def test_linking_cost_comes_from_the_same_cell_probability(
+    untrained_checkpoint, synthetic_movie
+):
+    """Requirement: Linking cost falls as the probability of being the same cell rises.
+
+    Class 1 is 'same cell' (see the training-target ordering test), so a 0.2 there must
+    give a cost of 0.8 - not 0.3 (from class 0) nor 0.9 (from class 2).
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {n: _track_record(n, [2], [present[n]]) for n in range(2)}
+    n_cells = len(present)
+    tracker.tracking_model.inference_forward = lambda *a, **k: _fixed_probabilities(
+        2, n_cells, different=0.7, same=0.2, daughter=0.1
+    )
+
+    tracker._get_cost_matrix(frame=3)
+
+    linking = tracker.c_matrix[-1][:2, :n_cells]
+    assert linking == pytest.approx(0.8)
+
+
+def test_division_is_judged_by_the_daughter_probability(
+    untrained_checkpoint, synthetic_movie
+):
+    """Requirement: A newly appeared cell may be attributed to a dividing parent.
+
+    Class 2 is 'daughter'. A cell that looks like a confident continuation (class 1 high)
+    but not a daughter must get no parent, and the reverse must get one.
+    """
+    tracker, present = _tracker_at_frame_3(untrained_checkpoint, synthetic_movie)
+    tracker.tracks = {0: _track_record(0, [2], [present[0]])}
+    n_cells = len(present)
+    new_cell = present[1]
+
+    def parent_given(**probs):
+        predictions = {
+            "predictions": _fixed_probabilities(1, n_cells, **probs)[0, 0].numpy(),
+            "track_ids": [0],
+        }
+        return tracker._get_parent(3, new_cell, predictions)
+
+    assert tracker.division == 0.5
+    assert parent_given(different=0.05, same=0.9, daughter=0.05) is None
+    assert parent_given(different=0.05, same=0.05, daughter=0.9) == 0

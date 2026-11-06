@@ -105,7 +105,7 @@ def sweep(
             tracker.track_cells()
 
             y_tracked = tracker.y_tracked
-            lineage = {int(k): v for k, v in tracker.get_lineage_dict().items()}
+            lineage = tracker.get_lineage_dict()  # integer-keyed already
             gt_lineage = {int(k): v for k, v in gt_lineages[batch].items()}
 
             stats = TrackingMetrics(
