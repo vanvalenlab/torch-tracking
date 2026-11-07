@@ -140,3 +140,48 @@ def test_cpu_and_gpu_agree_on_the_corrected_pipeline(
         pd.read_csv(cpu.results_path, index_col=0),
         check_exact=False, rtol=1e-9, atol=1e-9,
     )
+
+
+# ======================================================================================
+# The division attribution instrument (scripts/attribute_divisions.py).
+#
+# The instrument's claim is checked against the metric it explains, on real movies: a
+# division the harness scores correct must be attributed as detectable.
+# ======================================================================================
+
+
+def test_attribution_agrees_with_the_metric_on_real_movies(pinned_weights, dataset_dir):
+    import importlib.util
+    import json
+
+    import zarr
+
+    from tests.conftest import REPO_ROOT
+    from torch_tracking.eval import build_indices
+    from torch_tracking.tracker import CellTracker
+    from torch_tracking.utils import DISTANCE_THRESHOLD, require_mpp
+
+    spec = importlib.util.spec_from_file_location(
+        "attribute_divisions", REPO_ROOT / "scripts" / "attribute_divisions.py")
+    attr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(attr)
+
+    split = dataset_dir / "val.zarr"
+    if not split.exists():
+        pytest.skip("val split not found")
+    z = zarr.open(str(split))
+    mpps = require_mpp(z, str(split))
+    lineages = json.load(open(dataset_dir / "val.json"))
+    ends = build_indices(z["y"][:])
+
+    movie = 0   # one movie keeps this affordable on CPU; the script checks every movie
+    end = int(ends[movie])
+    tracker = CellTracker(checkpoint_dir=pinned_weights, device="cpu", mpp=float(mpps[movie]),
+                          division=0.5, birth=0.999, death=0.999, track_length=8,
+                          distance_threshold=DISTANCE_THRESHOLD, verbose=False)
+    records, stats = attr.attribute_movie(tracker, z["X"][movie, :end], z["y"][movie, :end],
+                                          lineages[movie])
+    correct, n_detectable = attr.check_instrument_agrees_with_metric(records, stats)
+    assert correct <= n_detectable
+    if correct == len(records):
+        assert n_detectable == len(records)

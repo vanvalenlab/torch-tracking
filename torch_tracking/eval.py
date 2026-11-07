@@ -35,6 +35,7 @@ __all__ = [
 #: an authoritative record rather than a rendering.
 COUNT_COLUMNS = (
     'correct_division',
+    'mismatch_division',
     'false_positive_division',
     'false_negative_division',
     'aa_tp',
@@ -69,11 +70,15 @@ def pooled_metrics(df):
     totals = {column: float(df[column].sum()) for column in COUNT_COLUMNS}
 
     correct = totals['correct_division']
+    mismatch = totals['mismatch_division']
     false_positive = totals['false_positive_division']
     false_negative = totals['false_negative_division']
 
-    predicted = correct + false_positive
-    actual = correct + false_negative
+    # A mismatched division (right parent, wrong daughter set) is both a missed
+    # true division and a reported division that matches no true one, so it
+    # enters both denominators.
+    predicted = correct + false_positive + mismatch
+    actual = correct + false_negative + mismatch
 
     precision = correct / predicted if predicted else float('nan')
     recall = correct / actual if actual else float('nan')
@@ -242,8 +247,10 @@ def evaluate(
 
     df = pd.DataFrame(rows)
 
-    df['division_precision'] = df['correct_division'] / (df['correct_division'] + df['false_positive_division'])
-    df['division_recall'] = df['correct_division'] / (df['correct_division'] + df['false_negative_division'])
+    df['division_precision'] = df['correct_division'] / (
+        df['correct_division'] + df['false_positive_division'] + df['mismatch_division'])
+    df['division_recall'] = df['correct_division'] / (
+        df['correct_division'] + df['false_negative_division'] + df['mismatch_division'])
     df['division_f1'] = (2 * df['division_recall'] * df['division_precision']) / (df['division_precision'] + df['division_recall'])
 
     df['aa_accuracy'] = df['aa_tp'] / df['aa_total']

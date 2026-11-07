@@ -236,9 +236,17 @@ To continue an interrupted run, call `trainer.load_checkpoint(path)` and then `t
 
 `--stopping-metric` names the validation metric that picks the best epoch, drives early stopping and drives the plateau scheduler. The default is `loss`, which is minimized. Every other metric (`accuracy` and the `precision_class_*`, `recall_class_*` and `f1_class_*` keys) is maximized, and the direction is applied consistently to all three. An unrecognized name is rejected when the trainer is built, with the list of valid names.
 
-Validation loss is **not** a good ranking of epochs by the metrics this project is judged on. Across 297 epochs in seven past runs, the rank correlation between validation loss and validation F1 for the mitosis class is about -0.40: lower loss does tend toward higher F1, but weakly, and the epoch picked by lowest loss scored below the best available in six of seven runs. Keeping every epoch (the default) is what lets a better rule be tested against the real evaluation. The rule itself is not changed here; `correct-checkpoint-selection` will replace it.
+Validation loss is only a weak ranking of epochs by validation daughter-class F1 (rank correlation about -0.40 across 297 epochs in seven past runs), but that is **not evidence of accuracy left on the table**. Traced over the 444 ground-truth divisions of the `val` split, a *perfect* daughter-class head would raise pooled division F1 by about 0.006, against a sampling standard error of about 0.012. Which epoch is kept barely moves the metric this project is judged on, so the default stays validation loss. Every epoch is kept by default, so that claim can be retested against the real evaluation.
 
-Three further limits are known and left for that change. Runs are **not reproducible**, because no random stream is seeded. A recorded loss is **one third of the per-entry cross-entropy**, because the loss averages over the three classes as well as the graded entries; correcting that would change what training minimizes, so it is done together with the retrain. And training runs under mixed precision while validation does not, so a run's training and validation losses come from different numeric paths and should not be compared digit for digit. Recorded validation losses are pooled by the number of entries each batch graded, so they also differ slightly from those recorded before this was changed.
+**Reproducing a run.** Pass `--seed N` and the same configuration gives the same recorded metrics on CPU (GPU kernels can still differ in the last bits). With no `--seed`, a seed is drawn and written to `config.json`, so the run can be repeated afterwards:
+
+```bash
+torch-tracking-train --data-dir ~/.deepcell/tracking --seed 1234
+```
+
+**What a recorded loss means.** The loss is the weighted cross-entropy per graded entry. Every loss recorded before `correct-checkpoint-selection` is **one third of the per-entry cross-entropy**, because it was also averaged over the three classes: multiply an earlier loss by 3 to compare it with a later one. Earlier validation losses were also computed at full precision while training ran in reduced precision; validation now runs at the same precision as training, so the two losses of an epoch come from one numeric path. Neither change moves the epoch a run selects.
+
+**Gradient norm.** Each epoch's training history records `grad_norm` (mean gradient norm before clipping), `grad_norm_max`, and `clip_engaged` (whether any batch reached `--clipnorm`), so whether clipping ever mattered is answered by the run itself.
 
 ### Training Settings
 
@@ -275,6 +283,7 @@ Every field of `TrainingConfig`. Each is recorded in `config.json`.
 | `decay` (`--decay`) | `0.99` | learning-rate multiplier per epoch under the 'exp' scheduler |
 | `weight_decay` (`--weight-decay`) | `0.0` | weight decay passed to the optimizer |
 | `max_checkpoints` (`--max-checkpoints`) | `None` | keep only the most recent N per-epoch checkpoints; default keeps every epoch |
+| `seed` (`--seed`) | `None` | seed for every random stream the run draws on; a seed is drawn and recorded when none is given, so the run can still be repeated |
 
 Three further values are fixed by the entry point rather than configured: `distance_threshold` (89, `utils.DISTANCE_THRESHOLD`), `track_length` (8) and `stride` (1) are dataloader arguments. `distance_threshold` and `track_length` must match the values used at inference.
 
@@ -331,7 +340,12 @@ result.per_movie              # one row per movie
 
 Reported metrics include:
 
-- **Division precision / recall / F1** — how accurately the tracker detects mitotic events
+- **Division precision / recall / F1** — how often a true division is reproduced exactly: the
+  same parent *and* the same daughter set. A division whose parent is found but whose daughters
+  are wrong or incomplete (a "mismatch") counts against both recall and precision, as a missed
+  division and as a false positive. Earlier versions of this package dropped mismatches from the
+  score entirely, which flattered division F1 (on the recorded test split, 0.9619 instead of
+  0.9239) without any change to the tracker
 - **`aa_accuracy`** — association accuracy (fraction of cells correctly linked frame-to-frame)
 - **`te_accuracy`** — target effectiveness, after Hayashida et al. 2020: the fraction of each
   ground-truth track's cells captured by the single result track that best covers it. Despite

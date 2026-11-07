@@ -126,8 +126,10 @@ def sweep(
 
     df = pd.DataFrame(rows)
 
-    df['division_precision'] = df['correct_division'] / (df['correct_division'] + df['false_positive_division'])
-    df['division_recall'] = df['correct_division'] / (df['correct_division'] + df['false_negative_division'])
+    df['division_precision'] = df['correct_division'] / (
+        df['correct_division'] + df['false_positive_division'] + df['mismatch_division'])
+    df['division_recall'] = df['correct_division'] / (
+        df['correct_division'] + df['false_negative_division'] + df['mismatch_division'])
     df['division_f1'] = (2 * df['division_recall'] * df['division_precision']) / (df['division_precision'] + df['division_recall'])
 
     df['aa_accuracy'] = df['aa_tp'] / df['aa_total']

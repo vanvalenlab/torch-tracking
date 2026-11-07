@@ -788,8 +788,7 @@ class MetricsTracker:
     def update(self, loss, predictions, targets):
         """
         Args:
-            loss: scalar loss for the batch, averaged over its graded entries (and over the
-                class axis; see divergence 53 for what that does to its scale)
+            loss: scalar loss for the batch, averaged over its graded entries
             predictions: (B, T, N, M, 3) class probabilities
             targets: (B, T, N, M) integer class labels, -1 marking an ungraded entry
         """

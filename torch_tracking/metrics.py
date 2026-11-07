@@ -201,6 +201,20 @@ def map_node(gt_node, G_res, cells_gt, cells_res):
 def classify_divisions(G_gt, G_res, cells_gt=[], cells_res=[], verbose=True):
     """Compare two graphs and calculate the cell division confusion matrix.
 
+    Every ground-truth division lands in exactly one of three outcomes, and a
+    result division that matches no ground-truth division is a fourth count:
+
+    - ``correct_division``: the matched result division has the same parent and
+      the same daughter set.
+    - ``mismatch_division``: a result division is matched, but its parent or
+      daughter set differs (e.g. only one of two daughters was found).
+    - ``false_negative_division``: no matched result division exists (missed).
+    - ``false_positive_division``: a result division matching no ground truth.
+
+    So ``correct + mismatch + false_negative == total_divisions``. A mismatch
+    is scored as both a miss and a false positive; see
+    ``calculate_summary_stats``.
+
     WARNING: This function will only work if the labels underlying both
     graphs are the same. E.G. the parents only match if the same label
     splits in the same frame - but each movie isn't guaranteed to be labeled
@@ -532,6 +546,7 @@ def calculate_target_effectiveness(lineage_gt, lineage_res, cells_gt=[], cells_r
 
 
 def calculate_summary_stats(correct_division,
+                            mismatch_division,
                             false_positive_division,
                             false_negative_division,
                             total_divisions,
@@ -543,8 +558,21 @@ def calculate_summary_stats(correct_division,
 
     Catch ZeroDivisionError and set to 0 instead
 
+    There are four division outcomes (see ``classify_divisions``): correct,
+    mismatched, missed (false negative) and false positive. A mismatched
+    division, where the parent was found but the daughter set or parent is
+    wrong, counts on both sides: the true division was not reproduced (a miss)
+    and a division that matches no true division was reported (a false
+    positive). So::
+
+        recall    = correct / (correct + false_negative + mismatch)
+        precision = correct / (correct + false_positive + mismatch)
+
     Args:
         correct_division (int): True positive or "correct divisions"
+        mismatch_division (int): Divisions with a matched parent node but the
+            wrong parent or daughter set. Required, not defaulted, so that it
+            cannot be silently dropped again.
         false_positive_division (int): False positives
         false_negative_division (int): False negatives
         total_divisions (int): Total number of ground truth divisions
@@ -558,12 +586,14 @@ def calculate_summary_stats(correct_division,
     _round = functools.partial(round, ndigits=n_digits)
 
     try:
-        recall = correct_division / (correct_division + false_negative_division)
+        recall = correct_division / (correct_division + false_negative_division
+                                     + mismatch_division)
     except ZeroDivisionError:
         recall = 0
 
     try:
-        precision = correct_division / (correct_division + false_positive_division)
+        precision = correct_division / (correct_division + false_positive_division
+                                        + mismatch_division)
     except ZeroDivisionError:
         precision = 0
 

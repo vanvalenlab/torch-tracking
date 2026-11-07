@@ -8,7 +8,10 @@ second per test. The real model appears once, for the probabilities-versus-logit
 
 import inspect
 import json
+import math
+import random
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -398,3 +401,120 @@ def test_every_name_the_training_docs_mention_exists():
     for method in ("train_epoch", "validate", "save_checkpoint", "load_checkpoint", "train"):
         assert hasattr(Trainer, method)
         assert method in section
+
+
+# --------------------------------------------------------------------------- gradient norm (group 1)
+
+
+def test_every_epoch_records_a_finite_gradient_norm(tmp_path):
+    trainer = _trainer(tmp_path, max_epochs=3)
+    trainer.train()
+    history = json.loads((trainer.checkpoint_dir / "training_history.json").read_text())["train"]
+    assert len(history) == 3
+    for epoch in history:
+        assert math.isfinite(epoch["grad_norm"]) and epoch["grad_norm"] > 0
+        assert epoch["grad_norm_max"] >= epoch["grad_norm"]
+
+
+def test_the_record_says_whether_the_clip_engaged(tmp_path):
+    tight = _trainer(tmp_path / "a", clipnorm=1e-9, log_and_save=False).train_epoch()
+    loose = _trainer(tmp_path / "b", clipnorm=1e9, log_and_save=False).train_epoch()
+    assert tight["clip_engaged"] is True
+    assert loose["clip_engaged"] is False
+
+
+def test_the_norm_is_measured_even_with_clipping_off(tmp_path):
+    metrics = _trainer(tmp_path, clipnorm=0, log_and_save=False).train_epoch()
+    assert math.isfinite(metrics["grad_norm"]) and metrics["grad_norm"] > 0
+    assert metrics["clip_engaged"] is False
+
+
+# --------------------------------------------------------------------------- validation precision (71)
+
+
+def test_validation_runs_in_the_precision_training_uses(tmp_path):
+    seen = {}
+    trainer = _trainer(tmp_path, data_precision="bfloat16", log_and_save=False)
+    original = trainer.model.training_forward
+
+    def spy(*args, **kwargs):
+        seen.setdefault("calls", []).append(torch.is_autocast_enabled("cpu"))
+        return original(*args, **kwargs)
+
+    trainer.model.training_forward = spy
+    trainer.train_epoch()
+    trainer.validate()
+    training_calls, validation_calls = seen["calls"][:3], seen["calls"][3:]
+    assert all(training_calls) and validation_calls and all(validation_calls)
+
+
+def test_full_precision_validation_stays_full_precision(tmp_path):
+    seen = []
+    trainer = _trainer(tmp_path, data_precision="float32", log_and_save=False)
+    original = trainer.model.training_forward
+    trainer.model.training_forward = lambda *a, **k: (seen.append(torch.is_autocast_enabled("cpu")),
+                                                      original(*a, **k))[1]
+    trainer.validate()
+    assert seen and not any(seen)
+
+
+# --------------------------------------------------------------------------- seeding (42)
+
+
+def _shuffled_run(tmp_path, seed):
+    """A run whose outcome depends on the shuffle order and the initial weights."""
+    training.seed_everything(seed)       # as run_training does, before the model is built
+    batches = _batches(6)
+    samples = [{k: v[i] for k, v in batch.items()} for batch in batches for i in range(B)]
+    loader = torch.utils.data.DataLoader(samples, batch_size=2, shuffle=True)
+    trainer = Trainer(TinyModel(), loader, _batches(2), _config(tmp_path, seed=seed, max_epochs=3))
+    trainer.train()
+    return trainer
+
+
+def test_the_same_seed_gives_the_same_run(tmp_path):
+    first = _shuffled_run(tmp_path / "a", seed=7)
+    second = _shuffled_run(tmp_path / "b", seed=7)
+    assert first.train_history == second.train_history
+    assert first.val_history == second.val_history
+
+
+def test_a_different_seed_gives_a_different_run(tmp_path):
+    first = _shuffled_run(tmp_path / "a", seed=7)
+    other = _shuffled_run(tmp_path / "b", seed=8)
+    assert first.train_history != other.train_history
+
+
+def test_the_seed_reaches_the_written_config(tmp_path):
+    trainer = _trainer(tmp_path, seed=123)
+    record = json.loads((trainer.checkpoint_dir / "config.json").read_text())
+    assert record["seed"] == 123
+
+
+def test_a_run_without_a_seed_draws_and_records_one(tmp_path):
+    trainer = _trainer(tmp_path)
+    assert isinstance(trainer.config.seed, int)
+    record = json.loads((trainer.checkpoint_dir / "config.json").read_text())
+    assert record["seed"] == trainer.config.seed
+
+
+def test_seed_everything_covers_every_stream():
+    def draw():
+        return (random.random(), float(np.random.rand()), float(torch.rand(1)))
+    training.seed_everything(5)
+    first = draw()
+    training.seed_everything(5)
+    assert draw() == first
+
+
+# --------------------------------------------------------------------------- selection (54)
+
+
+def test_a_run_without_a_selection_metric_selects_on_loss_and_keeps_every_epoch(tmp_path):
+    config = TrainingConfig(device="cpu", num_workers=0)
+    assert config.stopping_metric == "loss"
+    assert config.max_checkpoints is None
+    trainer = _trainer(tmp_path, max_epochs=4)
+    trainer.train()
+    assert trainer.stopping_metric == "loss"
+    assert len(list(trainer.checkpoint_dir.glob("checkpoint_epoch_*.pt"))) == 4

@@ -209,6 +209,12 @@ Document the internal schema of a single entry in `self.tracks`:
 - **Parameters**: `df` — any frame carrying the columns in `eval.COUNT_COLUMNS`
 - **Logic**: sums each metric's numerator and denominator across movies and divides once.
   A movie whose own ratio is undefined still contributes its counts
+- **Division scoring**: a mismatched division (right parent, wrong or incomplete daughter
+  set) counts as both a missed division and a false positive, so
+  recall = correct / (correct + missed + mismatched) and
+  precision = correct / (correct + false positive + mismatched). `mismatch_division` is
+  therefore one of `COUNT_COLUMNS`. On the recorded test split this gives division F1 0.9239;
+  the previous rule, which dropped mismatches, gave 0.9619 for the same counts
 - **Note**: this is deliberately *not* the mean of per-movie ratios. On the recorded test
   split, pooling gives association accuracy 0.9728 where averaging gives 0.9715
 
@@ -386,6 +392,7 @@ Two settings that look alike are separate: `gamma` is the focal-loss focusing pa
 - builds the optimizer and scheduler from it with `create_optimizer` and `create_scheduler`;
 - builds `TrackingLoss`, passing `class_weights` only to the loss modes that apply them (`wcce`, `focal_wcce`); for `focal` it prints a note that the recorded weights have no effect;
 - moves the model and loss to `config.device`;
+- draws a seed if the configuration has none, records it as `config.seed`, and seeds the framework, NumPy and Python's random streams from it (`run_training` does the same before building the model, so the initial weights are covered too);
 - sets up mixed precision for that device's type. `bfloat16` and `float16` autocast with a `GradScaler`; `float32` disables autocasting and the scaler entirely;
 - resolves the direction of improvement once from `stopping_metric` (`loss` minimizes, every other metric maximizes) and gives it to best-epoch selection, `EarlyStopping` and the plateau scheduler;
 - when `log_and_save` is on, creates `<checkpoint_dir>/<timestamp>/` and `<log_dir>/<timestamp>/`, writes `config.json` and opens a `SummaryWriter`. When it is off none of that happens.
@@ -394,13 +401,13 @@ Two settings that look alike are separate: `gamma` is the focal-loss focusing pa
 
 - Sets the model to `train()` and walks the training loader.
 - Per batch: forward under autocast (the model returns **probabilities**, which `TrackingLoss` requires), loss, then a finite-loss check. A batch whose loss is NaN or infinite is skipped with a message naming the batch, **before** any gradient scaling, so the scaler is never left half-updated.
-- For a finite loss: scaled `backward()`, unscale, gradient clipping (`clipnorm`, 0 disables), scaler and optimizer step, scaler update, metrics update.
-- Returns the metrics dict from `MetricsTracker.get_metrics()` and resets the tracker.
+- For a finite loss: scaled `backward()`, unscale, gradient clipping (`clipnorm`, 0 disables), scaler and optimizer step, scaler update, metrics update. The gradient norm is measured before clipping on every batch, whether or not clipping is on.
+- Returns the metrics dict from `MetricsTracker.get_metrics()` and resets the tracker. Three further keys describe the gradients of that epoch: `grad_norm` (mean pre-clip norm over the batches that took a step), `grad_norm_max` (the largest) and `clip_engaged` (`True` if any batch's norm exceeded `clipnorm`). A batch whose norm is not finite is left out of the two figures.
 
 #### `validate()`
 
 - `@torch.no_grad()`, model in `eval()`. Same shape as `train_epoch()` without a backward pass.
-- **Runs without autocast**, so validation is full precision while training is mixed precision. This is a recorded divergence, not intended behavior; see section 3.6.
+- **Runs under the same autocasting as `train_epoch()`**, so an epoch's training and validation losses are computed at the same precision (`bfloat16` by default; `float32` turns both off).
 - A batch with a NaN loss is skipped.
 
 #### `save_checkpoint(is_best=False)`
@@ -453,15 +460,15 @@ Each `checkpoint_epoch_NNNN.pt`, and `best_model.pt`, is a dictionary:
 | `best_epoch` | Epoch index of that best value, or `None` before any epoch has improved |
 | `train_history`, `val_history` | Lists of per-epoch metric dicts up to and including this epoch |
 
-The metrics in each dict are `loss`, `accuracy`, and `precision_class_{0,1,2}`, `recall_class_{0,1,2}`, `f1_class_{0,1,2}`, for class order `[different, same, mitosis]`. `loss` is each batch's loss as `TrackingLoss` returns it, pooled across batches with each weighted by how many entries it graded (padding is not graded). The batch loss itself is a third of the per-entry cross-entropy; see section 3.6.
+The metrics in each dict are `loss`, `accuracy`, and `precision_class_{0,1,2}`, `recall_class_{0,1,2}`, `f1_class_{0,1,2}`, for class order `[different, same, mitosis]`. `loss` is each batch's loss as `TrackingLoss` returns it, pooled across batches with each weighted by how many entries it graded (padding is not graded). The batch loss itself is the weighted cross-entropy per graded entry; see section 3.6 for how it compares with earlier runs. The training metrics dict also carries `grad_norm`, `grad_norm_max` and `clip_engaged` (section 3.3).
 
 ---
 
 ### 3.6 Known limits
 
-- **Selection by validation loss is weak.** Over 297 epochs in seven runs the rank correlation between validation loss and mitosis-class F1 is about -0.40, and the loss-selected epoch trailed the best epoch in six of seven. The default rule is unchanged here; `correct-checkpoint-selection` replaces it, using the per-epoch checkpoints this change makes available. (Divergence 54.)
-- **Runs are not reproducible.** No random stream is seeded. (Divergence 42, also for `correct-checkpoint-selection`.)
-- **A recorded loss is a third of the per-entry cross-entropy.** `TrackingLoss` averages over the class axis as well as the graded entries. The same value is what training minimizes, so correcting the scale also rescales the gradients that clipping acts on; it is left for `correct-checkpoint-selection`, which retrains. Tests pin the current value and gradients. (Divergence 53.)
-- **Recorded validation losses are pooled by graded entries**, not by batch size, so they differ slightly from those recorded before this was changed. Their scale is the same.
-- **Validation does not run under autocast**, so a run's training and validation losses come from different numeric paths. (Divergence 71.)
+- **Selection by validation loss is not where the accuracy is.** Validation loss ranks epochs only weakly against validation daughter-class F1 (rank correlation about -0.40 over 297 epochs in seven runs), but that F1 is a per-edge classification, not the metric this project is judged on. Traced over the 444 ground-truth divisions of the `val` split at the baseline checkpoint, a *perfect* daughter-class head would raise pooled division F1 by about **+0.006**, against a sampling standard error of about **0.012** on that split: half a standard error. The gap between validation loss and validation daughter-class F1 is therefore not evidence of recoverable accuracy. The default rule (minimize validation loss) is unchanged, and every epoch is still retained so the finding can be retested. (Divergence 54, closed by measurement in `correct-checkpoint-selection`.)
+- **Division detection is reachable only through a birth.** About 30.6% of true daughter edges on the `val` split are never offered to it, although the model had already given those edges a median daughter probability of about 0.99. This is the larger lever (a ceiling of about +0.018 on `val`, an upper bound and not a forecast) and belongs to `cell-tracking`; see section 1 and the divergence register.
+- **Reproducibility.** A run is seeded from `--seed` (or a seed it draws and records in `config.json`). The same seed and configuration give the same recorded metrics on CPU; GPU kernels may still differ in the last bits. Runs recorded before `correct-checkpoint-selection` carry no seed and cannot be reproduced.
+- **Comparing losses with earlier runs.** Every loss recorded before `correct-checkpoint-selection` is one third of the per-entry cross-entropy (it was also averaged over the three classes). To compare an earlier loss with a later one, multiply it by 3. Earlier validation losses were also computed at full precision while training ran in reduced precision, so they are not directly comparable even after rescaling. The epoch an earlier run selected is unaffected by the rescale.
+- **Recorded validation losses are pooled by graded entries**, not by batch size, so they differ slightly from those recorded before that was changed.
 - **CPU training is not a supported mode.** The device type follows `--device`, so a CPU run works in tests, but only CPU *inference* is a project guarantee.

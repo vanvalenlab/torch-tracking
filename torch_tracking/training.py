@@ -9,6 +9,8 @@ import argparse
 import dataclasses
 import datetime
 import json
+import math
+import random
 import re
 import shutil
 import time
@@ -17,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -41,6 +44,25 @@ from torch_tracking.utils import (
 PRECISIONS = ('bfloat16', 'float16', 'float32')
 
 _CHECKPOINT_PATTERN = re.compile(r'checkpoint_epoch_(\d+)\.pt$')
+
+
+def seed_everything(seed):
+    """Seed the framework, the numerical library and Python's own stream from one value.
+
+    Dataloader workers need no separate call: PyTorch derives each worker's seed from the
+    framework seed in force when the loader's iterator is created, and the framework's
+    stream is what this seeds. (It also seeds every visible GPU.)
+    """
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+
+
+def resolve_seed(seed):
+    """The seed a run uses: the one given, or a fresh draw so the run can still be repeated."""
+    if seed is not None:
+        return seed
+    return random.SystemRandom().randrange(2 ** 31)
 
 
 def _setting(default, help, **extra):
@@ -97,6 +119,9 @@ class TrainingConfig:
     weight_decay: float = _setting(0.0, 'weight decay passed to the optimizer')
     max_checkpoints: Optional[int] = _setting(
         None, 'keep only the most recent N per-epoch checkpoints; default keeps every epoch')
+    seed: Optional[int] = _setting(
+        None, 'seed for every random stream the run draws on; a seed is drawn and recorded '
+              'when none is given, so the run can still be repeated')
 
     def to_dict(self):
         """Every field, so the written record cannot omit a setting that acts on the run."""
@@ -139,6 +164,13 @@ class Trainer:
         config: TrainingConfig
     ):
         validate_config(config)
+
+        # A run with no seed still gets one, written to config.json below, so it can be
+        # repeated afterwards. Seeding here (after the model was built by the caller) covers
+        # the shuffle, dropout and augmentation streams; `run_training` seeds earlier still,
+        # so that the model's initial weights are covered too.
+        config.seed = resolve_seed(config.seed)
+        seed_everything(config.seed)
 
         self.config = config
         self.model = model
@@ -225,6 +257,10 @@ class Trainer:
         """Train for one epoch."""
         self.model.train()
 
+        # The norm of the gradient before clipping, one figure per batch that took a step.
+        grad_norms = []
+        clip_engaged = False
+
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch} [Train]', dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(pbar):
@@ -265,12 +301,20 @@ class Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer) # Unscales the gradients in-place
 
-            # Gradient clipping
-            if self.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.gradient_clip
-                )
+            # Gradient clipping. The norm is measured whether or not clipping is on (an
+            # infinite threshold measures and changes nothing), so a run's record says
+            # whether the clip ever engaged.
+            threshold = self.gradient_clip if self.gradient_clip > 0 else float('inf')
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                threshold
+            ).item()
+            # A non-finite norm means the scaler is about to skip this step; it says
+            # nothing about the size of a real gradient, so it is left out of the record.
+            if math.isfinite(grad_norm):
+                grad_norms.append(grad_norm)
+                if grad_norm > threshold:
+                    clip_engaged = True
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -293,15 +337,18 @@ class Trainer:
 
         self.metrics_tracker.reset()
 
+        metrics['grad_norm'] = sum(grad_norms) / len(grad_norms) if grad_norms else float('nan')
+        metrics['grad_norm_max'] = max(grad_norms) if grad_norms else float('nan')
+        metrics['clip_engaged'] = clip_engaged
+
         return metrics
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         """Validate on validation set.
 
-        Validation does not run under autocast, so its forward pass is full precision while
-        training's is not. That is divergence 71 in `openspec/DIVERGENCES.md`; it is left
-        as it is here because aligning it changes recorded validation losses.
+        Runs under the same autocasting as `train_epoch`, so the two losses recorded for an
+        epoch are computed at the same precision.
         """
         self.model.eval()
 
@@ -316,14 +363,13 @@ class Trainer:
             adj_matrices = batch['adj_matrices'].to(self.device)
             labels = batch['labels'].to(self.device)
 
-            # Forward pass
-            predictions = self.model.training_forward(
-                appearances, morphologies, centroids, adj_matrices,
-                return_logits=False
-            )
-
-            # Compute loss
-            loss = self.loss_fn(predictions, labels)
+            # Forward pass and loss, at the precision training uses
+            with self.autocast:
+                predictions = self.model.training_forward(
+                    appearances, morphologies, centroids, adj_matrices,
+                    return_logits=False
+                )
+                loss = self.loss_fn(predictions, labels)
 
             if torch.isnan(loss):
                 continue
@@ -540,6 +586,10 @@ def run_training(config):
         raise ValueError("config.data_dir is required: the directory holding "
                          "train_proc.zarr and val_proc.zarr")
     data_dir = Path(config.data_dir).expanduser()
+
+    # Seed before the model is built, so its initial weights are covered as well.
+    config.seed = resolve_seed(config.seed)
+    seed_everything(config.seed)
 
     model = build_model(config)
 

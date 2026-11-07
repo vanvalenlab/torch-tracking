@@ -194,38 +194,47 @@ lower is better. This closes divergence 48.
 - **WHEN** a selection metric is configured that the run does not record
 - **THEN** construction SHALL fail naming the metric and the available ones
 
-### Requirement: Selection by validation loss is a known weakness awaiting replacement
+### Requirement: Checkpoint selection does not determine division accuracy
 
-Validation loss ranks epochs weakly against the metrics this project contracts on. Measured
-over 297 epochs in seven runs, the rank correlation between validation loss and validation
-daughter-class F1 is about -0.40: the correct direction, but weak enough that the selected
-epoch was beaten on daughter F1 in six of seven runs. The rule is NOT corrected here;
-`correct-checkpoint-selection` SHALL replace it. This states divergence 54 unresolved.
+Selection among epochs SHALL NOT be presented as a lever on division accuracy. Validation
+loss SHALL remain the default selection metric, and every epoch SHALL remain retained, so
+the finding can be retested rather than taken on trust. This closes divergence 54.
 
-#### Scenario: The weakness is recorded, not presented as intended
+#### Scenario: The measured ceiling is stated, not the weakness alone
 
 - **WHEN** the selection rule is documented
-- **THEN** it SHALL state that validation loss ranks epochs weakly against the contract metrics
-- **AND** it SHALL name the change that will replace it
+- **THEN** it SHALL state that a perfect daughter-class head would move pooled division F1
+  by about 0.006 on the validation split, against a sampling standard error of about 0.012
+- **AND** it SHALL state that the gap between validation loss and validation daughter-class
+  F1 is therefore not evidence of recoverable accuracy
 
-#### Scenario: The default rule is unchanged by this specification
+#### Scenario: The default is unchanged and the evidence is retained
 
-- **WHEN** a run is launched without a selection metric
-- **THEN** it SHALL select the epoch of lowest validation loss, as before
+- **WHEN** a run is launched without naming a selection metric
+- **THEN** validation loss SHALL be used
+- **AND** every completed epoch's checkpoint SHALL be retained by default
 
-### Requirement: Training runs are not yet reproducible
+### Requirement: Training runs are reproducible from a recorded seed
 
-No random stream in training is currently seeded, so a run cannot be reproduced and two runs
-of the same configuration differ. This is NOT corrected here, because seeding changes
-training behavior and belongs with the run that reports that effect.
-`correct-checkpoint-selection` SHALL introduce seeding. This states divergence 42
-unresolved.
+A run SHALL seed every random stream it draws on — framework, numerical library and
+data-loading worker alike — from a single caller-supplied value, and SHALL record that
+value in the run's configuration. Two runs of the same configuration and seed SHALL
+produce the same sequence of recorded metrics. This closes divergence 42.
 
-#### Scenario: The limit is stated where runs are recorded
+#### Scenario: The same seed gives the same run
 
-- **WHEN** a run's provenance is written
-- **THEN** it SHALL be possible to tell from the record that the run is not reproducible
-- **AND** the change that will introduce seeding SHALL be named
+- **WHEN** two runs are launched with identical configuration and the same seed
+- **THEN** the metrics recorded for each epoch SHALL match between them
+
+#### Scenario: The seed reaches the configuration record
+
+- **WHEN** a run is launched with a seed
+- **THEN** that seed SHALL appear in the configuration record written for the run
+
+#### Scenario: No seed is chosen silently
+
+- **WHEN** a run is launched without a seed
+- **THEN** a seed SHALL be drawn and recorded, so the run remains reproducible afterwards
 
 ### Requirement: Every epoch's checkpoint is retained
 
@@ -310,24 +319,35 @@ weighting it by batch size over-counts a batch that graded little. This closes d
 - **WHEN** a batch contains no graded entries
 - **THEN** it SHALL contribute nothing to the epoch figure
 
-### Requirement: The loss is not yet reported on the per-entry scale
+### Requirement: The loss is reported on the per-entry scale
 
-The loss averages over the three-class axis as well as over the graded entries, so every
-recorded loss is one third of the per-entry weighted cross-entropy. This is NOT corrected
-here: the same value is what training minimizes, so rescaling it rescales the gradients that
-clipping acts on and makes a retrained run incomparable with earlier ones.
-`correct-checkpoint-selection` SHALL correct it. This states divergence 53 unresolved.
+The reported loss SHALL be the weighted cross-entropy averaged over the entries it graded,
+and SHALL NOT also average over the class axis. Because the correction is a constant
+rescale, the epoch a run selects SHALL NOT move. This closes divergence 53.
 
-#### Scenario: The scale is stated where the figures are read
+#### Scenario: The loss equals the per-entry cross-entropy
 
-- **WHEN** a recorded loss is documented
-- **THEN** the documentation SHALL state that it is a third of the per-entry cross-entropy
-- **AND** it SHALL name the change that will correct it
+- **WHEN** a batch is graded
+- **THEN** the returned loss SHALL equal the weighted cross-entropy summed over graded
+  entries and divided by the number of graded entries
 
-#### Scenario: The optimized objective is untouched by this specification
+#### Scenario: The selected epoch does not move
 
-- **WHEN** the loss is computed for a fixed set of predictions and labels
-- **THEN** its value and its gradients SHALL be those of the mean over graded entries and classes
+- **WHEN** a recorded run's epochs are ranked by validation loss before and after the
+  correction
+- **THEN** the ranking SHALL be identical, because the correction is a constant factor
+
+### Requirement: A run records the gradient norm it measured
+
+A run SHALL record, for every epoch, the gradient norm observed before clipping. Whether
+the clip engaged SHALL be answerable from the run's own record rather than inferred from
+the loss scale.
+
+#### Scenario: The norm is recorded whether or not the clip engages
+
+- **WHEN** an epoch completes
+- **THEN** the gradient norm observed during it SHALL appear in the run's history
+- **AND** it SHALL be recorded whether or not any batch reached the clip threshold
 
 ### Requirement: The loss receives probabilities and the model's defaults agree
 
@@ -370,18 +390,17 @@ divergence 57.
 - **THEN** each SHALL depend on the run's predictions
 - **AND** none SHALL be fixed by its initialization
 
-### Requirement: Validation and training losses are not yet on the same numeric path
+### Requirement: Validation and training losses come from one numeric path
 
-Training runs under autocasting while validation does not, so the two losses recorded for an
-epoch come from different numeric paths. This is NOT corrected here: aligning them changes
-recorded validation losses and therefore which epoch a run selects, which this change holds
-fixed. `correct-checkpoint-selection` SHALL resolve it alongside the selection rule.
+Validation SHALL run under the same autocasting as training, so that the two losses
+recorded for an epoch are computed at the same precision. A run SHALL NOT record a
+full-precision validation loss beside a reduced-precision training loss. This closes
+divergence 71.
 
-#### Scenario: The discrepancy is documented where the figures are read
+#### Scenario: Both losses share a precision
 
-- **WHEN** a run's recorded losses are documented
-- **THEN** the documentation SHALL state that training and validation losses come from different numeric paths
-- **AND** it SHALL name the change that will align them
+- **WHEN** a run is configured to train under reduced precision
+- **THEN** its validation pass SHALL run under that same precision
 
 ### Requirement: The documented training interface matches the implementation
 

@@ -43,11 +43,10 @@ class TrackingLoss(nn.Module):
             class order. Applied by `wcce` and `focal_wcce`; `focal` has no use for them
             and raises rather than accepting and discarding them.
 
-    The returned loss is a mean over the graded entries **and** over the class axis, so it
-    is one third of the per-entry weighted cross-entropy. That is divergence 53, left as it
-    is on purpose: this value is what training minimizes, so rescaling it rescales the
-    gradients that gradient clipping acts on. `correct-checkpoint-selection` corrects it
-    together with the retrain that reports the effect.
+    The returned loss is on the per-entry scale: the weighted cross-entropy summed over the
+    classes and averaged over the graded entries. It is not also averaged over the class
+    axis. Losses recorded before this was corrected (divergence 53) are one third of this
+    figure.
     """
 
     def __init__(self, loss='wcce', gamma=2.0, class_weights = None):
@@ -124,4 +123,5 @@ class TrackingLoss(nn.Module):
             modulator = (1.0 - p_t) ** self.gamma                         # (K, 1)
             loss = modulator * ce                                           # (K, C)
 
-        return loss.mean()
+        # Per-entry scale: sum over the class axis, mean over graded entries.
+        return loss.sum(dim=-1).mean()

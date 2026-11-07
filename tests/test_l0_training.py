@@ -387,17 +387,17 @@ def test_trainer_docstring_describes_the_constructor_it_has():
         assert not re.search(rf"^\s+{stale}", doc, re.M), f"docstring still lists {stale}"
 
 
-# --------------------------------------------------------------------------- the loss objective is pinned
+# --------------------------------------------------------------------------- the loss scale
 
 
 def _reference_objective(probs, labels, class_weights):
-    """An independent statement of today's objective: the weighted cross-entropy summed over
-    graded entries and divided by (graded entries x classes). Written without TrackingLoss."""
+    """An independent statement of the objective: the weighted cross-entropy summed over
+    graded entries and divided by the number of graded entries. Written without TrackingLoss."""
     valid = labels >= 0
     p = probs[valid].clamp(1e-7, 1 - 1e-7)                 # (K, 3)
     chosen = p.gather(1, labels[valid].unsqueeze(1))        # probability of the true class
     weights = torch.tensor(class_weights, dtype=p.dtype)[labels[valid]].unsqueeze(1)
-    return (-(chosen.log()) * weights).sum() / (p.shape[0] * 3)
+    return (-(chosen.log()) * weights).sum() / p.shape[0]
 
 
 def _fixed_case():
@@ -407,21 +407,16 @@ def _fixed_case():
     return logits, labels
 
 
-def test_loss_scale_is_a_third_of_the_per_entry_cross_entropy():
-    """Divergence 53, pinned rather than fixed: correcting the scale also rescales what
-    training minimizes, so it is left to the change that retrains. If this fails, the
-    objective has moved - decide that on purpose, in `correct-checkpoint-selection`."""
+def test_loss_is_the_weighted_cross_entropy_per_graded_entry():
+    """Divergence 53: the loss is averaged over graded entries alone, not over classes too."""
     logits, labels = _fixed_case()
     probs = logits.softmax(-1)
     loss = TrackingLoss(loss="wcce", class_weights=[1, 10, 100])(probs, labels)
-    graded = (labels >= 0).sum()
-    per_entry = _reference_objective(probs, labels, [1, 10, 100]) * 3   # sum / K
-    assert loss.item() == pytest.approx((per_entry / 3).item(), rel=1e-5)
-    assert graded.item() > 0
+    assert (labels >= 0).sum().item() > 0
+    assert loss.item() == pytest.approx(_reference_objective(probs, labels, [1, 10, 100]).item(), rel=1e-5)
 
 
-def test_loss_gradients_are_pinned():
-    """The gradients are what clipping acts on, so they are pinned, not just the value."""
+def test_loss_gradients_follow_the_per_entry_scale():
     logits, labels = _fixed_case()
     TrackingLoss(loss="wcce", class_weights=[1, 10, 100])(logits.softmax(-1), labels).backward()
     actual = logits.grad.clone()
@@ -431,10 +426,28 @@ def test_loss_gradients_are_pinned():
     assert torch.allclose(actual, logits.grad, rtol=1e-4, atol=1e-8)
 
 
+def test_a_constant_rescale_leaves_the_epoch_ranking_unchanged():
+    """The correction is a constant factor, so the epoch a run selects cannot move."""
+    recorded = [0.91, 0.62, 0.70, 0.55, 0.58, 0.55001, 0.80]
+    rescaled = [3 * v for v in recorded]
+    rank = lambda losses: sorted(range(len(losses)), key=losses.__getitem__)
+    assert rank(recorded) == rank(rescaled)
+    assert min(range(len(recorded)), key=recorded.__getitem__) == \
+        min(range(len(rescaled)), key=rescaled.__getitem__)
+
+
+def test_the_loss_docstring_states_the_per_entry_scale():
+    doc = " ".join(TrackingLoss.__doc__.split())
+    assert "per-entry scale" in doc
+    assert "one third of this figure" in doc
+    assert "left as it is on purpose" not in doc
+
+
 def test_the_known_loss_caveats_are_stated_where_figures_are_read():
     """What a reader of a recorded loss needs to know, in both places a reader looks."""
     for name in ("README.md", "docs.md"):
-        text = (REPO_ROOT / name).read_text()
-        assert "third of the per-entry cross-entropy" in text.replace("one third", "third"), name
-        assert "correct-checkpoint-selection" in text, name
-        assert "graded" in text and "different numeric paths" in text, name
+        text = REPO_ROOT.joinpath(name).read_text().replace("one third", "third")
+        assert "third of the per-entry" in text, name   # earlier losses were a third of today's
+        assert "multiply" in text, name                  # and how to compare them
+        assert "grad_norm" in text and "clip_engaged" in text, name
+        assert "seed" in text, name
