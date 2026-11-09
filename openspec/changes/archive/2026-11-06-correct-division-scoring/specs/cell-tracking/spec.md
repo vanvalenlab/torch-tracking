@@ -8,7 +8,7 @@ A cell is offered to division detection only when the assignment step has alread
 it begins a new track. A true daughter the assignment step continued onto an existing track
 is therefore never tested for a parent, whatever the model predicted for it. This defect
 SHALL be documented as accepted rather than scheduled for correction: the gain measured for
-the best implementable rule is smaller than the metric's own sampling error, and the
+the best implementable rule is about one sampling standard error, not a clear gain, and the
 assignment step is published and otherwise accurate.
 
 #### Scenario: A continued daughter is never tested
