@@ -344,8 +344,8 @@ Reported metrics include:
   same parent *and* the same daughter set. A division whose parent is found but whose daughters
   are wrong or incomplete (a "mismatch") counts against both recall and precision, as a missed
   division and as a false positive. Earlier versions of this package dropped mismatches from the
-  score entirely, which flattered division F1 (on the recorded test split, 0.9619 instead of
-  0.9239) without any change to the tracker
+  score entirely, which flattered division F1 (on the recorded test split, 0.9588 instead of
+  0.9157) without any change to the tracker
 - **`aa_accuracy`** — association accuracy (fraction of cells correctly linked frame-to-frame)
 - **`te_accuracy`** — target effectiveness, after Hayashida et al. 2020: the fraction of each
   ground-truth track's cells captured by the single result track that best covers it. Despite

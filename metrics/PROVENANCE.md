@@ -7,7 +7,7 @@ the claims rather than take them on faith.
 
 | File | What it holds | Reproducible? |
 | --- | --- | --- |
-| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access and the checkpoint below — regenerated 2026-11-06 by `specify-training-data` |
+| `eval_results.csv` | torch-tracking's own accuracy on the test set | Yes, with dataset access and the checkpoint below — regenerated 2026-11-09 by `correct-model-normalization` |
 | `benchmarks.csv` | The TF Caliban tracking reference numbers | **No. Permanently irreproducible** — see below |
 
 Other CSVs here (`postprocess_sweep.csv`) remain ignored: they are derived, regenerable, and
@@ -32,133 +32,118 @@ Every number in both files measures *tracking only*, on masks supplied as input.
 
 ## `eval_results.csv`
 
-Regenerated 2026-11-06 by `specify-training-data` from a model retrained on data whose
-**temporal-adjacency training targets are built per window from the lineage** under a new
-padding rule. It **replaces** the figures `redesign-feature-extraction` produced the day
-before, which are kept under "Superseded baselines" below so that the movement can be
-explained. The same targets were trained twice, and the first of those runs
-(`20261105-190321`) is kept there too: the two differ in training schedule, and their
-results differ by 0.027 on division F1 (see "What changed in `specify-training-data`").
+Regenerated 2026-11-09 by `correct-model-normalization` from a model **retrained after four
+defects in the model's own arithmetic were corrected** (divergences 34, 60, 80 and 82:
+appearance crops normalized row by row, padding slots pooled into every BatchNorm statistic and
+given a graph self-loop, and the temporal LSTM mixing neighbouring slots). The previous run,
+`20261106-051755`, measured a model that was never the intended one and is kept under
+"Superseded baselines" below with its figures.
 
-> **Read this first: single unseeded run.** These figures come from one training run, with
-> no random seed set anywhere in the package (divergence 42). Differences of a few
-> thousandths between this file and any other are not meaningful.
+> **Read this first: single seeded run.** These figures come from one training run (seed
+> 20261109). The run-to-run spread on division F1 for this project is about 0.027 and the
+> sampling standard error on 178 divisions is about 0.016, so **division F1 cannot separate
+> this run from the previous one or from the reference.** AA and TE are the robust figures.
 
 | Field | Value |
 | --- | --- |
-| Produced by | `checkpoints/20261106-051755/best_model.pt` (local only) |
-| Checkpoint SHA256 | `fea35daa88c86d83ddc02e61721ac720a558c0eca9a2a1c79c75df7a1d92334f` |
+| Produced by | `checkpoints/20261109-080943/best_model.pt` (local only) |
+| Checkpoint SHA256 | `ffdcc88d9a2bcff79affd8386c69f0381da0f72298718c397ba20f6f95232ed9` |
 | Published as | **Not yet published.** Weights go to `vanvalenlab/torch-tracking` only after the owner validates them and uploads manually. The HuggingFace filename and revision are added here by the owner after that upload |
 | Dataset | `DynamicNuclearNet-tracking` v1.0, `test` split (12 movies, up to 71 frames, 584×600). Evaluated from `~/.deepcell/tracking/regen/test.zarr` and `test.json` |
-| Training data | `train` and `val` regenerated 2026-11-05 into `~/.deepcell/tracking/regen/`. The processed zarrs hold four arrays (`appearances`, `morphologies`, `centroids`, `mpp`) plus each movie's corrected lineage. Their four inputs are bit-identical to the previous conversion. The temporal adjacency is **not stored**: it is built per window in the dataloader. An entry is graded only if its row's cell is in frame *t* and its column's cell is in frame *t+1*, else `-1`; births and deaths are graded; a dividing parent's `2` entries are written last so padding cannot erase them |
-| Training configuration | `checkpoints/20261106-051755/config.json` and `run_manifest.json`: RAdam, lr 1e-3, `reduce_on_plateau`, batch size 8, 2 layers, `crop_size=32`, `loss=wcce`, bfloat16, `distance_threshold=89`, 4 data workers, `CUDA_VISIBLE_DEVICES=5` with `device=cuda:0`. **Early stopping ON with `early_stopping_patience=10`**, separate from the scheduler's `patience=5`. The run lasted 33 epochs (about 2.9 h between `config.json` and the final history write), consistent with early stopping ten epochs after its best; the evaluated checkpoint is the best by validation loss, **epoch 23 (1-indexed), val loss 0.0021** (0.0053 at the last epoch) |
-| Loss class weights | `[1, 10, 100]` (different : same : daughter). **Not recorded in `config.json`**, because `TrainingConfig.to_dict()` omits it (divergence 44), so this row is the only record. It is the `TrainingConfig` default; the launcher that wrote `run_manifest.json` is not in this repository, so that no override was passed is assumed from the default, not verified |
-| Schedule | The first run on these targets (`20261105-190321`) used one `patience` value for both early stopping and `ReduceLROnPlateau`, so it stopped at 14 epochs before the learning rate could be reduced. This run splits them (per the manifest's own note) and ran 33. **Whether a learning-rate reduction fired in this run is not captured:** neither `training_history.json` nor `run_manifest.json` records a learning rate. Validation loss is noisy across epochs, and it only weakly tracks daughter-class F1 here (Spearman ρ = −0.34 over the 33 epochs, from `training_history.json`): epoch 16 (1-indexed) scores 0.840 on daughter F1 against 0.807 at the selected epoch. No other epoch's weights were saved, so that cannot be tested (divergences 51 and 54) |
-| Harness | `torch_tracking.eval.evaluate()`, invoked as `python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tracking/regen --distance-threshold 89` |
+| Training data | `train` and `val` as regenerated 2026-11-05 into `~/.deepcell/tracking/regen/`, unchanged by this retrain. Four arrays (`appearances`, `morphologies`, `centroids`, `mpp`) plus each movie's corrected lineage; the temporal adjacency is built per window in the dataloader |
+| Training configuration | `checkpoints/20261109-080943/config.json`, written by `scripts/retrain_correct_model_normalization.py`: the previous run's configuration — RAdam, lr 1e-3, `reduce_on_plateau` with `patience=5`, batch size 8, 2 layers, `crop_size=32`, `loss=wcce`, class weights `[1, 10, 100]`, bfloat16, `distance_threshold=89`, 4 data workers, early stopping with `early_stopping_patience=10`, `CUDA_VISIBLE_DEVICES=5` with `device=cuda:0` — **plus seed 20261109**, which the previous run did not have. Every field of the two `config.json` files matches except the seed and fields added to or removed from `TrainingConfig` since (`class_weights`, `data_dir`, `max_checkpoints`, `seed`, `step_gamma` now recorded; `label_smoothing` gone) |
+| Training run | 29 epochs (early stopping at epoch 28, 0-indexed; about 1 h 41 min between `config.json` and the final history write). The evaluated checkpoint is the best by validation loss: **epoch 19 (1-indexed; `best_epoch` is 18 in the history file, which is 0-indexed), val loss 0.00162** (0.00171 at the last epoch). Daughter-class F1 peaks at a different epoch (1-indexed 28, 0.929 against 0.912 at the selected one), the same weak link between validation loss and the contract metrics recorded in divergence 54 |
+| Loss scale | Validation losses in this run are on the corrected per-entry scale (divergence 53) and are computed under the same autocast as training (divergence 71). **They are not comparable with the previous run's figures in this file**, which predate both corrections; the first epoch's loss, 0.0677 against 0.0220, agrees once the factor of three is applied |
+| Harness | `python -m torch_tracking.eval --checkpoint checkpoints/20261109-080943/best_model.pt --split-dir ~/.deepcell/tracking/regen --distance-threshold 89` |
 | Inference parameters | `division=0.5`, `birth=0.999`, `death=0.999`, `track_length=8`, `distance_threshold=89`. Each movie's own `mpp` is read from the zarr and passed to its tracker |
 | Metric match threshold | `TrackingMetrics(..., threshold=0.8)` |
 | Frames per movie | Every non-empty frame, including each movie's last. The ground-truth lineage is the full `test.json` |
-| Device | Evaluated on CPU (4 threads). Trained on one GPU (physical card 5) |
-| Verified at | Base commit `5961c14` plus the uncommitted `specify-training-data` changes, 2026-11-06. `eval_results.csv` last written 2026-11-06 08:15 (UTC−8); the figures below are pooled from that file, so a later re-evaluation shows up as a mismatch |
+| Device | Evaluated on CPU (16 threads, `nice`). Trained on one GPU (physical card 5) |
+| Verified at | Base commit `3332e06` plus the uncommitted `correct-model-normalization` changes, 2026-11-09. `eval_results.csv` written 2026-11-09 10:01 (UTC−8); the figures below are pooled from that file, so a later re-evaluation shows up as a mismatch |
 | Verification environment | Python 3.14.3, torch 2.11.0+cu128, numpy 2.5.2, pandas 3.0.5, zarr 3.3.0, torch-geometric 2.8.0.post1 |
 
 ### Aggregate figures
 
-Summed across all 12 movies (not an average of per-movie rates). **Single unseeded run.**
+Summed across all 12 movies (not an average of per-movie rates). **Single seeded run.**
 
 | Metric | Value |
 | --- | --- |
-| Division precision | 0.9266 |
-| Division recall | 0.9213 |
-| **Division F1** | **0.9239** |
-| **Association accuracy (AA)** | **0.9929** |
-| **Target effectiveness (TE)** | **0.9940** |
-| Total ground-truth divisions | 178 (164 correct, 7 mismatched, 6 false positive, 7 missed) |
+| Division precision | 0.9157 |
+| Division recall | 0.9157 |
+| **Division F1** | **0.9157** |
+| **Association accuracy (AA)** | **0.9940** |
+| **Target effectiveness (TE)** | **0.9950** |
+| Total ground-truth divisions | 178 (163 correct, 8 mismatched, 7 false positive, 7 missed) |
 
-**Scoring rule.** Division figures in this table are pooled under the **corrected rule**
+**Scoring rule.** Division figures are pooled under the **corrected rule**
 (`correct-division-scoring`): a mismatched division — right parent, wrong daughter set —
 counts as both a missed division and a false positive, so
 recall = correct / (correct + missed + mismatched) and
 precision = correct / (correct + false positive + mismatched). Under the **previous rule**
-mismatched divisions were dropped from the numerator and both denominators, which gave
-division precision 0.9647, recall 0.9591 and **F1 0.9619** for this same run
-(*superseded scoring rule — historical, not the contract metric*).
+(superseded, not the contract metric) these counts would give division F1 0.9588.
 
-**The tracker did not change; only the scoring rule did.** The checkpoint, the lineages
-it produces and every count in `eval_results.csv` are identical. Division F1 moved from
-0.9619 to 0.9239 (−0.0380) because 7 of the 178 divisions (3.9%) were previously counted
-as neither a hit nor a miss. That drop is not a regression.
+AA is 48,273 correct of 48,562 (289 errors) and TE 49,528 of 49,775 (247 errors), both from the
+summed per-movie counts in `eval_results.csv`.
 
-Against the `Caliban - GT` row of `benchmarks.csv` **re-pooled under the same corrected
-rule** (0.9146 / 0.9781 / 0.9787; 166 correct, 4 mismatched, 15 false positive, 8 missed):
-division F1 is higher by 0.0093, AA by 0.0148 and TE by 0.0153. (Under the previous rule
-for both sides the division margin was +0.0267, with the reference at 0.9352.) The AA and TE margins are the robust
-ones, because all three runs recorded here sit within 0.0012 of each other on those two.
-The division margin is **not** distinguishable from run-to-run variation: this project's own
-two runs on these targets differ by 0.027 on division F1, and with 178 divisions one event
-is worth about 0.6 points of recall. The corrected division margin of +0.0093 is smaller still,
-so it is not distinguishable from the reference either.
+### Movement from the previous baseline
 
-**Division figures elsewhere in this file.** Every division F1, precision and recall quoted
-below this section was produced under the **previous scoring rule** unless it is marked
-"corrected". They are retained as labelled history because the comparisons they support were
-made under that rule. Re-pooled under the corrected rule from the recorded counts:
+The previous run (`20261106-051755`) and this one differ by the four corrections above and by
+retraining; the test split, scoring rule and inference parameters are the same. Because they
+interact, **the movement cannot be attributed to any one of them** (the change's Decision 1).
 
-| Configuration | Counts (correct / mismatched / false positive / missed) | Division F1, previous rule | Division F1, **corrected rule** |
-| --- | --- | --- | --- |
-| This file (`20261106-051755`), threshold 89 | 164 / 7 / 6 / 7 | 0.9619 | **0.9239** |
-| Seeded retrain (seed 20261106), threshold 89 | 163 / 4 / 6 / 11 | 0.9504 | **0.9288** |
-| First run on the new targets (`20261105-190321`) | 158 / 8 / 10 / 12 | 0.9349 | **0.8927** |
-| Previous retrain (`redesign-feature-extraction`) | 161 / 7 / 5 / 10 | 0.9555 | **0.9174** |
-| Original published baseline | 155 / 11 / 6 / 12 | 0.9451 | **0.8857** |
-| `correct-scale-convention` retrain | 163 / 6 / 7 / 9 | 0.9532 | **0.9209** |
-| `Caliban - GT` reference | 166 / 4 / 15 / 8 | 0.9352 | **0.9146** |
+| | Division F1 | AA | TE | Counts (correct / mismatched / false positive / missed) |
+| --- | --- | --- | --- | --- |
+| **This run** (`20261109-080943`), threshold 89 | **0.9157** | **0.9940** | **0.9950** | 163 / 8 / 7 / 7 |
+| Previous, as committed (`20261106-051755`, matches a fresh evaluation at threshold **64**) | 0.9239 | 0.9929 | 0.9940 | 164 / 7 / 6 / 7 |
+| Previous, re-evaluated at threshold 89 (like for like) | 0.9266 | 0.9935 | 0.9945 | 164 / 7 / 5 / 7 |
+| `Caliban - GT` reference | 0.9146 | 0.9781 | 0.9787 | 166 / 4 / 15 / 8 |
 
-The ordering between configurations changes: under the corrected rule the seeded retrain
-(0.9288) is above this file's baseline (0.9239) by 0.0049, where under the previous rule it
-was below by 0.0115. Both differences are well inside the sampling standard error of about
-0.016, so neither is a finding; it is recorded because the earlier "does not show an
-improvement" reading was made under the previous rule.
+**Direction and size.** Association accuracy and target effectiveness **rose** by 0.0011 and
+0.0010 against the committed figures (0.0005 each like for like), about 290 and 250 errors
+against about 340 and 300. They are the robust figures: the runs recorded in this file
+sit within about 0.0012 of each other on both. Division F1 **fell** by 0.0082 against the committed
+figure (0.0109 like for like). That is one to two divisions' worth (one division is 0.0056 of
+recall at 178), against a run-to-run spread of about 0.027 and a sampling standard error of
+about 0.016. **It is not distinguishable from no change, and no conclusion should be drawn
+from its sign.** Eight mismatched divisions against seven is the whole of it.
 
-### Division-threshold sweep under the corrected rule (`correct-division-scoring`)
+**Margin against the reference.** This run is above the `Caliban - GT` row on all three
+contract metrics: division F1 by **0.0011** (one event; not distinguishable from parity),
+association accuracy by **0.0160** and target effectiveness by **0.0163**. Reference parity,
+the floor, holds. The AA and TE margins are the ones that carry weight; the division margin
+is smaller than any noise figure above and should be read as "no worse than the reference",
+not "better".
 
-`python -m torch_tracking.eval_sweep` over `division` 0.3–0.8 on the test split, same
-checkpoint (`20261106-051755`), `distance_threshold=89`, `birth=death=0.999`, match threshold
-0.8, run on **GPU** (physical card 5) with output kept in scratch. Counts are summed over the
-12 movies.
+**What was adopted.** The change adopts these figures whatever their direction (decided with
+the user, 2026-11-09): the superseded ones describe a model that was never the intended one.
+The corrected model is, on the robust figures, at least as accurate and on the noisy one
+indistinguishable.
 
-| `division` | correct / mismatched / false positive / missed | Division F1, **corrected rule** | Division F1, previous rule |
-| --- | --- | --- | --- |
-| 0.3 | 164 / 7 / 6 / 7 | 0.9239 | 0.9619 |
-| 0.4 | 164 / 7 / 6 / 7 | 0.9239 | 0.9619 |
-| **0.5** (default) | 164 / 7 / 5 / 7 | 0.9266 | 0.9647 |
-| 0.6 | 164 / 6 / 4 / 8 | **0.9318** | 0.9647 |
-| 0.7 | 163 / 6 / 4 / 9 | 0.9288 | 0.9617 |
-| 0.8 | 163 / 7 / 2 / 8 | 0.9314 | **0.9702** |
+**The earlier figures were not evaluated at the stated threshold.** The superseded
+`eval_results.csv` records 64 even though the "Inference parameters" row beside it said 89;
+the two rows above are the same checkpoint at both thresholds. This run's file was produced
+at 89 as stated, so the first row is the like-for-like one against the third.
 
-**The recommended threshold moves off 0.5.** Under the corrected rule the sweep's maximum
-is `division=0.6` (0.9318); under the previous rule it was 0.8 (0.9702). The corrected-rule
-gain over the default is +0.0052, and 0.6 and 0.8 differ by 0.0004, which is one event.
-Against a sampling standard error of about 0.016 this is **not a finding to act on**, and the
-default is **unchanged**: changing it would change tracking output and carries its own
-evaluation obligation (constraint 2). It is recorded so a later change can decide.
+### Division-threshold sweep (`correct-model-normalization`)
 
-**The committed `eval_results.csv` does not match a fresh evaluation at `distance_threshold=89`.**
-The L3 accuracy tests (`test_l3_accuracy.py`, CPU, same checkpoint, run 2026-11-06 after the
-correction) report:
+`python -m torch_tracking.eval_sweep` over `division` 0.3–0.8 on the test split, this
+checkpoint, `distance_threshold=89`, `birth=death=0.999`, match threshold 0.8, run on **CPU**
+with output kept in scratch. Counts are summed over the 12 movies. Recorded, not used to
+choose a new default.
 
-| `distance_threshold` | Division F1 (corrected rule) | AA | TE |
-| --- | --- | --- | --- |
-| 64 (the tests' "inherited") | **0.9239** | 0.9929 | 0.9940 |
-| 89 (the tests' "retuned") | 0.9266 | 0.9935 | 0.9945 |
+| `division` | correct / mismatched / false positive / missed | Division F1 | AA | TE |
+| --- | --- | --- | --- | --- |
+| 0.3 | 163 / 8 / 8 / 7 | 0.9132 | 0.9936 | 0.9946 |
+| 0.4 | 163 / 8 / 8 / 7 | 0.9132 | 0.9936 | 0.9946 |
+| **0.5** (default) | 163 / 8 / 7 / 7 | **0.9157** | 0.9940 | 0.9950 |
+| 0.6 | 162 / 8 / 6 / 8 | 0.9153 | 0.9944 | 0.9954 |
+| 0.7 | 162 / 8 / 5 / 8 | 0.9178 | 0.9945 | 0.9955 |
+| 0.8 | 162 / 8 / 5 / 8 | 0.9178 | 0.9945 | 0.9955 |
 
-The 64 row reproduces this file's committed counts and aggregate figures exactly; the 89 row
-reproduces the GPU sweep at `division=0.5` above (5 false positives). The "Inference
-parameters" row of this file states 89, so either the committed CSV was written at 64 or
-the stated parameter is wrong. **This is not resolved here.** It predates this change, it
-does not depend on the scoring rule (both rows move together), and the contract figures in
-this file are the committed CSV's, as the reproducibility requirement says. The
-CPU-versus-GPU agreement test passed, so the difference is not a device effect.
+The row at `division=0.5` reproduces the evaluation above exactly. The whole sweep spans 0.0046
+on division F1 — under one event — so the default is **unchanged**. (The previous run's sweep
+preferred 0.6; this one is flat, which is more consistent with a threshold that does not matter
+than with a new optimum.)
 
 ### What changed in `specify-training-data`
 
@@ -298,10 +283,31 @@ it should not be read as an improvement.
 ### Superseded baselines
 
 Division figures in this section were produced under the **previous scoring rule** (mismatched
-divisions excluded); corrected-rule equivalents are in the table under "Aggregate figures".
+divisions excluded); corrected-rule equivalents are in the table under "Aggregate figures"
+and in the entries below. **Checkpoints trained before `correct-model-normalization` were trained
+for a defective model and should not be loaded into the corrected code as if they matched it:
+they load, because the state-dict layout is unchanged, but their weights and running statistics
+were estimated under the old arithmetic.**
 The original published baseline's `eval_results.csv` (commit `d235366`) records 11 mismatched
 divisions (155 correct, 11 mismatched, 6 false positive, 12 missed of 178), so its division
 F1 of 0.9451 is **0.8857** under the corrected rule.
+
+**`specify-training-data`, second run (2026-11-06, replaced 2026-11-09 by `correct-model-normalization`).**
+`checkpoints/20261106-051755/best_model.pt` (SHA256
+`fea35daa88c86d83ddc02e61721ac720a558c0eca9a2a1c79c75df7a1d92334f`), unseeded, early stopping
+with `early_stopping_patience=10` against scheduler `patience=5`, 33 epochs, best by validation
+loss at epoch 23 (1-indexed, val loss 0.0021 on the scale of the time). Its configuration is in
+`checkpoints/20261106-051755/config.json` and `run_manifest.json`; the committed
+`eval_results.csv` at that point matched an evaluation at `distance_threshold=64`. Pooled under
+the corrected scoring rule: division F1 **0.9239**, AA **0.9929**, TE **0.9940** (division
+precision 0.9266, recall 0.9213; 164 correct, 7 mismatched, 6 false positive, 7 missed of 178;
+AA 48,219 of 48,562, TE 49,478 of 49,775). Re-evaluated at 89: 0.9266 / 0.9935 / 0.9945 (164 /
+7 / 5 / 7). Division F1 under the previous rule was 0.9619. Its `division` sweep over 0.3–0.8 at
+threshold 89 gave corrected-rule F1 0.9239, 0.9239, 0.9266, 0.9318, 0.9288 and 0.9314, a spread of
+0.0079. The per-movie results are recoverable from version control at the commit that
+preceded `correct-model-normalization`. It was trained and evaluated on the **defective**
+model (divergences 34, 60, 80 and 82), so it is not a baseline to compare a corrected model's
+internals against, only its figures.
 
 **`specify-training-data`, first run (2026-11-05, replaced 2026-11-06).**
 `checkpoints/20261105-190321/best_model.pt` (SHA256

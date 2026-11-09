@@ -213,10 +213,10 @@ Document the internal schema of a single entry in `self.tracks`:
   set) counts as both a missed division and a false positive, so
   recall = correct / (correct + missed + mismatched) and
   precision = correct / (correct + false positive + mismatched). `mismatch_division` is
-  therefore one of `COUNT_COLUMNS`. On the recorded test split this gives division F1 0.9239;
-  the previous rule, which dropped mismatches, gave 0.9619 for the same counts
+  therefore one of `COUNT_COLUMNS`. On the recorded test split this gives division F1 0.9157;
+  the previous rule, which dropped mismatches, gave 0.9588 for the same counts
 - **Note**: this is deliberately *not* the mean of per-movie ratios. On the recorded test
-  split, pooling gives association accuracy 0.9728 where averaging gives 0.9715
+  split, pooling gives association accuracy 0.9940 where averaging gives 0.9964
 
 #### `build_indices(y)`
 

@@ -40,13 +40,88 @@ def scale_factor(mpp, model_mpp=MODEL_MPP):
     return float(mpp) / float(model_mpp)
 
 
+def real_cell_mask(morphologies):
+    """Boolean mask, ``True`` where a cell slot holds a real cell.
+
+    ``morphologies`` is ``(..., 3)``, as an ``ndarray`` or a ``Tensor``; the result has
+    the shape of ``morphologies`` without its last axis. A padding slot carries an all-zero
+    morphology and a real cell has positive area, so a slot is real exactly when any of its
+    morphology values is non-zero.
+
+    This is the one definition of "padding" in the repository: the graph rule in
+    ``spatial_adjacency`` and every normalization layer in the model use it, so they cannot
+    drift apart. It is deliberately *not* read from the centroid. Padding sits at the
+    origin in stored data, but training augmentation translates every centroid - padding
+    rows included - by a random per-sample offset, so a padding slot's centroid can be
+    anywhere.
+    """
+    return (morphologies != 0).any(-1)
+
+
+def pair_masks(is_real):
+    """Real-pair masks for the two kinds of delta the training branch builds.
+
+    ``is_real`` is ``(B, T, N)``, from ``real_cell_mask``. Returns ``(within, across)``:
+
+    * ``across``, ``(B, T-1, N, N)``: entry ``[b, t, i, j]`` is real only when slot ``i`` of
+      frame ``t`` *and* slot ``j`` of frame ``t+1`` are both real. That is the pairing
+      ``compute_deltas_across_frames`` and ``Comparison`` use (tracks of the current frame
+      against candidates of the next), and the one the training targets use to decide
+      which entries are graded, so the three agree by construction.
+    * ``within``, ``(B, T, N)``: the delta of slot ``i`` from the previous frame to this
+      one. It is real when the slot is real in both frames; the first frame has no
+      predecessor, so there it is real when the slot itself is.
+    """
+    across = is_real[:, :-1, :, None] & is_real[:, 1:, None, :]
+    within = is_real.clone()
+    within[:, 1:] = is_real[:, 1:] & is_real[:, :-1]
+    return within, across
+
+
+def masked_apply(module, x, is_real, *, fallback_below=2):
+    """Apply a batch-statistic module to the real rows of ``x`` only.
+
+    ``x`` is ``(..., C)`` and ``is_real`` is the boolean mask of the leading axes. The
+    real rows are gathered into ``(R, C)``, passed through ``module`` - normally an
+    ``nn.BatchNorm1d`` - and scattered back into a zero tensor of ``x``'s shape, so padding
+    rows come out exactly zero. Because the stock module sees only real rows, its mean,
+    variance and running buffers are accumulated over real cells alone, with its momentum,
+    ``num_batches_tracked`` and train/eval switch behaving exactly as they always did.
+
+    Two degenerate cases, because ``nn.BatchNorm1d`` in train mode raises at exactly one
+    row and a fixture can easily hit it:
+
+    * **No real row.** The module is not called, so no running statistic moves, and the
+      result is all zeros.
+    * **Fewer than ``fallback_below`` real rows in train mode.** The module is applied to
+      every row unmasked instead. Real training carries tens of real cells per window and
+      never reaches this; it exists so a tiny batch gives a number rather than an error
+      whose cause is three layers from its symptom.
+
+    In eval mode the module uses its running buffers, which depend on no batch, so a single
+    real row is simply normalized.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    mask = is_real.reshape(-1)
+    n_real = int(mask.sum())
+
+    if n_real == 0:
+        return torch.zeros_like(x)
+    if module.training and n_real < fallback_below:
+        return module(flat).reshape(x.shape)
+
+    normalized = module(flat[mask])
+    out = normalized.new_zeros(flat.shape[0], normalized.shape[-1])
+    out[mask] = normalized
+    return out.reshape(*x.shape[:-1], normalized.shape[-1])
+
+
 def spatial_adjacency(centroids, morphologies, distance_threshold):
     """Boolean ``(N, N)`` spatial graph over one frame's cell slots.
 
-    Two slots are linked when both are real cells and their centroid distance is
-    strictly greater than zero and strictly less than ``distance_threshold``. A padding
-    slot carries an all-zero morphology (a real cell has positive area), so any pair
-    involving one has a zero morphology dot product and is excluded.
+    Two slots are linked when both are real cells (see ``real_cell_mask``) and their
+    centroid distance is strictly greater than zero and strictly less than
+    ``distance_threshold``.
 
     The single definition of the graph rule: the tracker and the training dataloader
     both call it, so training and inference build the same graph. Padding slots also sit
@@ -55,8 +130,8 @@ def spatial_adjacency(centroids, morphologies, distance_threshold):
     """
     distance = cdist(centroids, centroids, metric='euclidean')
     adjacency = (distance > 0) & (distance < distance_threshold)
-    is_pad = np.matmul(morphologies, morphologies.T) == 0
-    return adjacency & ~is_pad
+    is_real = real_cell_mask(np.asarray(morphologies))
+    return adjacency & is_real[:, None] & is_real[None, :]
 
 
 def count_nonempty_frames(movie):
@@ -233,14 +308,17 @@ def weighted_categorical_crossentropy_v2(
         
     return - (y_true * torch.log(y_pred) * class_weights)
 
-def add_self_loops_dense(adj: torch.Tensor) -> torch.Tensor:
-    """Add a self-loop to every node of a dense adjacency matrix.
+def add_self_loops_dense(adj: torch.Tensor, is_real: torch.Tensor) -> torch.Tensor:
+    """Give every *real* cell of a dense adjacency matrix a self-loop.
 
     Args:
         adj: Adjacency matrices of shape (B*T, N, N).
+        is_real: Boolean mask of shape (B*T, N), ``True`` for a real cell and ``False``
+            for a padding slot (see ``real_cell_mask``).
 
     Returns:
-        The same matrices with a non-zero diagonal, shape (B*T, N, N).
+        The same matrices with a non-zero diagonal entry at every real cell and none at a
+        padding slot, shape (B*T, N, N).
 
     This replaced `normalize_adjacency_symmetric`, which computed a full
     `D^-1/2 A D^-1/2` that the only caller then discarded: `NeighborhoodEncoder`
@@ -249,14 +327,15 @@ def add_self_loops_dense(adj: torch.Tensor) -> torch.Tensor:
     its `add_self_loops=True`, which is what this does directly. Divergence 60.
 
     The graph layers are configured with `add_self_loops=False`, so these are the only
-    self-loops in the model. Removing this step would isolate every node, not just the
-    padding slots. Whether a *padding* slot should carry one is a separate question that
-    `correct-model-normalization` answers, because changing it moves the BatchNorm
-    statistics of divergence 34.
+    self-loops in the model, and dropping them would isolate every node. They are added
+    to real cells only. A padding slot is given no edge at all, so it cannot exchange
+    anything with a real cell and does not contribute an embedding the normalization
+    layers downstream would otherwise pool. A node with no edges is safe: `GATConv`
+    returns exactly zero for it.
     """
     with torch.no_grad():
-        identity = torch.eye(adj.shape[-1], device=adj.device, dtype=adj.dtype)
-        return adj + identity
+        loops = torch.diag_embed(is_real.to(adj.dtype))
+        return adj + loops
 
 def is_valid_lineage(y, lineage):
     """Check if a cell lineage of a single movie is valid.

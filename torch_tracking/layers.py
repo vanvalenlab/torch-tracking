@@ -12,8 +12,10 @@ class ImageNormalization2D(nn.Module):
         norm_method (str): Normalization method to use, one of:
             "std", "max", "whole_image", None.
         filter_size (int): The length of the convolution window (not used in current impl).
-        data_format (str): 'channels_first' or 'channels_last'.
-            PyTorch default is 'channels_first'.
+        data_format (str): The layout of the input, 'channels_first' (B, C, H, W) or
+            'channels_last' (B, H, W, C). Normalization is taken over the two spatial
+            axes of whichever layout is declared, so the declaration has to be true.
+            Anything else raises.
     """
     def __init__(
         self,
@@ -29,10 +31,16 @@ class ImageNormalization2D(nn.Module):
         
         self.norm_method = norm_method.lower() if isinstance(norm_method, str) else norm_method
         self.filter_size = filter_size
-        self.data_format = 'channels_first'
-        
-        # Channel axis: 1 for channels_first, -1 for channels_last
-        self.channel_axis = 1 if data_format == 'channels_first' else -1
+
+        # This used to store the literal 'channels_first' whatever the caller passed, so
+        # a channels_last crop was normalized over (width, channels) - one image row at
+        # a time - instead of over its spatial extent. Divergence 80.
+        supported = ('channels_first', 'channels_last')
+        if data_format not in supported:
+            raise ValueError(
+                f'Invalid `data_format`: {data_format!r}. Use one of {supported}.'
+            )
+        self.data_format = data_format
 
     def forward(self, x):
         """Apply normalization to input tensor."""
@@ -143,7 +151,8 @@ class Unmerge(nn.Module):
 class TemporalMerge(nn.Module):
     """Layer for merging the time dimension of a Tensor using LSTM.
     
-    Processes temporal sequences at each spatial location independently.
+    Runs one LSTM sequence per (batch entry, track), over that track's frames in time
+    order. A track's output depends only on its own frames - never on another slot.
     Initialized to match Keras LSTM defaults:
         - Glorot Uniform for input weights
         - Orthogonal for recurrent weights
@@ -191,16 +200,20 @@ class TemporalMerge(nn.Module):
         # x shape: (batch, time, tracks, encoder_dim)
         batch_size, time_steps, num_tracks, features = x.shape
         
-        # Reshape to process all tracks independently
-        # (B, T, N, F) -> (B*N, T, F)
-        x = x.reshape(batch_size * num_tracks, time_steps, features)
+        # One LSTM sequence per (batch entry, track): the track axis must come in front
+        # of the time axis *before* the reshape. Reshaping (B, T, N, F) directly reads T
+        # consecutive memory rows, which are T different tracks of one frame, so the LSTM
+        # carried state from one slot to the next and a track's output depended on how
+        # many other slots the batch held. Divergence 82.
+        # (B, T, N, F) -> (B, N, T, F) -> (B*N, T, F)
+        x = x.permute(0, 2, 1, 3).reshape(batch_size * num_tracks, time_steps, features)
         
         # Apply LSTM
         x, _ = self.lstm(x)
         
-        # Reshape back
-        # (B*N, T, F) -> (B, T, N, F)
-        x = x.reshape(batch_size, time_steps, num_tracks, self.encoder_dim)
+        # Restore the layout
+        # (B*N, T, F) -> (B, N, T, F) -> (B, T, N, F)
+        x = x.reshape(batch_size, num_tracks, time_steps, self.encoder_dim).permute(0, 2, 1, 3)
         
         return x
 

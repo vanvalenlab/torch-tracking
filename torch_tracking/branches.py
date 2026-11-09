@@ -6,6 +6,7 @@ import torch.nn as nn
 # Assuming these are imported from your other modules
 from torch_tracking.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
 from torch_tracking.layers import compute_deltas, compute_deltas_across_frames
+from torch_tracking.utils import pair_masks, real_cell_mask
 
 from torch_tracking.encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder, DeltaEncoder
 
@@ -66,6 +67,10 @@ class TrainingBranch(nn.Module):
         Returns:
             embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
             deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
+            pair_mask: (batch, time-1, max_cells, max_cells) boolean, ``True`` where both
+                the track and the candidate of that entry are real cells. Derived here once
+                from the morphologies and handed to the decoder, so the delta encoders and
+                the decoder normalize over the same pairs.
         """
 
         batch_size, time_steps, max_cells, H, W, C = appearances.shape
@@ -103,6 +108,11 @@ class TrainingBranch(nn.Module):
         # Process centroids to get deltas
         # 1. Compute deltas within each frame (across tracks)
 
+        # Which slots, and which pairs of slots, are real. Padding must not set the
+        # statistics a real pair is normalized by. Divergence 34.
+        is_real = real_cell_mask(morphologies)  # (B, T, N)
+        within_real, pair_mask = pair_masks(is_real)
+
         deltas_within = compute_deltas(centroids_out)  # (B, T, N, 2)
         deltas_within = torch.abs(deltas_within)
         
@@ -111,8 +121,8 @@ class TrainingBranch(nn.Module):
         deltas_across = torch.abs(deltas_across)
         
         # Encode deltas
-        deltas_within_enc = self.delta_encoder(deltas_within)  # (B, T, N, encoder_dim)
-        deltas_across_enc = self.delta_across_frames_encoder(deltas_across)  # (B, T-1, N, N, encoder_dim)
+        deltas_within_enc = self.delta_encoder(deltas_within, within_real)  # (B, T, N, encoder_dim)
+        deltas_across_enc = self.delta_across_frames_encoder(deltas_across, pair_mask)  # (B, T-1, N, N, encoder_dim)
         
         # Apply temporal merge to within-frame deltas
         deltas_within_current = deltas_within_enc[:, :-1]  # (B, T-1, N, encoder_dim)
@@ -127,7 +137,7 @@ class TrainingBranch(nn.Module):
         # Concatenate within and across deltas
         deltas = torch.cat([deltas_within_current, deltas_across_enc], dim=-1)
         
-        return embedding_comparisons, deltas
+        return embedding_comparisons, deltas, pair_mask
 
 
 class InferenceBranch(nn.Module):

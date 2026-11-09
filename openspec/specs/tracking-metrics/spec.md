@@ -389,9 +389,10 @@ hit nor a miss.
 #### Scenario: The corrected rule is applied to the recorded test split
 
 - **WHEN** the committed `metrics/eval_results.csv` is pooled under this rule
-- **THEN** pooled division F1 SHALL be 0.9239
-- **AND** the figure obtained by excluding mismatches, 0.9619, SHALL NOT be reported as
-  the contract metric
+- **THEN** the pooled division F1 SHALL be the figure `metrics/PROVENANCE.md` records, which
+  is checked against the committed counts
+- **AND** the figure obtained by excluding mismatches SHALL NOT be reported as the contract
+  metric
 
 #### Scenario: Scoring is unchanged for a split with no mismatches
 

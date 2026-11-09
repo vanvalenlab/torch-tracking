@@ -253,14 +253,15 @@ class GNNTrackingModel(nn.Module):
         """
 
         # Get features from training branch
-        embedding_comparisons, deltas = self.training_branch(
+        embedding_comparisons, deltas, pair_mask = self.training_branch(
             appearances, morphologies, centroids, adj_matrices
         )
         
         # Decode to predictions
         output = self.tracking_decoder(
             embedding_comparisons, deltas,
-            apply_softmax=not return_logits
+            apply_softmax=not return_logits,
+            is_real=pair_mask
         )
         
         return output
