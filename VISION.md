@@ -125,3 +125,9 @@ made clear how much of the recorded behavior was defective rather than merely un
 including one defect that invalidates the published checkpoint. Specs and tests written
 under the earlier stance are being rewritten as each capability's corrections land; some
 requirements still carry a marker naming the change that will replace or correct them.
+
+The divergence register has now reached closure: no entry is Open, and the one entry not
+corrected (78) was measured and accepted as a decision. What remains outside it is the
+owner's step — publishing the retrained weights to the `vanvalenlab` HuggingFace
+organization, which has not happened. Until it does, the published checkpoint still
+predates the corrections, and the accuracy tests skip rather than evaluate it.

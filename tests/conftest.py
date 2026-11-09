@@ -133,14 +133,22 @@ def dataset_dir():
 
 @pytest.fixture(scope="session")
 def pinned_weights():
-    """The pinned trained checkpoint, downloaded from HuggingFace.
+    """The checkpoint the accuracy tests evaluate: a local one, supplied by the caller.
 
-    Gated: requires org membership, accepted terms, and HF_TOKEN. Never committed -
-    constraint 6. Revision and hash are recorded in metrics/PROVENANCE.md.
+    Set TORCH_TRACKING_WEIGHTS to a local checkpoint file. Nothing is downloaded or
+    uploaded in that case, and HF_TOKEN is not needed for the weights. Which checkpoint
+    the current baseline was produced from is recorded in metrics/PROVENANCE.md.
 
-    Set TORCH_TRACKING_WEIGHTS to a local checkpoint file to evaluate that instead, for
-    example a retrained model that has not been published yet. Nothing is downloaded or
-    uploaded in that case, and HF_TOKEN is not needed for the weights.
+    With the variable unset the tests skip. They used to download the published
+    checkpoint, but that one predates the corrections to the model's arithmetic
+    (divergences 12, 34, 60, 80 and 82), so evaluating it through the corrected code
+    measured a model the code no longer matches. Divergence 84.
+
+    To restore the download once the corrected checkpoint is published to the
+    vanvalenlab organization (constraint 6 - only the owner can do that): delete the
+    skip below, put the new repository id, filename and revision into the three
+    constants of the commented download, uncomment it, and record the same revision and
+    hash in metrics/PROVENANCE.md.
     """
     local = os.environ.get("TORCH_TRACKING_WEIGHTS")
     if local:
@@ -148,22 +156,30 @@ def pinned_weights():
         if not local_path.is_file():
             pytest.fail(f"TORCH_TRACKING_WEIGHTS is set but is not a file: {local_path}")
         return local_path
-    if not os.environ.get("HF_TOKEN"):
-        pytest.skip("HF_TOKEN not set; trained weights are gated (doc/model_access.md)")
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:  # pragma: no cover
-        pytest.skip("huggingface_hub not installed")
-    try:
-        return Path(
-            hf_hub_download(
-                repo_id="vanvalenlab/torch-tracking",
-                filename="torch-tracking_2026-07-30.pt",
-                revision="038f1e6e47f28f0cc11f106a14c7e8bae9d5896c",
-            )
-        )
-    except Exception as exc:  # network, auth, or gating failure
-        pytest.skip(f"could not fetch pinned weights: {type(exc).__name__}")
+    pytest.skip(
+        "TORCH_TRACKING_WEIGHTS is not set. The published checkpoint "
+        "(torch-tracking_2026-07-30.pt) predates divergences 12, 34, 60, 80 and 82, so "
+        "it is no longer downloaded: evaluating it through the corrected code would "
+        "measure a model the code does not match. Point TORCH_TRACKING_WEIGHTS at a "
+        "local checkpoint trained by the current code; metrics/PROVENANCE.md names the "
+        "one the current baseline came from."
+    )
+
+    # What the download looked like, kept as a record of what was superseded:
+    #
+    #     if not os.environ.get("HF_TOKEN"):
+    #         pytest.skip("HF_TOKEN not set; trained weights are gated (doc/model_access.md)")
+    #     from huggingface_hub import hf_hub_download
+    #     try:
+    #         return Path(
+    #             hf_hub_download(
+    #                 repo_id="vanvalenlab/torch-tracking",
+    #                 filename="torch-tracking_2026-07-30.pt",
+    #                 revision="038f1e6e47f28f0cc11f106a14c7e8bae9d5896c",
+    #             )
+    #         )
+    #     except Exception as exc:  # network, auth, or gating failure
+    #         pytest.skip(f"could not fetch pinned weights: {type(exc).__name__}")
 
 
 # --------------------------------------------------------------------------------------

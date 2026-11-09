@@ -158,7 +158,9 @@ def _cli(argv=None):
     parser.add_argument('--birth', type=float, nargs='+', default=list(DEFAULT_BIRTH_SWEEP))
     parser.add_argument('--death', type=float, nargs='+', default=list(DEFAULT_DEATH_SWEEP))
     parser.add_argument('--track-length', type=int, default=8)
-    parser.add_argument('--distance-threshold', type=int, default=64)
+    parser.add_argument('--distance-threshold', type=int, default=DISTANCE_THRESHOLD,
+                        help='Distance in pixels within which cells count as connected in the '
+                        'graph (default: the retuned threshold, %(default)s)')
     parser.add_argument('--threshold', type=float, default=0.8)
 
     args = parser.parse_args(argv)

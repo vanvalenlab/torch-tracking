@@ -1,16 +1,20 @@
-"""L3 - accuracy guardrails. Needs BOTH gated assets: HF_TOKEN and the dataset.
+"""L3 - accuracy guardrails. Needs a local checkpoint and the dataset.
 
 This layer reports accuracy against the external reference rather than asserting it
 against any recorded figure, because retraining legitimately moves these numbers. What
 produced the current figures is in metrics/PROVENANCE.md.
 
-It does not run in CI: trained weights are gated on HuggingFace, and there is currently
-no route for a new user to obtain DynamicNuclearNet-tracking at all (doc/model_access.md).
-Both fixtures skip rather than fail, so an ordinary `pytest` run is green without them.
+It does not run in CI: there is currently no route for a new user to obtain
+DynamicNuclearNet-tracking at all (doc/model_access.md), and the corrected checkpoint is not
+published. Both fixtures skip rather than fail, so an ordinary `pytest` run is green
+without them.
 
-The weights these tests use must be the retrained checkpoint. The `pinned_weights` fixture
-in conftest.py is the one place the revision lives; the superseded checkpoint was trained
-under the old scale convention and must not be evaluated with the corrected pipeline.
+The weights these tests use must be a checkpoint trained by the current code, supplied
+through TORCH_TRACKING_WEIGHTS. The currently published checkpoint predates the scale
+convention (correct-scale-convention) and the later corrections to the model's arithmetic -
+divergences 12, 34, 60, 80 and 82 - and must not be evaluated with the corrected pipeline,
+so the `pinned_weights` fixture in conftest.py skips rather than downloading it. The
+checkpoint the current baseline came from is named in metrics/PROVENANCE.md.
 """
 
 import pytest
@@ -70,6 +74,9 @@ def test_corrected_pipeline_is_reported_against_the_reference(
 
     Reported, not floored: what tolerance counts as parity is a decision for the person
     reviewing the retrain, and constraint 3 makes the reference the floor they judge by.
+
+    The checkpoint must carry every correction the current baseline does: the scale
+    convention and divergences 12, 34, 60, 80 and 82.
     """
     from tests.conftest import INHERITED_DISTANCE_THRESHOLD, reference_rows
     from torch_tracking.eval import pooled_metrics
@@ -93,6 +100,8 @@ def test_the_retune_is_separable_from_the_scale_correction(
 
     The inherited 64 px was optimized at 0.768 um/px; at the corrected 0.55 um/px it
     covers about half the area. Two variables moved in this change, so both are reported.
+    The retuned figure is the one that corresponds to the baseline in metrics/PROVENANCE.md;
+    the inherited one is new information with no recorded counterpart.
     """
     from tests.conftest import (
         INHERITED_DISTANCE_THRESHOLD,
@@ -120,7 +129,8 @@ def test_cpu_and_gpu_agree_on_the_corrected_pipeline(
 
     Skips where no CUDA device is present, which includes CI and every CPU-only machine.
     Compares the pipeline against itself, so it needs no reference figures. On a shared
-    server, only run this on a GPU you have been assigned.
+    server, only run this on a GPU you have been assigned. The checkpoint must carry the
+    corrections listed in the module docstring.
     """
     import pandas as pd
     import torch

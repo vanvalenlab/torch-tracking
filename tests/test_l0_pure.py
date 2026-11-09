@@ -1025,18 +1025,23 @@ def test_one_angle_and_one_offset_apply_to_the_whole_sample(tmp_path):
     stored = dataset.features["centroids"][0, 0:3]
     sample = dataset[0]
 
-    # Rebuild the transform from the single angle and offset the dataset drew.
-    angle = torch.deg2rad(dataset.rotation_angle.clone().detach())
-    rotation = torch.tensor(
-        [[torch.cos(angle), -torch.sin(angle)], [torch.sin(angle), torch.cos(angle)]]
-    )
-    expected = torch.matmul(torch.from_numpy(stored).float(), rotation)
-    expected = expected + dataset.random_translate
+    # The dataset no longer records its draw (divergence 68), so recover the transform from
+    # the sample itself: one rotation and one offset must map every stored centroid, in
+    # every frame, onto its augmented position.
+    before = torch.from_numpy(stored).float().reshape(-1, 2)
+    after = sample["centroids"].reshape(-1, 2)
+    design = torch.cat([before, torch.ones(len(before), 1)], dim=1)
+    fit = torch.linalg.lstsq(design, after).solution  # rows 0-1: rotation, row 2: offset
+    rotation, offset = fit[:2], fit[2]
 
-    assert torch.allclose(sample["centroids"], expected, atol=1e-4), (
+    assert torch.allclose(design @ fit, after, atol=1e-4), (
         "every frame and cell in a sample must share one rotation angle and one "
         "translation offset"
     )
+    assert torch.allclose(rotation.T @ rotation, torch.eye(2), atol=1e-4), "not a rotation"
+    assert torch.allclose(torch.linalg.det(rotation), torch.tensor(1.0), atol=1e-4)
+    assert not hasattr(dataset, "rotation_angle") and not hasattr(dataset, "random_translate")
+    assert offset.shape == (2,)
 
 
 def test_morphology_is_untransformed_and_adjacency_is_unaffected(tmp_path):

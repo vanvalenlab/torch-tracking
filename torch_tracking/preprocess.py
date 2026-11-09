@@ -273,11 +273,6 @@ def _write_zarr_pair(raw_path, processed_path, X, y, features, lineages, mpps, t
         os.rename(partial, final)
 
 
-if __name__ == "__main__":
-
-    data_directory = Path.home() / '.deepcell/tracking/'
-    print(data_directory)
-    
-    for filename in Path(data_directory).glob('*.trks'):
-        print(f"Converting {os.path.basename(filename)}")
-        convert_trk_to_zarr(filename)
+# Conversion is reached through `convert_trk_to_zarr`, which the test suite exercises. A
+# `__main__` block used to sit here that converted every `.trks` file under a hardcoded
+# `~/.deepcell/tracking/`; nothing ran it. Divergence 83.

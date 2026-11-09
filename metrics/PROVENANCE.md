@@ -359,6 +359,33 @@ python -m torch_tracking.eval --checkpoint <weights> --split-dir ~/.deepcell/tra
 
 ---
 
+### L3 verification (`close-register-divergences`)
+
+The accuracy layer was run for the first time against the checkpoint above. **This is a
+verification of the figures already recorded, not new baseline figures**: the same
+checkpoint, evaluated through the same harness, reproduced them.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-11-09 (about 10:28–10:33 UTC−8) |
+| Checkpoint | `checkpoints/20261109-080943/best_model.pt`, supplied through `TORCH_TRACKING_WEIGHTS` |
+| Dataset | `~/.deepcell/tracking` (the `test.zarr` and `test.json` there are byte-identical in size and content to the `regen/` copy the CSV was produced from) |
+| Environment | CPU only (`CUDA_VISIBLE_DEVICES=` empty), `nice -n 10`, **16 threads** (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`), chosen after seeing load average about 6 on 128 cores and 725 GiB free. Python 3.14.3 |
+| Result | 4 passed, 1 skipped in 265 s. The skip is `test_cpu_and_gpu_agree_on_the_corrected_pipeline`: no GPU was agreed for it, so constraint 1's CPU-against-GPU claim is **still unchecked** |
+
+| Pooled, 12 test movies | Threshold 89 (retuned) | Threshold 64 (inherited) | Caliban - GT |
+| --- | --- | --- | --- |
+| Division F1 | 0.9157 | 0.9132 | 0.9146 |
+| Association accuracy | 0.9940 | 0.9939 | 0.9781 |
+| Target effectiveness | 0.9950 | 0.9949 | 0.9787 |
+
+The threshold-89 column equals the aggregate figures above to four places, so the committed
+`eval_results.csv` stands. The threshold-64 column is new and has no recorded counterpart: at
+the corrected model, the retune moves division F1 by +0.0025 and the other two by +0.0001,
+which is well inside the sampling error recorded above. The same caveat applies as to every
+division figure here: one seeded run, and division F1 cannot separate this run from the
+reference.
+
 ## `benchmarks.csv`
 
 The reference numbers for the TensorFlow Caliban tracking model, used for the parity claim
@@ -406,6 +433,12 @@ reason the `.gitignore` exception exists.
 ---
 
 ## Pinned checkpoint for dataset-dependent tests (L3)
+
+> **Superseded for the accuracy tests (divergence 84).** The checkpoint below predates
+> divergences 12, 34, 60, 80 and 82, so the L3 fixture no longer downloads it: with
+> `TORCH_TRACKING_WEIGHTS` unset the tests skip. The record is kept as the description of
+> what is published. When the corrected checkpoint (`20261109-080943`) is published, the
+> owner restores the download and records its new revision and hash here.
 
 The L3 test layer asserts accuracy thresholds and needs real weights. It pins an explicit
 revision, because the default download resolves to the latest revision and a replaced
