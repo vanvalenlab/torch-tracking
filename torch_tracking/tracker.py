@@ -146,12 +146,12 @@ class CellTracker:
                         crop_size=self.appearance_dim,
                     )
         
-        if checkpoint_path is None:
+        if (checkpoint_path is None) or not (Path(checkpoint_path).is_file()):
             
             hf_hub_download(repo_id='vanvalenlab/torch-tracking', 
-                            filename='torch-tracking_2026-07-30.pt',
+                            filename='torch-tracking_2026-11-09.pt',
                             local_dir=Path.home() / '.deepcell/models')
-            checkpoint_path = Path.home() / '.deepcell/models/torch-tracking_2026-07-30.pt'
+            checkpoint_path = Path.home() / '.deepcell/models/torch-tracking_2026-11-09.pt'
 
         self.checkpoint_path = checkpoint_path
         checkpoint = torch.load(checkpoint_path, map_location=self.device)['model_state_dict']
