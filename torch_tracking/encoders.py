@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data, Batch
-from torch_tracking.utils import normalize_adjacency_symmetric
+from torch_tracking.utils import add_self_loops_dense
 
 # Import custom layers (assumes they're in the same directory)
 from torch_tracking.layers import ImageNormalization2D
@@ -23,7 +23,6 @@ class AppearanceEncoder(nn.Module):
         appearance_shape (tuple): Shape of appearance input (H, W, C)
         n_filters (int): Number of convolutional filters
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
         appearance_norm (bool): Whether to apply input normalization
         data_format (str): 'channels_first' or 'channels_last'
     """
@@ -32,9 +31,8 @@ class AppearanceEncoder(nn.Module):
         appearance_shape=(32, 32, 1),
         n_filters=64,
         encoder_dim=64,
-        norm_layer='batch',
         appearance_norm=True,
-        data_format='channels_first',
+        data_format='channels_last',
         dropout = 0.1
     ):
         super().__init__()
@@ -158,9 +156,8 @@ class MorphologyEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of morphology features (default: 3)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=3, encoder_dim=64):
         super().__init__()
         self.encoder_dim = encoder_dim
         
@@ -210,9 +207,8 @@ class CentroidEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of centroid features (default: 2 for x,y)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=2, encoder_dim=64):
         super().__init__()
         self.encoder_dim = encoder_dim
         
@@ -257,13 +253,11 @@ class DeltaEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of delta features (default: 2)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
+    def __init__(self, input_dim=2, encoder_dim=64, dropout=0.1):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
-        self.norm_layer_type = norm_layer
         self.norm = nn.BatchNorm1d(encoder_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -287,16 +281,11 @@ class DeltaEncoder(nn.Module):
         new_shape = list(original_shape[:-1]) + [x.shape[-1]]
         x = x.view(new_shape)
         
-        # Apply normalization - LayerNorm is easier for variable shapes
+        # BatchNorm1d needs (N, C), and the input is rank 4 or rank 5
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_flat = self.norm(x_flat)
+        x = x_flat.view(new_shape)
 
-        if self.norm_layer_type == 'batch':
-            # Flatten for BatchNorm1d: needs (N, C) or (N, C, L)
-            x_flat = x.reshape(-1, x.shape[-1])
-            x_flat = self.norm(x_flat)
-            x = x_flat.view(new_shape)
-        else:
-            x = self.norm(x)
-                
         x = self.dropout(x)
         x = self.activation(x)
 
@@ -339,10 +328,16 @@ class NeighborhoodEncoder(nn.Module):
         self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         
-        # Initial feature combination
-        # Concatenate all encoders' outputs
-        combined_dim = (3 * self.embedding_dim)
-                
+        # Initial feature combination: the three encoders' outputs are concatenated, so
+        # the width is their actual widths summed. It used to be `3 * embedding_dim`,
+        # which is only right while all four numbers coincide. The final layer below
+        # already summed real widths; these two now agree. Divergence 69.
+        combined_dim = (
+            appearance_encoder.encoder_dim
+            + morphology_encoder.encoder_dim
+            + centroid_encoder.encoder_dim
+        )
+
         self.initial_dense = nn.Linear(combined_dim, n_filters)
         self.initial_norm = nn.BatchNorm1d(n_filters) if norm_layer == 'batch' else nn.LayerNorm(n_filters)
         self.initial_activation = nn.ReLU()
@@ -423,7 +418,11 @@ class NeighborhoodEncoder(nn.Module):
         """
 
         BT, N, _ = adj_matrix.shape  # (B*T, max_cells, max_cells)
-        adj_matrix = normalize_adjacency_symmetric(adj_matrix)
+        # `_apply_batched_gnn` converts this to an edge list with `.nonzero()`, so only
+        # the sparsity pattern survives. Self-loops are added explicitly; the symmetric
+        # normalization that used to be computed here was discarded by that `.nonzero()`.
+        # Divergence 60.
+        adj_matrix = add_self_loops_dense(adj_matrix)
 
         # Encode each feature type
         app_features = self.appearance_encoder(appearance)  # (B * T *  N, encoder_dim)
@@ -486,40 +485,8 @@ class NeighborhoodEncoder(nn.Module):
 
 
 # Example usage and tests
-if __name__ == "__main__":
-    print("Testing encoder modules...\n")
-
-    max_cells = 39
-    batch_size = 2
-    n_frames = 8
-
-    app_encoder = AppearanceEncoder(appearance_shape=(1, 32, 32))
-    app_in = torch.randn(batch_size * n_frames * max_cells, 1, 32, 32)  # channels_last: (B * T * N, C, H, W)
-
-    morph_encoder = MorphologyEncoder(input_dim=3, encoder_dim=64)
-    morph_in = torch.randn(batch_size * n_frames * max_cells, 3)
 
 
-    cent_encoder = CentroidEncoder(input_dim=2, encoder_dim=64)
-    cent_in = torch.randn(batch_size * n_frames * max_cells, 2)
-
-
-    # Test NeighborhoodEncoder
-    adj_matrix = torch.randn(batch_size * n_frames, max_cells, max_cells)
-    n_encoder = NeighborhoodEncoder(appearance_encoder=app_encoder,
-                                    morphology_encoder=morph_encoder,
-                                    centroid_encoder=cent_encoder, graph_layer='gat'
-                                    )
-    
-    neighborhood = n_encoder(app_in, morph_in, cent_in, adj_matrix)
-
-    print(f"   Output: {neighborhood[0].shape, neighborhood[1].shape}\n")
-    
-    # Test DeltaEncoder
-    print("4. DeltaEncoder")
-    delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
-    x = torch.randn(16, max_cells, 2)
-    out = delta_encoder(x)
-    print(f"   Input: {x.shape}, Output: {out.shape}\n")
-    
-    print("✅ Basic encoder tests passed!")
+# Shape checks for these modules live in tests/test_l1_model.py. They used to sit in
+# a `__main__` block here, which nothing ran and which had gone stale: it constructed
+# modules with arguments they no longer take. Divergence 64.

@@ -209,7 +209,7 @@ def main(argv=None):
         end = int(end_frames[movie])
         X, y = z['X'][movie, :end], z['y'][movie, :end]
         for name, rule, threshold in variants:
-            tracker = Tracker(checkpoint_dir=args.checkpoint, device=args.device,
+            tracker = Tracker(checkpoint_path=args.checkpoint, device=args.device,
                               mpp=float(mpps[movie]), division=0.5, birth=0.999, death=0.999,
                               track_length=8, distance_threshold=DISTANCE_THRESHOLD,
                               verbose=False)

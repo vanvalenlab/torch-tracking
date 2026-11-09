@@ -141,7 +141,7 @@ annotation = np.load('masks.npy')   # shape (T, H, W, 1), int
 
 # Initialize the tracker
 tracker = CellTracker(
-    checkpoint_dir='path/to/best_model.pt',  # omit to use ~/.deepcell default
+    checkpoint_path='path/to/best_model.pt',  # omit to use ~/.deepcell default
     device='cuda',
     mpp=0.65,        # set to your image's microns-per-pixel
 )

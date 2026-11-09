@@ -3,11 +3,11 @@ from pathlib import Path
 
 import copy
 import timeit
+import warnings
 from tqdm import tqdm
 import numpy as np
 import torch
 import pandas as pd
-import glob
 
 from huggingface_hub import hf_hub_download
 from scipy.optimize import linear_sum_assignment
@@ -19,11 +19,17 @@ from torch_tracking.model import GNNTrackingModel
 class CellTracker:
     """
     Args:
-        checkpoint_dir (str or None): The directory of the model weight file
+        checkpoint_path (str, Path or None): Path to the checkpoint *file* holding the
+            model weights, which is handed to `torch.load`. When omitted, the published
+            weights are fetched from HuggingFace into `~/.deepcell/models/` and that file
+            is used. Not a directory: the previous name, `checkpoint_dir`, said it was,
+            and is still accepted with a deprecation warning. Note that
+            `TrainingConfig.checkpoint_dir` is a genuine directory; the two are unrelated.
 
-        device (str, optional): The device that you want to use for inference.
-            Default is `cuda`, can also be `cpu` or `mps`
-            If you have a multi-GPU device, specify using `cuda:<N>` where N is the GPU ID
+        device (str, optional): The device used for inference.
+            Default is `cpu`; can also be `cuda` or `mps`.
+            If you have a multi-GPU device, specify using `cuda:<N>` where N is the GPU ID.
+            CPU is the default so that inference needs no GPU.
 
 
         distance_threshold (int, optional): The distance threshold by which cells are 
@@ -61,7 +67,7 @@ class CellTracker:
     """
     def __init__(
         self,
-        checkpoint_dir = None,
+        checkpoint_path = None,
         device = None,
         distance_threshold: int = DISTANCE_THRESHOLD,
         death: float = 0.999,
@@ -70,7 +76,26 @@ class CellTracker:
         track_length: int = 8,
         mpp = 0.55,
         verbose=True,
+        checkpoint_dir = None,
     ):
+        # `checkpoint_dir` named a directory and was passed to `torch.load` as a file
+        # path. It is kept as a deprecated alias because published reproduction commands
+        # in metrics/PROVENANCE.md use it. Divergence 3.
+        if checkpoint_dir is not None:
+            if checkpoint_path is not None:
+                raise ValueError(
+                    'Pass either `checkpoint_path` or the deprecated `checkpoint_dir`, '
+                    'not both.'
+                )
+            warnings.warn(
+                '`checkpoint_dir` is deprecated and will be removed; use '
+                '`checkpoint_path`. It never named a directory - it is passed to '
+                '`torch.load` as a file path.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            checkpoint_path = checkpoint_dir
+
         
         # Birth and death are costs in an assignment problem where continuing a track
         # that has already divided costs 1.0. At or above that, ending or restarting is
@@ -121,14 +146,15 @@ class CellTracker:
                         crop_size=self.appearance_dim,
                     )
         
-        if checkpoint_dir is None:
+        if checkpoint_path is None:
             
             hf_hub_download(repo_id='vanvalenlab/torch-tracking', 
                             filename='torch-tracking_2026-07-30.pt',
                             local_dir=Path.home() / '.deepcell/models')
-            checkpoint_dir = Path.home() / '.deepcell/models/torch-tracking_2026-07-30.pt'
+            checkpoint_path = Path.home() / '.deepcell/models/torch-tracking_2026-07-30.pt'
 
-        checkpoint = torch.load(checkpoint_dir, map_location=self.device)['model_state_dict']
+        self.checkpoint_path = checkpoint_path
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)['model_state_dict']
 
         self.tracking_model.load_state_dict(checkpoint)  
         self.tracking_model.eval().to(self.device)
@@ -272,7 +298,8 @@ class CellTracker:
             for frame in range(n_frames):
                 frame_features = get_image_features(
                     self.X[frame],
-                    self.y[frame]
+                    self.y[frame],
+                    appearance_dim=self.appearance_dim,
                 )
                 
                 # Build ID mappings

@@ -36,7 +36,7 @@ def _track(checkpoint, movie, device):
     from torch_tracking.tracker import CellTracker
 
     tracker = CellTracker(
-        checkpoint_dir=str(checkpoint), device=device, verbose=False,
+        checkpoint_path=str(checkpoint), device=device, verbose=False,
         **BASELINE_INFERENCE_PARAMS,
     )
     tracker.preprocess_movie(movie=movie.X.copy(), annotation=movie.y.copy())
@@ -385,7 +385,7 @@ def _tracker(checkpoint, **kwargs):
 
     params = dict(BASELINE_INFERENCE_PARAMS)
     params.update(kwargs)
-    return CellTracker(checkpoint_dir=str(checkpoint), device="cpu", verbose=False, **params)
+    return CellTracker(checkpoint_path=str(checkpoint), device="cpu", verbose=False, **params)
 
 
 def test_rank_4_is_required_and_the_error_names_the_ranks(untrained_checkpoint, synthetic_movie):
@@ -604,7 +604,7 @@ def _tracker_at_frame_3(untrained_checkpoint, synthetic_movie):
     from torch_tracking.tracker import CellTracker
 
     tracker = CellTracker(
-        checkpoint_dir=str(untrained_checkpoint),
+        checkpoint_path=str(untrained_checkpoint),
         device="cpu",
         verbose=False,
         **BASELINE_INFERENCE_PARAMS,
@@ -777,9 +777,9 @@ def test_thresholds_just_below_the_maximum_cost_are_accepted(untrained_checkpoin
     """
     from torch_tracking.tracker import CellTracker
 
-    CellTracker(checkpoint_dir=str(untrained_checkpoint), device="cpu", verbose=False)
+    CellTracker(checkpoint_path=str(untrained_checkpoint), device="cpu", verbose=False)
     CellTracker(
-        checkpoint_dir=str(untrained_checkpoint),
+        checkpoint_path=str(untrained_checkpoint),
         device="cpu",
         verbose=False,
         birth=np.nextafter(1.0, 0.0),

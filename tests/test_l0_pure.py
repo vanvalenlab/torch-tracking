@@ -2208,7 +2208,7 @@ def test_birth_and_death_at_or_above_the_maximum_cost_are_rejected(name, value):
     from torch_tracking.tracker import CellTracker
 
     with pytest.raises(ValueError, match=rf"`{name}` must be below 1\.0"):
-        CellTracker(checkpoint_dir="not-read-because-validation-comes-first", **{name: value})
+        CellTracker(checkpoint_path="not-read-because-validation-comes-first", **{name: value})
 
 
 @pytest.mark.parametrize("name", ["death", "birth", "division", "track_length"])

@@ -250,63 +250,8 @@ def compute_deltas_across_frames(centroids):
 
 
 # Example usage and tests
-if __name__ == "__main__":
-    print("Testing custom PyTorch layers...\n")
-    
-    # Test ImageNormalization2D
-    print("1. ImageNormalization2D")
-    img_norm = ImageNormalization2D(norm_method='whole_image')
-    x = torch.randn(2, 3, 32, 32)
-    out = img_norm(x)
-    print(f"   Input: {x.shape}, Output: {out.shape}")
-    print(f"   Output mean: {out.mean():.4f}, std: {out.std():.4f}\n")
-    
-    # Test Comparison
-    print("2. Comparison")
-    comp = Comparison()
-    x = torch.randn(2, 4, 5, 64)  # batch, time, tracks_x, features
-    y = torch.randn(2, 4, 3, 64)  # batch, time, tracks_y, features
-    out = comp(x, y)
-    print(f"   x: {x.shape}, y: {y.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 4, 5, 3, 128])\n")
-    
-    # Test DeltaReshape
-    print("3. DeltaReshape")
-    delta_reshape = DeltaReshape()
-    current = torch.randn(2, 4, 5, 64)
-    future = torch.randn(2, 4, 3, 64)
-    out = delta_reshape(current, future)
-    print(f"   Current: {current.shape}, Future: {future.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 4, 5, 3, 64])\n")
-    
-    # Test Unmerge
-    print("4. Unmerge")
-    unmerge = Unmerge(track_length=8, max_cells=39, embedding_dim=64)
-    x = torch.randn(2, 312, 64)  # batch, (8*39), features
-    out = unmerge(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 8, 39, 64])\n")
-    
-    # Test TemporalMerge
-    print("5. TemporalMerge")
-    temp_merge = TemporalMerge(encoder_dim=64)
-    x = torch.randn(2, 8, 39, 64)  # batch, time, tracks, features
-    out = temp_merge(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 8, 39, 64])\n")
-    
-    # Test compute_deltas
-    print("6. compute_deltas")
-    x = torch.randn(2, 8, 39, 2)
-    deltas = compute_deltas(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {deltas.shape} (expected: [2, 8, 39, 2])\n")
-    
-    # Test compute_deltas_across_frames
-    print("7. compute_deltas_across_frames")
-    centroids = torch.randn(2, 8, 39, 2)
-    deltas = compute_deltas_across_frames(centroids)
-    print(f"   Input: {centroids.shape}")
-    print(f"   Output: {deltas.shape} (expected: [2, 7, 39, 39, 2])\n")
-    
-    print("✅ All tests passed!")
+
+
+# Shape checks for these modules live in tests/test_l1_model.py. They used to sit in
+# a `__main__` block here, which nothing ran and which had gone stale: it constructed
+# modules with arguments they no longer take. Divergence 64.

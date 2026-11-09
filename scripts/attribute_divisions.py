@@ -194,7 +194,7 @@ def main(argv=None):
     all_records, movie_stats = [], []
     for movie in movies:
         end = int(end_frames[movie])
-        tracker = CellTracker(checkpoint_dir=args.checkpoint, device='cpu', mpp=float(mpps[movie]),
+        tracker = CellTracker(checkpoint_path=args.checkpoint, device='cpu', mpp=float(mpps[movie]),
                               division=args.division, birth=0.999, death=0.999, track_length=8,
                               distance_threshold=DISTANCE_THRESHOLD, verbose=False)
         records, stats = attribute_movie(tracker, z['X'][movie, :end], z['y'][movie, :end],

@@ -233,60 +233,30 @@ def weighted_categorical_crossentropy_v2(
         
     return - (y_true * torch.log(y_pred) * class_weights)
 
-def normalize_adjacency_symmetric(
-    adj: torch.Tensor,
-    add_self_loops: bool = True,
-    eps: float = 1e-12
-) -> torch.Tensor:
-    """Symmetric normalization: D^(-1/2) @ A @ D^(-1/2)
-    
-    This is the most common normalization for GCNs (Kipf & Welling, 2017).
-    Results in normalized adjacency where each edge is weighted by the inverse
-    square root of the product of node degrees.
-    
-    Formula: Ã = D^(-1/2) @ A @ D^(-1/2)
-    where D is the degree matrix and A is the adjacency matrix.
-    
+def add_self_loops_dense(adj: torch.Tensor) -> torch.Tensor:
+    """Add a self-loop to every node of a dense adjacency matrix.
+
     Args:
-        adj: Adjacency matrices of shape (B, T, N, N)
-        add_self_loops: If True, adds self-connections before normalization
-        eps: Small constant to avoid division by zero
-    
+        adj: Adjacency matrices of shape (B*T, N, N).
+
     Returns:
-        Normalized adjacency matrices of shape (B, T, N, N)
-    
-    Example:
-        >>> adj = torch.rand(2, 8, 39, 39) > 0.5
-        >>> adj = adj.float()
-        >>> adj_norm = normalize_adjacency_symmetric(adj)
+        The same matrices with a non-zero diagonal, shape (B*T, N, N).
+
+    This replaced `normalize_adjacency_symmetric`, which computed a full
+    `D^-1/2 A D^-1/2` that the only caller then discarded: `NeighborhoodEncoder`
+    converts the result to an edge list with `.nonzero()`, which keeps the sparsity
+    pattern and throws away every weight. The sole surviving effect of that function was
+    its `add_self_loops=True`, which is what this does directly. Divergence 60.
+
+    The graph layers are configured with `add_self_loops=False`, so these are the only
+    self-loops in the model. Removing this step would isolate every node, not just the
+    padding slots. Whether a *padding* slot should carry one is a separate question that
+    `correct-model-normalization` answers, because changing it moves the BatchNorm
+    statistics of divergence 34.
     """
     with torch.no_grad():
-
-        if adj.ndim == 3:
-            T, N, _ = adj.shape
-        if adj.ndim == 4:
-            # batched
-            B, T, N, _ = adj.shape
-        
-        # Add self-loops: A + I
-        if add_self_loops:
-            identity = torch.eye(N, device=adj.device, dtype=adj.dtype)
-            identity = identity.view(1, N, N).expand(T, N, N)
-            adj = adj + identity
-        
-        # Compute degree matrix: D[i,i] = sum_j A[i,j]
-        degree = adj.sum(dim=-1)  # (B, T, N)
-        
-        # D^(-1/2)
-        degree_inv_sqrt = degree.pow(-0.5)
-        degree_inv_sqrt[degree_inv_sqrt == float('inf')] = 0.0
-        degree_inv_sqrt = torch.clamp(degree_inv_sqrt, min=0.0, max=1e10)
-        
-        # Create diagonal matrix from degree^(-1/2)
-        # D^(-1/2) @ A @ D^(-1/2)
-        adj_norm = degree_inv_sqrt.unsqueeze(-1) * adj * degree_inv_sqrt.unsqueeze(-2)
-        
-        return adj_norm
+        identity = torch.eye(adj.shape[-1], device=adj.device, dtype=adj.dtype)
+        return adj + identity
 
 def is_valid_lineage(y, lineage):
     """Check if a cell lineage of a single movie is valid.
@@ -772,7 +742,6 @@ class MetricsTracker:
     
     def __init__(self):
         self.reset()
-        self.pad_value = -1
     
     def reset(self):
         self.total_loss = 0.0

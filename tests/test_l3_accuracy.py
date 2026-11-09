@@ -176,7 +176,7 @@ def test_attribution_agrees_with_the_metric_on_real_movies(pinned_weights, datas
 
     movie = 0   # one movie keeps this affordable on CPU; the script checks every movie
     end = int(ends[movie])
-    tracker = CellTracker(checkpoint_dir=pinned_weights, device="cpu", mpp=float(mpps[movie]),
+    tracker = CellTracker(checkpoint_path=pinned_weights, device="cpu", mpp=float(mpps[movie]),
                           division=0.5, birth=0.999, death=0.999, track_length=8,
                           distance_threshold=DISTANCE_THRESHOLD, verbose=False)
     records, stats = attr.attribute_movie(tracker, z["X"][movie, :end], z["y"][movie, :end],

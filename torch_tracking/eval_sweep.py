@@ -86,7 +86,7 @@ def sweep(
             end_frame = end_frames[batch]
 
             tracker = CellTracker(
-                checkpoint_dir=checkpoint_path,
+                checkpoint_path=checkpoint_path,
                 device=device,
                 mpp=float(mpps[batch]),
                 division=div_thresh,

@@ -16,13 +16,15 @@ class TrackingDecoder(nn.Module):
     
     Args:
         embedding_dim (int): Dimension of embedding features
-        encoder_dim (int): Dimension of delta/position features
         n_filters (int): Number of hidden units in intermediate layers
         n_classes (int): Number of output classes (default: 3)
             - Class 0: No link, different cell
             - Class 1: Same cell
             - Class 2: Daughter cell
         norm_layer (str): 'batch' or 'layer' normalization
+        dropout (float): Dropout probability applied before the output layer
+        encoder_dim (int): Dimension of the delta/position features. Defaults to
+            `embedding_dim`, which is what the model passes
     """
     def __init__(
         self,
@@ -30,15 +32,20 @@ class TrackingDecoder(nn.Module):
         n_filters=64,
         n_classes=3,
         norm_layer='batch',
-        dropout=0.1
+        dropout=0.1,
+        encoder_dim=None
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.encoder_dim = embedding_dim if encoder_dim is None else encoder_dim
         self.n_filters = n_filters
         self.n_classes = n_classes
-        
-        # Input dimension: concatenated embeddings (2x) + deltas (2x)
-        input_dim = 4 * self.embedding_dim
+
+        # The decoder is handed a pairwise embedding comparison (two embeddings wide) and
+        # a pairwise delta (two delta encodings wide), concatenated. It used to size
+        # itself as `4 * embedding_dim`, which silently assumed the delta encoders were
+        # as wide as the embeddings. Divergence 69, same defect as NeighborhoodEncoder's.
+        input_dim = 2 * self.embedding_dim + 2 * self.encoder_dim
         
         # First dense layer
         self.dense1 = nn.Linear(input_dim, n_filters)
@@ -107,65 +114,8 @@ class TrackingDecoder(nn.Module):
 
 
 # Example usage and tests
-if __name__ == "__main__":
-    print("Testing tracking decoder modules...\n")
-    
-    # Test basic TrackingDecoder
-    print("1. TrackingDecoder (basic)")
-    decoder = TrackingDecoder(
-        embedding_dim=64,
-        encoder_dim=64,
-        n_filters=64,
-        n_classes=3
-    )
-    
-    # Create sample inputs
-    # Shape: (batch, time-1, tracks_current, tracks_future, features)
-    embedding_comp = torch.randn(2, 7, 39, 39, 128)  # 2*64
-    deltas = torch.randn(2, 7, 39, 39, 128)  # 2*64
-    
-    # Forward pass with softmax (inference mode)
-    output = decoder(embedding_comp, deltas, apply_softmax=True)
-    print(f"   Embedding comparison: {embedding_comp.shape}")
-    print(f"   Deltas: {deltas.shape}")
-    print(f"   Output: {output.shape}")
-    print(f"   Expected: (2, 7, 39, 39, 3)")
-    print(f"   Output sum along class dim: {output[0, 0, 0, 0].sum():.4f} (should be ~1.0)")
-    print()
-    
-    # Test without softmax (training mode)
-    logits = decoder(embedding_comp, deltas, apply_softmax=False)
-    print(f"   Logits (no softmax): {logits.shape}")
-    print(f"   Logits range: [{logits.min():.2f}, {logits.max():.2f}]")
-    print()
-    
-    # Test with different batch sizes
-    print("3. Testing different input sizes")
-    embedding_comp_small = torch.randn(1, 3, 10, 15, 128)
-    deltas_small = torch.randn(1, 3, 10, 15, 128)
-    output_small = decoder(embedding_comp_small, deltas_small)
-    print(f"   Small input: {embedding_comp_small.shape} -> {output_small.shape}")
-    print()
-    
-    # Demonstrate usage with loss function
-    print("4. Example training setup")
-    print("   For training, use apply_softmax=False and CrossEntropyLoss:")
-    print("   ")
-    print("   # Get logits")
-    print("   logits = decoder(embeddings, deltas, apply_softmax=False)")
-    print("   ")
-    print("   # Reshape for loss: (B, T, X, Y, C) -> (B*T*X*Y, C)")
-    print("   logits_flat = logits.reshape(-1, n_classes)")
-    print("   targets_flat = targets.reshape(-1)  # (B*T*X*Y)")
-    print("   ")
-    print("   # Compute loss")
-    print("   criterion = nn.CrossEntropyLoss()")
-    print("   loss = criterion(logits_flat, targets_flat)")
-    print()
-    
-    print("✅ All decoder tests passed!")
-    
-    # Show parameter count
-    total_params = sum(p.numel() for p in decoder.parameters())
-    print(f"\nTotal parameters in basic decoder: {total_params:,}")
-    
+
+
+# Shape checks for these modules live in tests/test_l1_model.py. They used to sit in
+# a `__main__` block here, which nothing ran and which had gone stale: it constructed
+# modules with arguments they no longer take. Divergence 64.

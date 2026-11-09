@@ -202,7 +202,7 @@ def evaluate(
         # and evaluation order cannot affect any movie's result.
         # It is given the movie's declared resolution, so it is rescaled to MODEL_MPP.
         tracker = CellTracker(
-            checkpoint_dir=checkpoint_path,
+            checkpoint_path=checkpoint_path,
             device=device,
             mpp=float(mpps[batch]),
             division=division,

@@ -17,7 +17,8 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 UNTRAINED_CHECKPOINT = DATA_DIR / "random_init_seed0.pt"
 
 #: The architecture CellTracker hardcodes. A checkpoint trained with other
-#: hyperparameters cannot be loaded into it; `tracking-model` specifies this coupling.
+#: hyperparameters cannot be loaded into it; the `tracking-model` spec requires that
+#: the tracker and this record agree.
 MODEL_ARCH = {
     "graph_layer": "gat",
     "data_format": "channels_last",
@@ -98,7 +99,7 @@ def tracked_synthetic(untrained_checkpoint, synthetic_movie, device):
     from torch_tracking.tracker import CellTracker
 
     tracker = CellTracker(
-        checkpoint_dir=str(untrained_checkpoint),
+        checkpoint_path=str(untrained_checkpoint),
         device=device,
         verbose=False,
         **BASELINE_INFERENCE_PARAMS,

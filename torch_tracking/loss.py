@@ -61,7 +61,6 @@ class TrackingLoss(nn.Module):
 
         self.loss = loss
         self.gamma = gamma
-        self.pad_value = -1
         self.class_weights = class_weights
 
     def forward(self, predictions, targets, label_smoothing=0.0):
