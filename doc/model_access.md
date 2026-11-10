@@ -56,3 +56,46 @@ Specific model versions can be downloaded with the [huggingface CLI][hf-cli].
 
 [hf-versions]: https://huggingface.co/vanvalenlab/torch-tracking/tree/main
 [hf-cli]: https://huggingface.co/docs/huggingface_hub/en/guides/cli
+
+Datasets
+--------
+
+```{warning}
+**There is currently no route for a new user to obtain the
+`DynamicNuclearNet-tracking` dataset.**
+
+Model weights have completed the move to huggingface; the datasets have not.
+As of 2026-11-04:
+
+- The `vanvalenlab` huggingface organization publishes models but
+  [no public datasets][vvhf].
+- The `users.deepcell.org` access portal, which previously issued the API keys
+  that `deepcell.datasets` used to fetch DynamicNuclearNet, was deprecated in
+  10-2026 and **has since been removed**.
+
+This affects anyone who wants to train the model, reproduce the published
+accuracy figures, or run the dataset-dependent test layer. Those tasks are
+currently possible only for people who already hold a local copy of the data.
+Existing copies live under `~/.deepcell/tracking/`.
+
+This gap is documented rather than worked around. If you need the dataset,
+contact the Van Valen Lab directly.
+```
+
+Note that `DynamicNuclearNet-tracking` (the tracking dataset, used here) is
+distinct from `DynamicNuclearNet` (a nuclear segmentation model, which this
+package does not use) and from `DynamicNuclearNet-segmentation` (the
+segmentation dataset, also unused). See `metrics/PROVENANCE.md` for how these names relate.
+
+Legacy `deepcell-auth`
+----------------------
+
+`requirements.txt` still lists `deepcell_auth`, from the era when weights were
+fetched through the DeepCell portal. **It is no longer reached by any code
+path**: nothing under `torch_tracking/` imports it, and `CellTracker` can be
+constructed and used with the module blocked from import entirely (verified
+2026-11-04).
+
+It is retained for now because the auth migration is still in flight. It should
+be removed once the dataset side of the migration lands and nothing depends on
+it.

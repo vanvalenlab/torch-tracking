@@ -12,8 +12,10 @@ class ImageNormalization2D(nn.Module):
         norm_method (str): Normalization method to use, one of:
             "std", "max", "whole_image", None.
         filter_size (int): The length of the convolution window (not used in current impl).
-        data_format (str): 'channels_first' or 'channels_last'.
-            PyTorch default is 'channels_first'.
+        data_format (str): The layout of the input, 'channels_first' (B, C, H, W) or
+            'channels_last' (B, H, W, C). Normalization is taken over the two spatial
+            axes of whichever layout is declared, so the declaration has to be true.
+            Anything else raises.
     """
     def __init__(
         self,
@@ -29,10 +31,16 @@ class ImageNormalization2D(nn.Module):
         
         self.norm_method = norm_method.lower() if isinstance(norm_method, str) else norm_method
         self.filter_size = filter_size
-        self.data_format = 'channels_first'
-        
-        # Channel axis: 1 for channels_first, -1 for channels_last
-        self.channel_axis = 1 if data_format == 'channels_first' else -1
+
+        # Store the caller's data_format: normalizing a channels_last crop with
+        # channels_first axes would normalize one image row at a time instead of over
+        # the crop's spatial extent.
+        supported = ('channels_first', 'channels_last')
+        if data_format not in supported:
+            raise ValueError(
+                f'Invalid `data_format`: {data_format!r}. Use one of {supported}.'
+            )
+        self.data_format = data_format
 
     def forward(self, x):
         """Apply normalization to input tensor."""
@@ -143,7 +151,8 @@ class Unmerge(nn.Module):
 class TemporalMerge(nn.Module):
     """Layer for merging the time dimension of a Tensor using LSTM.
     
-    Processes temporal sequences at each spatial location independently.
+    Runs one LSTM sequence per (batch entry, track), over that track's frames in time
+    order. A track's output depends only on its own frames - never on another slot.
     Initialized to match Keras LSTM defaults:
         - Glorot Uniform for input weights
         - Orthogonal for recurrent weights
@@ -191,16 +200,20 @@ class TemporalMerge(nn.Module):
         # x shape: (batch, time, tracks, encoder_dim)
         batch_size, time_steps, num_tracks, features = x.shape
         
-        # Reshape to process all tracks independently
-        # (B, T, N, F) -> (B*N, T, F)
-        x = x.reshape(batch_size * num_tracks, time_steps, features)
+        # One LSTM sequence per (batch entry, track): the track axis must come in front
+        # of the time axis *before* the reshape. Reshaping (B, T, N, F) directly reads T
+        # consecutive memory rows, which are T different tracks of one frame, so the LSTM
+        # would carry state from one slot to the next and a track's output would depend
+        # on how many other slots the batch held.
+        # (B, T, N, F) -> (B, N, T, F) -> (B*N, T, F)
+        x = x.permute(0, 2, 1, 3).reshape(batch_size * num_tracks, time_steps, features)
         
         # Apply LSTM
         x, _ = self.lstm(x)
         
-        # Reshape back
-        # (B*N, T, F) -> (B, T, N, F)
-        x = x.reshape(batch_size, time_steps, num_tracks, self.encoder_dim)
+        # Restore the layout
+        # (B*N, T, F) -> (B, N, T, F) -> (B, T, N, F)
+        x = x.reshape(batch_size, num_tracks, time_steps, self.encoder_dim).permute(0, 2, 1, 3)
         
         return x
 
@@ -247,66 +260,3 @@ def compute_deltas_across_frames(centroids):
     deltas = centroid_future - centroid_current  # (B, T-1, N, N, 2)
     
     return deltas
-
-
-# Example usage and tests
-if __name__ == "__main__":
-    print("Testing custom PyTorch layers...\n")
-    
-    # Test ImageNormalization2D
-    print("1. ImageNormalization2D")
-    img_norm = ImageNormalization2D(norm_method='whole_image')
-    x = torch.randn(2, 3, 32, 32)
-    out = img_norm(x)
-    print(f"   Input: {x.shape}, Output: {out.shape}")
-    print(f"   Output mean: {out.mean():.4f}, std: {out.std():.4f}\n")
-    
-    # Test Comparison
-    print("2. Comparison")
-    comp = Comparison()
-    x = torch.randn(2, 4, 5, 64)  # batch, time, tracks_x, features
-    y = torch.randn(2, 4, 3, 64)  # batch, time, tracks_y, features
-    out = comp(x, y)
-    print(f"   x: {x.shape}, y: {y.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 4, 5, 3, 128])\n")
-    
-    # Test DeltaReshape
-    print("3. DeltaReshape")
-    delta_reshape = DeltaReshape()
-    current = torch.randn(2, 4, 5, 64)
-    future = torch.randn(2, 4, 3, 64)
-    out = delta_reshape(current, future)
-    print(f"   Current: {current.shape}, Future: {future.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 4, 5, 3, 64])\n")
-    
-    # Test Unmerge
-    print("4. Unmerge")
-    unmerge = Unmerge(track_length=8, max_cells=39, embedding_dim=64)
-    x = torch.randn(2, 312, 64)  # batch, (8*39), features
-    out = unmerge(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 8, 39, 64])\n")
-    
-    # Test TemporalMerge
-    print("5. TemporalMerge")
-    temp_merge = TemporalMerge(encoder_dim=64)
-    x = torch.randn(2, 8, 39, 64)  # batch, time, tracks, features
-    out = temp_merge(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {out.shape} (expected: [2, 8, 39, 64])\n")
-    
-    # Test compute_deltas
-    print("6. compute_deltas")
-    x = torch.randn(2, 8, 39, 2)
-    deltas = compute_deltas(x)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {deltas.shape} (expected: [2, 8, 39, 2])\n")
-    
-    # Test compute_deltas_across_frames
-    print("7. compute_deltas_across_frames")
-    centroids = torch.randn(2, 8, 39, 2)
-    deltas = compute_deltas_across_frames(centroids)
-    print(f"   Input: {centroids.shape}")
-    print(f"   Output: {deltas.shape} (expected: [2, 7, 39, 39, 2])\n")
-    
-    print("✅ All tests passed!")

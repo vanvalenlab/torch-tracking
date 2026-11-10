@@ -1,5 +1,5 @@
 import torch
-from torch_tracking.utils import weighted_categorical_crossentropy_v2
+from torch_tracking.utils import check_choice
 from torch import nn
 from torch.nn import functional as F
 
@@ -22,17 +22,45 @@ def multiclass_focal_loss(probs, targets_one_hot, gamma=2.0):
     return modulator * ce
 
 
+LOSSES = ('wcce', 'focal', 'focal_wcce')
+
+#: Loss modes that apply `class_weights`. `focal` does not, and refuses them.
+WEIGHTED_LOSSES = ('wcce', 'focal_wcce')
+
+
 class TrackingLoss(nn.Module):
+    """Classification loss over the track-by-cell score grid.
+
+    The loss takes the logarithm of its input, so it requires **probabilities** (a softmax
+    over the three classes), never logits. `GNNTrackingModel.training_forward` returns
+    probabilities by default for exactly this reason.
+
+    Args:
+        loss: one of `LOSSES`.
+        gamma: focusing parameter for the focal modes. Unrelated to any learning-rate
+            schedule; the step schedule has its own `step_gamma`.
+        class_weights: per-class weights, in the model's `[different, same, mitosis]`
+            class order. Applied by `wcce` and `focal_wcce`; `focal` has no use for them
+            and raises rather than accepting and discarding them.
+
+    The returned loss is on the per-entry scale: the weighted cross-entropy summed over the
+    classes and averaged over the graded entries. It is not also averaged over the class
+    axis. Losses recorded by earlier versions of this package, which also averaged over the
+    class axis, are one third of this figure.
+    """
 
     def __init__(self, loss='wcce', gamma=2.0, class_weights = None):
         super().__init__()
 
-        assert loss in ('wcce', 'focal', 'focal_wcce'), \
-            f"loss must be 'wcce', 'focal', or 'focal_wcce', got '{loss}'"
+        check_choice('loss', loss, LOSSES)
+        if loss not in WEIGHTED_LOSSES and class_weights is not None:
+            raise ValueError(
+                f"loss {loss!r} does not apply class_weights; pass class_weights=None, "
+                f"or use one of {', '.join(WEIGHTED_LOSSES)}"
+            )
 
         self.loss = loss
         self.gamma = gamma
-        self.pad_value = -1
         self.class_weights = class_weights
 
     def forward(self, predictions, targets, label_smoothing=0.0):
@@ -94,4 +122,5 @@ class TrackingLoss(nn.Module):
             modulator = (1.0 - p_t) ** self.gamma                         # (K, 1)
             loss = modulator * ce                                           # (K, C)
 
-        return loss.mean()
+        # Per-entry scale: sum over the class axis, mean over graded entries.
+        return loss.sum(dim=-1).mean()

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv, GATConv
 from torch_geometric.data import Data, Batch
-from torch_tracking.utils import normalize_adjacency_symmetric
+from torch_tracking.utils import add_self_loops_dense, masked_apply, real_cell_mask
 
 # Import custom layers (assumes they're in the same directory)
 from torch_tracking.layers import ImageNormalization2D
@@ -18,12 +18,13 @@ class AppearanceEncoder(nn.Module):
     - Input shape is (B*T, N, H, W, C)
     - Conv3D treats N as "time" dimension but with kernel_size=1 (no mixing between cells)
     - This is semantically correct: cells are a separate dimension, not part of batch
+    - Every BatchNorm here pools over all the cells it is given, so `NeighborhoodEncoder`
+      gives it real cells only, never padding slots (see `encode_real_cells`)
     
     Args:
         appearance_shape (tuple): Shape of appearance input (H, W, C)
         n_filters (int): Number of convolutional filters
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
         appearance_norm (bool): Whether to apply input normalization
         data_format (str): 'channels_first' or 'channels_last'
     """
@@ -32,9 +33,8 @@ class AppearanceEncoder(nn.Module):
         appearance_shape=(32, 32, 1),
         n_filters=64,
         encoder_dim=64,
-        norm_layer='batch',
         appearance_norm=True,
-        data_format='channels_first',
+        data_format='channels_last',
         dropout = 0.1
     ):
         super().__init__()
@@ -158,9 +158,8 @@ class MorphologyEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of morphology features (default: 3)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=3, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=3, encoder_dim=64):
         super().__init__()
         self.encoder_dim = encoder_dim
         
@@ -186,7 +185,8 @@ class MorphologyEncoder(nn.Module):
         # Apply conv: (B*T, 3, N) -> (B*T, encoder_dim, N)
         x = self.conv(x)
         
-        # BatchNorm1d normalizes across (B*T, N) for each channel
+        # BatchNorm1d normalizes across the cells it is handed for each channel. The
+        # caller (`encode_real_cells`) hands it real cells only, one per row.
         x = self.norm(x)
         x = self.activation(x)
         
@@ -210,9 +210,8 @@ class CentroidEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of centroid features (default: 2 for x,y)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch'):
+    def __init__(self, input_dim=2, encoder_dim=64):
         super().__init__()
         self.encoder_dim = encoder_dim
         
@@ -238,7 +237,8 @@ class CentroidEncoder(nn.Module):
         # Apply conv: (B*T, 2, N) -> (B*T, encoder_dim, N)
         x = self.conv(x)
         
-        # BatchNorm1d normalizes across (B*T, N) for each channel
+        # BatchNorm1d normalizes across the cells it is handed for each channel. The
+        # caller (`encode_real_cells`) hands it real cells only, one per row.
         x = self.norm(x)
         x = self.activation(x)
         
@@ -257,22 +257,25 @@ class DeltaEncoder(nn.Module):
     Args:
         input_dim (int): Dimension of delta features (default: 2)
         encoder_dim (int): Output feature dimension
-        norm_layer (str): 'batch' or 'layer' normalization
     """
-    def __init__(self, input_dim=2, encoder_dim=64, norm_layer='batch', dropout=0.1):
+    def __init__(self, input_dim=2, encoder_dim=64, dropout=0.1):
         super().__init__()
         self.dense = nn.Linear(input_dim, encoder_dim)
         self.activation = nn.ReLU()
-        self.norm_layer_type = norm_layer
         self.norm = nn.BatchNorm1d(encoder_dim)
         self.dropout = nn.Dropout(dropout)
 
 
-    def forward(self, x):
+    def forward(self, x, is_real=None):
         """
         Args:
             x: Tensor of shape (batch, time, tracks, input_dim) 
                or (batch, time, tracks_1, tracks_2, input_dim)
+            is_real: Optional boolean mask of ``x``'s shape without its last axis, ``True``
+               where the delta joins real cells (see ``utils.pair_masks``). The
+               normalization takes its statistics over those entries only. ``None``
+               means every entry is real, which is what the inference branch passes: it
+               has already stripped padding.
         
         Returns:
             Tensor of same shape but with encoder_dim in last dimension
@@ -287,20 +290,50 @@ class DeltaEncoder(nn.Module):
         new_shape = list(original_shape[:-1]) + [x.shape[-1]]
         x = x.view(new_shape)
         
-        # Apply normalization - LayerNorm is easier for variable shapes
-
-        if self.norm_layer_type == 'batch':
-            # Flatten for BatchNorm1d: needs (N, C) or (N, C, L)
+        # BatchNorm1d needs (N, C), and the input is rank 4 or rank 5
+        if is_real is None:
             x_flat = x.reshape(-1, x.shape[-1])
             x_flat = self.norm(x_flat)
             x = x_flat.view(new_shape)
         else:
-            x = self.norm(x)
-                
+            x = masked_apply(self.norm, x, is_real)
+
         x = self.dropout(x)
         x = self.activation(x)
 
         return x
+
+
+def encode_real_cells(encoder, x, is_real):
+    """Run a per-cell encoder on the real cells of ``x`` and scatter back.
+
+    ``x`` is ``(B*T, N, ...)`` and ``is_real`` its ``(B*T, N)`` mask. The real cells are
+    gathered into ``(R, 1, ...)`` - one cell per pseudo-batch row - so every normalization
+    inside the encoder pools over real cells only, then the result is placed back into a
+    zero ``(B*T, N, dim)``. Padding rows come out exactly zero.
+
+    This masks every BatchNorm in the three per-cell encoders at once with no change to
+    their internals, which is possible because nothing else inside them mixes cells: their
+    convolutions use a kernel of one along the cell axis. ``BatchNorm3d`` over
+    ``(R, C, 1, H, W)`` gives the same statistic as over ``(B*T, C, N, H, W)`` on the same
+    values.
+
+    As in ``masked_apply``, no real cell gives all zeros without calling the encoder, and in
+    train mode a lone real cell falls back to the full tensor, because a normalization
+    layer cannot take its statistics from a single row.
+    """
+    bt, n = is_real.shape
+    n_real = int(is_real.sum())
+
+    if n_real == 0:
+        return x.new_zeros(bt, n, encoder.encoder_dim)
+    if encoder.training and n_real < 2:
+        return encoder(x) * is_real.unsqueeze(-1)
+
+    out = encoder(x[is_real].unsqueeze(1)).squeeze(1)
+    full = out.new_zeros(bt, n, out.shape[-1])
+    full[is_real] = out
+    return full
 
 
 class NeighborhoodEncoder(nn.Module):
@@ -339,10 +372,16 @@ class NeighborhoodEncoder(nn.Module):
         self.embedding_dim = embedding_dim
         self.n_layers = n_layers
         
-        # Initial feature combination
-        # Concatenate all encoders' outputs
-        combined_dim = (3 * self.embedding_dim)
-                
+        # Initial feature combination: the three encoders' outputs are concatenated, so
+        # the width is their actual widths summed (not `3 * embedding_dim`, which is only
+        # right while all four numbers coincide). The final layer below is sized the
+        # same way.
+        combined_dim = (
+            appearance_encoder.encoder_dim
+            + morphology_encoder.encoder_dim
+            + centroid_encoder.encoder_dim
+        )
+
         self.initial_dense = nn.Linear(combined_dim, n_filters)
         self.initial_norm = nn.BatchNorm1d(n_filters) if norm_layer == 'batch' else nn.LayerNorm(n_filters)
         self.initial_activation = nn.ReLU()
@@ -405,6 +444,13 @@ class NeighborhoodEncoder(nn.Module):
         
             return out
 
+    @staticmethod
+    def _normalize(norm, node_features, is_real):
+        """Normalize ``(B*T, N, C)`` node features over real cells only."""
+        if isinstance(norm, nn.BatchNorm1d):
+            return masked_apply(norm, node_features, is_real)
+        return norm(node_features)
+
     def forward(self, appearance, morphology, centroids, adj_matrix):
         """
 
@@ -423,16 +469,17 @@ class NeighborhoodEncoder(nn.Module):
         """
 
         BT, N, _ = adj_matrix.shape  # (B*T, max_cells, max_cells)
-        adj_matrix = normalize_adjacency_symmetric(adj_matrix)
+        # `_apply_batched_gnn` converts this to an edge list with `.nonzero()`, so only
+        # the sparsity pattern survives, so no edge weighting is computed here. Self-loops
+        # are added explicitly, to real cells only; a padding slot is left with no edges.
+        is_real = real_cell_mask(morphology)  # (B*T, N)
+        adj_matrix = add_self_loops_dense(adj_matrix, is_real)
 
-        # Encode each feature type
-        app_features = self.appearance_encoder(appearance)  # (B * T *  N, encoder_dim)
-        morph_features = self.morphology_encoder(morphology)  # (B * T * N, encoder_dim)
-        centroid_features = self.centroid_encoder(centroids)  # (B * T * N, encoder_dim)
-
-        app_features = app_features.view(BT, N, -1)
-        morph_features = morph_features.view(BT, N, -1)
-        centroid_features = centroid_features.view(BT, N, -1)
+        # Encode each feature type on the real cells only, so no padding slot reaches a
+        # normalization layer.
+        app_features = encode_real_cells(self.appearance_encoder, appearance, is_real)
+        morph_features = encode_real_cells(self.morphology_encoder, morphology, is_real)
+        centroid_features = encode_real_cells(self.centroid_encoder, centroids, is_real)
 
         # Concatenate features
         node_features = torch.cat([app_features, morph_features, centroid_features], dim=-1)
@@ -440,18 +487,10 @@ class NeighborhoodEncoder(nn.Module):
         # Initial dense layer
         node_features = self.initial_dense(node_features)
 
-
-        if isinstance(self.initial_norm, nn.BatchNorm1d):
-            node_features = node_features.permute(0, 2, 1)
-            node_features = self.initial_norm(node_features)
-            node_features = node_features.permute(0, 2, 1)
-        else:
-            node_features = self.initial_norm(node_features)
-        
+        node_features = self._normalize(self.initial_norm, node_features, is_real)
         node_features = self.initial_activation(node_features)
 
         # For each graph in the batch, apply GNN
-
         for gnn_layer, norm, activation in zip(
             self.graph_layers, self.graph_norms, self.graph_activations
         ):
@@ -460,66 +499,16 @@ class NeighborhoodEncoder(nn.Module):
                 gnn_layer, node_features, adj_matrix
             )
 
-            node_features = node_features.permute(0,2,1)
-            node_features = norm(node_features)
-            node_features = node_features.permute(0,2,1)
+            node_features = self._normalize(norm, node_features, is_real)
             node_features = activation(node_features)
             node_features = self.dropout(node_features)
 
-        
         # Final concatenation and dense layer
         node_features = torch.cat([app_features, morph_features, node_features], dim=-1)
-        
+
         node_features = self.final_dense(node_features)
-        
-        if isinstance(self.final_norm, nn.BatchNorm1d):
-            node_features = node_features.permute(0, 2, 1)
-            node_features = self.final_norm(node_features)
-            node_features = node_features.permute(0, 2, 1)
-        else:
-            node_features = self.final_norm(node_features)
-        
+        node_features = self._normalize(self.final_norm, node_features, is_real)
         node_features = self.final_activation(node_features)
         centroids = centroids.view(BT, N, -1)
         
         return node_features, centroids
-
-
-# Example usage and tests
-if __name__ == "__main__":
-    print("Testing encoder modules...\n")
-
-    max_cells = 39
-    batch_size = 2
-    n_frames = 8
-
-    app_encoder = AppearanceEncoder(appearance_shape=(1, 32, 32))
-    app_in = torch.randn(batch_size * n_frames * max_cells, 1, 32, 32)  # channels_last: (B * T * N, C, H, W)
-
-    morph_encoder = MorphologyEncoder(input_dim=3, encoder_dim=64)
-    morph_in = torch.randn(batch_size * n_frames * max_cells, 3)
-
-
-    cent_encoder = CentroidEncoder(input_dim=2, encoder_dim=64)
-    cent_in = torch.randn(batch_size * n_frames * max_cells, 2)
-
-
-    # Test NeighborhoodEncoder
-    adj_matrix = torch.randn(batch_size * n_frames, max_cells, max_cells)
-    n_encoder = NeighborhoodEncoder(appearance_encoder=app_encoder,
-                                    morphology_encoder=morph_encoder,
-                                    centroid_encoder=cent_encoder, graph_layer='gat'
-                                    )
-    
-    neighborhood = n_encoder(app_in, morph_in, cent_in, adj_matrix)
-
-    print(f"   Output: {neighborhood[0].shape, neighborhood[1].shape}\n")
-    
-    # Test DeltaEncoder
-    print("4. DeltaEncoder")
-    delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
-    x = torch.randn(16, max_cells, 2)
-    out = delta_encoder(x)
-    print(f"   Input: {x.shape}, Output: {out.shape}\n")
-    
-    print("✅ Basic encoder tests passed!")

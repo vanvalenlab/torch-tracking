@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch_tracking.utils import masked_apply
+
 
 class TrackingDecoder(nn.Module):
     """Decoder that predicts tracking associations between frames.
@@ -16,13 +18,15 @@ class TrackingDecoder(nn.Module):
     
     Args:
         embedding_dim (int): Dimension of embedding features
-        encoder_dim (int): Dimension of delta/position features
         n_filters (int): Number of hidden units in intermediate layers
         n_classes (int): Number of output classes (default: 3)
             - Class 0: No link, different cell
             - Class 1: Same cell
             - Class 2: Daughter cell
         norm_layer (str): 'batch' or 'layer' normalization
+        dropout (float): Dropout probability applied before the output layer
+        encoder_dim (int): Dimension of the delta/position features. Defaults to
+            `embedding_dim`, which is what the model passes
     """
     def __init__(
         self,
@@ -30,15 +34,20 @@ class TrackingDecoder(nn.Module):
         n_filters=64,
         n_classes=3,
         norm_layer='batch',
-        dropout=0.1
+        dropout=0.1,
+        encoder_dim=None
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.encoder_dim = embedding_dim if encoder_dim is None else encoder_dim
         self.n_filters = n_filters
         self.n_classes = n_classes
-        
-        # Input dimension: concatenated embeddings (2x) + deltas (2x)
-        input_dim = 4 * self.embedding_dim
+
+        # The decoder is handed a pairwise embedding comparison (two embeddings wide) and
+        # a pairwise delta (two delta encodings wide), concatenated. Sizing from both
+        # widths, rather than `4 * embedding_dim`, stays correct when the delta encoders
+        # are not as wide as the embeddings.
+        input_dim = 2 * self.embedding_dim + 2 * self.encoder_dim
         
         # First dense layer
         self.dense1 = nn.Linear(input_dim, n_filters)
@@ -54,7 +63,7 @@ class TrackingDecoder(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, embedding_comparison, deltas, apply_softmax=True):
+    def forward(self, embedding_comparison, deltas, apply_softmax=True, is_real=None):
         """
         Args:
             embedding_comparison: Tensor of shape 
@@ -65,6 +74,12 @@ class TrackingDecoder(nn.Module):
                 Position delta features
             apply_softmax: Whether to apply softmax (True for inference, 
                 False for training with CrossEntropyLoss)
+            is_real: Optional boolean mask ``(batch, time, tracks_current,
+                tracks_future)``, ``True`` where both ends of the pair are real cells. The
+                normalization takes its statistics over those pairs only; a pair with a
+                padding end is never graded, so letting it set the statistics would let
+                padding decide how real pairs are scored. ``None`` means every pair is
+                real, which is the inference branch's case.
         
         Returns:
             Tensor of shape (batch, time, tracks_current, tracks_future, n_classes)
@@ -84,7 +99,10 @@ class TrackingDecoder(nn.Module):
         
         # Apply normalization
         if isinstance(self.norm1, nn.BatchNorm1d):
-            x = self.norm1(x)
+            if is_real is None:
+                x = self.norm1(x)
+            else:
+                x = masked_apply(self.norm1, x, is_real.reshape(-1))
         else:
             # LayerNorm works directly on flattened features
             x = self.norm1(x)
@@ -104,68 +122,3 @@ class TrackingDecoder(nn.Module):
             x = self.softmax(x)
         
         return x
-
-
-# Example usage and tests
-if __name__ == "__main__":
-    print("Testing tracking decoder modules...\n")
-    
-    # Test basic TrackingDecoder
-    print("1. TrackingDecoder (basic)")
-    decoder = TrackingDecoder(
-        embedding_dim=64,
-        encoder_dim=64,
-        n_filters=64,
-        n_classes=3
-    )
-    
-    # Create sample inputs
-    # Shape: (batch, time-1, tracks_current, tracks_future, features)
-    embedding_comp = torch.randn(2, 7, 39, 39, 128)  # 2*64
-    deltas = torch.randn(2, 7, 39, 39, 128)  # 2*64
-    
-    # Forward pass with softmax (inference mode)
-    output = decoder(embedding_comp, deltas, apply_softmax=True)
-    print(f"   Embedding comparison: {embedding_comp.shape}")
-    print(f"   Deltas: {deltas.shape}")
-    print(f"   Output: {output.shape}")
-    print(f"   Expected: (2, 7, 39, 39, 3)")
-    print(f"   Output sum along class dim: {output[0, 0, 0, 0].sum():.4f} (should be ~1.0)")
-    print()
-    
-    # Test without softmax (training mode)
-    logits = decoder(embedding_comp, deltas, apply_softmax=False)
-    print(f"   Logits (no softmax): {logits.shape}")
-    print(f"   Logits range: [{logits.min():.2f}, {logits.max():.2f}]")
-    print()
-    
-    # Test with different batch sizes
-    print("3. Testing different input sizes")
-    embedding_comp_small = torch.randn(1, 3, 10, 15, 128)
-    deltas_small = torch.randn(1, 3, 10, 15, 128)
-    output_small = decoder(embedding_comp_small, deltas_small)
-    print(f"   Small input: {embedding_comp_small.shape} -> {output_small.shape}")
-    print()
-    
-    # Demonstrate usage with loss function
-    print("4. Example training setup")
-    print("   For training, use apply_softmax=False and CrossEntropyLoss:")
-    print("   ")
-    print("   # Get logits")
-    print("   logits = decoder(embeddings, deltas, apply_softmax=False)")
-    print("   ")
-    print("   # Reshape for loss: (B, T, X, Y, C) -> (B*T*X*Y, C)")
-    print("   logits_flat = logits.reshape(-1, n_classes)")
-    print("   targets_flat = targets.reshape(-1)  # (B*T*X*Y)")
-    print("   ")
-    print("   # Compute loss")
-    print("   criterion = nn.CrossEntropyLoss()")
-    print("   loss = criterion(logits_flat, targets_flat)")
-    print()
-    
-    print("✅ All decoder tests passed!")
-    
-    # Show parameter count
-    total_params = sum(p.numel() for p in decoder.parameters())
-    print(f"\nTotal parameters in basic decoder: {total_params:,}")
-    

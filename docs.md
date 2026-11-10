@@ -6,7 +6,7 @@
 
 ### 1.1 Module overview
 
-The `CellTracker` module is the object where all the steps of cell tracking happens. `CellTracker` takes in a time-lapse movie of nuclei to track and their corresponding labeled masks. Features about each object (appearance, morphology, centroid) are extracted: appearance is a 32x32 crop of each nucleus; morphology contains eccentricity, area, and perimeter information; and centroid specifies where in the field of view the cell is located. These features are used to build the embeddings of each cell (a high-dimensional representation of the cells, taking into account their morphology, location, and appearance) using the `CellTracker.get_embeddings()` method. For each frame of the time-lapse, `CellTracker.inference_forward()` will analyze a 7-frame history of the movie and the curent frame. It then returns a prediction of whether a cell and a track are the same, different, or have a mother/daughter cell relationship. The model then assigns tracks to cells using the Hungarian algorithm, which assigns one cell to one track to minimize cost.
+The `CellTracker` module is the object where all the steps of cell tracking happens. `CellTracker` takes in a time-lapse movie of nuclei to track and their corresponding labeled masks. Features about each object (appearance, morphology, centroid) are extracted: appearance is a 32x32 crop of each nucleus; morphology contains eccentricity, area, and perimeter information; and centroid specifies where in the field of view the cell is located. These features are used to build the embeddings of each cell (a high-dimensional representation of the cells, taking into account their morphology, location, and appearance) using the model's `GNNTrackingModel.get_embeddings()` method. For each frame of the time-lapse, `GNNTrackingModel.inference_forward()` will analyze the previous `track_length` frames of each track (8 by default) together with the current frame. It then returns a prediction of whether a cell and a track are different, the same, or have a mother/daughter cell relationship, in that order. The model then assigns tracks to cells using the Hungarian algorithm, which assigns one cell to one track to minimize cost.
 
 After tracking the full time-lapse movie, the `CellTracker` object contains the tracked masks (`CellTracker.y_tracked()`), the original movie (`CellTracker.X`), and the original untracked masks (`CellTracker.y`). In addition, the cell lineage information can be returned in the form of a dictionary with the `CellTracker.get_lineage_dict()` method.
 
@@ -17,14 +17,14 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 - **Purpose**: Validates inputs, rescales data to the model's native resolution, extracts per-frame features (appearance, morphology, centroid, adjacency), and pre-computes GNN embeddings for the full movie before tracking begins
 
 - **Parameters**:
-- `tracking_model`: a `GNNTrackingModel` instance — will be moved to `device` and set to eval mode
-  - `device`: `'cuda'` or `'cpu'`
+  - `checkpoint_path`: path to the checkpoint **file** holding the model weights. The tracker builds its own `GNNTrackingModel` internally — it is not handed one — and loads this file into it, then moves it to `device` and sets eval mode. Omit it to download the published weights to `~/.deepcell/models/`. The former name `checkpoint_dir` is still accepted but deprecated: it never named a directory. Not to be confused with `TrainingConfig.checkpoint_dir`, which is one
+  - `device`: `'cpu'` (the default), `'cuda'`, `'cuda:<N>'` or `'mps'`. CPU by default so that inference needs no GPU
   - `distance_threshold`: pixel radius used to define edges in the adjacency graph — cells farther apart than this are not connected
   - `death`: diagonal cost used in the death sub-matrix of the LAP — higher values make track termination less likely
   - `birth`: diagonal cost used in the birth sub-matrix of the LAP — higher values make new track creation less likely
   - `division`: minimum class-2 (daughter) probability required for a new track to be labelled a division rather than a fresh birth
-  - `track_length`: number of historical frames fed to the `InferenceBranch` LSTM — shorter histories are zero-padded
-  - `mpp`: microns-per-pixel of the input data; the data is rescaled so that `model_mpp / mpp` matches the resolution the model was trained on
+  - `track_length`: number of preceding frames of each track fed to the `InferenceBranch` LSTM — a younger track is padded by repeating its most recent frame. The default of 8 is the window the processed training data is built for, so change the two together
+  - `mpp`: microns-per-pixel of the input data; the data is rescaled by `mpp / model_mpp` (`model_mpp` is 0.55), so each pixel spans the resolution the model was trained on. A movie coarser than the model is enlarged
 
 - **Raises**: `ValueError` for rank != 4, mismatched spatial shapes
 
@@ -121,14 +121,14 @@ After tracking the full time-lapse movie, the `CellTracker` object contains the 
 
 - For each active track, collects the most recent `track_length` frames of the specified feature (embedding or centroid) from `self.tracks`
 - Pads with the last known value if fewer than `track_length` frames are available (e.g. for newly-created tracks)
-- Returns a dict mapping a sequential index (not track ID) to a `(track_length, feature_dim)` array
+- Returns a dict mapping each track's number to a `(track_length, feature_dim)` array. A track with no frame before `before_frame` is absent; the remaining keys still name their own tracks, so a key is never a position in the iteration
 
 ##### `_update_tracks(assignments, frame, predictions)`
 
 - Iterates over the LAP solution row by row:
-  - If `track_idx` maps to an existing track → appends frame, label, embedding, centroid to that track's history and updates `self.y`
-  - If `track_idx` is out of range of existing tracks → a birth occurred; calls `_create_new_track()` and then `_get_parent()` to test for division
-- After processing all assignments, iterates over tracks with daughters and calls the division-correction logic to cap parent tracks and reroute any incorrect post-division assignments into new daughter tracks
+  - Each assignment pairs a cost-matrix row with a cell. Rows below the number of scored tracks are existing tracks, resolved to a track number through `predictions['track_ids']`: the cell's frame, label, embedding and centroid are appended to that track's history
+  - Later rows are birth rows → a birth occurred; calls `_create_new_track()`, which assigns the next track number, and then `_get_parent()` to test for division
+- After processing all assignments, iterates over tracks with daughters and calls the division-correction logic to cap parent tracks and reroute any incorrect post-division assignments into new daughter tracks. A parent may have two or more daughters (multipolar mitosis occurs in the data). If rerouting would remove a track's only frame, it raises rather than leave an empty track
 
 ##### `_get_parent(frame, cell_id, predictions)`
 
@@ -180,163 +180,295 @@ Document the internal schema of a single entry in `self.tracks`:
 
 ### 2.1 Module overview
 
-- Script that loads a test zarr dataset, runs `CellTracker` on each sample, computes `TrackingMetrics`, and aggregates results into a CSV
-- Also contains a visualization utility (`create_timelapse_gif`) for qualitative inspection
+- `torch_tracking.eval` exposes `evaluate()`: loads a split, runs `CellTracker` on each
+  movie, computes `TrackingMetrics`, pools the results and writes a per-movie CSV.
+  Importing the module performs no evaluation.
+- `torch_tracking.eval_sweep` exposes `sweep()`, the same evaluation across a grid of
+  postprocessing thresholds. It imports the frame-extent rule rather than redefining it.
+- Both also provide a `__main__` CLI. Neither reads any path fixed in source.
+- `create_timelapse_gif` remains available for qualitative inspection.
 
 ---
 
 ### 2.2 Functions
 
-#### `build_indices(X)`
+#### `evaluate(checkpoint_path, split_dir, ...)`
 
-- **Purpose**: Determines the last valid (non-empty) frame for each sample in a batched array, to avoid running the tracker on zero-padded frames
-- **Parameters**: `X` — batched label array of shape `(B, T, H, W, C)`
-- **Logic**: sums pixels across spatial and channel dimensions for each frame; the last frame with a non-zero sum is the end frame
-- **Returns**: list of `int`, one per batch entry
+- **Purpose**: evaluate a checkpoint against a ground-truth split
+- **Key parameters**: `checkpoint_path` and `split_dir` are required; `split` (default
+  `'test'`), `output_dir` (default `'metrics'`, or `None` to compute without writing),
+  `device` (default `'cpu'`), the tracking parameters, and `threshold`
+- **Returns**: `EvaluationResult` with `.per_movie` (one row per movie), `.pooled` (the
+  three contract metrics) and `.results_path`
+- **Raises**: `FileNotFoundError` naming the missing path when the split is absent
+- **Side effects**: writes `eval_results.csv` beneath `output_dir`, creating it if needed
 
-#### `pretty_print(df)`
+#### `pooled_metrics(df)`
 
-- **Purpose**: Prints a formatted summary of division detection performance (precision, recall, F1) aggregated across the full evaluation set
-- **Parameters**: `df` — the results DataFrame with columns `correct_division`, `false_positive_division`, `false_negative_division`
-- **Note**: computes macro-level (pooled) metrics rather than averaging per-sample, which is the appropriate choice when sample sizes vary
+- **Purpose**: pool division F1, association accuracy and target effectiveness across movies
+- **Parameters**: `df` — any frame carrying the columns in `eval.COUNT_COLUMNS`
+- **Logic**: sums each metric's numerator and denominator across movies and divides once.
+  A movie whose own ratio is undefined still contributes its counts
+- **Division scoring**: a mismatched division (right parent, wrong or incomplete daughter
+  set) counts as both a missed division and a false positive, so
+  recall = correct / (correct + missed + mismatched) and
+  precision = correct / (correct + false positive + mismatched). `mismatch_division` is
+  therefore one of `COUNT_COLUMNS`. On the recorded test split this gives division F1 0.9157;
+  the previous rule, which dropped mismatches, gave 0.9588 for the same counts
+- **Note**: this is deliberately *not* the mean of per-movie ratios. On the recorded test
+  split, pooling gives association accuracy 0.9940 where averaging gives 0.9964
+
+#### `build_indices(y)`
+
+- **Purpose**: per-movie frame extent, used to avoid running the tracker on zero-padded frames
+- **Parameters**: `y` — batched label array of shape `(B, T, H, W, C)`
+- **Logic**: counts frames whose mask holds any labelled pixel, via
+  `utils.count_nonempty_frames`, and returns that count
+- **Returns**: list of `int`, one per movie. It is the exclusive end of the occupied
+  frames, so used as a slice bound it includes every non-empty frame. The training
+  dataloader derives its extent from the same `count_nonempty_frames`
+
+#### `pretty_print(pooled)`
+
+- **Purpose**: print every contract metric to the terminal
+- **Parameters**: `pooled` — the dict returned by `pooled_metrics`, i.e. `result.pooled`.
+  It previously took the results DataFrame and reported division metrics only
 
 #### `create_timelapse_gif(im1, im2, output_path, fps, titles, cmap)`
 
-- **Purpose**: Saves a side-by-side animated GIF comparing two label movies (typically predicted vs. ground truth) for qualitative review
+- **Purpose**: saves a side-by-side animated GIF comparing two label movies (typically
+  predicted vs. ground truth) for qualitative review
 - **Parameters**:
-  - `im1`, `im2`: arrays of shape `(T, H, W, C)` — note channels are not split, the whole slice is passed to `imshow`
+  - `im1`, `im2`: arrays of shape `(T, H, W, C)` — note channels are not split, the whole
+    slice is passed to `imshow`
   - `output_path`: destination path for the `.gif` file
   - `fps`: playback speed
   - `titles`: tuple of two strings for subplot titles
-  - `cmap`: matplotlib colourmap — `'viridis'` recommended for label images, `'gray'` for raw images
-- **Side effects**: writes a file to disk and prints the output path; closes the matplotlib figure to free memory
+  - `cmap`: matplotlib colourmap — `'viridis'` recommended for label images, `'gray'` for
+    raw images
+- **Side effects**: writes a file to disk and prints the output path; closes the matplotlib
+  figure to free memory. Imports matplotlib lazily, so importing `eval` does not
 
 ---
 
-### 2.3 `__main__` evaluation loop
-
-#### Setup
-
-- Config dict — document each key: `batch_size`, `n_layers`, `crop_size`, `crop_mode`, `write_movies`
-- Output directories (`movies/`, `metrics/`) created if absent
-- Model initialisation and checkpoint loading — note that `model_state_dict` is expected in the checkpoint
+### 2.3 The evaluation loop
 
 #### Data loading
 
-- Opens raw data (`test.zarr`, contains nuclear image `X` and segmentation ground truth segmentation image `y`)
-- Loads ground-truth lineage from a paired JSON file indexed by batch position
+- `split_dir` must hold `<split>.zarr` (nuclear image `X` and ground-truth masks `y`) and
+  `<split>.json` (ground-truth lineages, indexed by movie position)
+- A missing file raises `FileNotFoundError` naming it, rather than failing later
 
-#### Per-sample loop
+#### Per-movie loop
 
-- `build_indices` is called once on `y` to get all end frames; note it is called inside the loop but the result is constant — this could be moved outside
-- `CellTracker` is constructed and `track_cells()` called for each sample
-- `get_lineage_dict()` and `y_tracked` are retrieved from the tracker
-- Both lineage dicts are re-keyed as `int` before being passed to `TrackingMetrics` — explain why (JSON keys are strings)
-- `TrackingMetrics(...).stats` is the raw dict appended to `metrics_out`
+- `build_indices` is called **once**, outside the loop; the result is constant
+- A fresh `CellTracker` is constructed per movie, so no state carries across movies and
+  evaluation order cannot affect any result
+- Each tracker is constructed with the movie's declared `mpp`, read from the split's
+  `mpp` array, so it is rescaled by `mpp / model_mpp` exactly as conversion did. A zarr
+  holding no `mpp` raises `ValueError` rather than defaulting to 0.55 µm/px
+- Both lineage dicts are re-keyed as `int` before reaching `TrackingMetrics`, because JSON
+  object keys are always strings while `get_lineage_dict()` returns `int` keys
+- `TrackingMetrics(...).stats` is the raw dict collected per movie
 
 #### Post-loop aggregation
 
-- `metrics_out` is collected into a DataFrame
-- Division precision, recall, F1, association accuracy, and target effectiveness are computed as derived columns — document the formulas
-- Results written to `eval_results.csv`
-- `pretty_print(df)` called for a terminal summary
+- Rows are collected into a DataFrame; per-movie ratio columns are derived from the counts
+- `pooled_metrics` computes the three contract metrics from the count columns
+- Results are written to `<output_dir>/eval_results.csv` — the directory created is the
+  directory written into
+- `pretty_print(result.pooled)` gives a terminal summary of all three
 
 #### Optional GIF output
 
-- Controlled by `config['write_movies']`; when enabled, calls `_track_review_dict()` (note the private method access) and `create_timelapse_gif` per sample
+- Controlled by the `write_movies` argument; when enabled, calls `_track_review_dict()`
+  (note the private method access) and `create_timelapse_gif` per movie, beneath `movies_dir`
 
 ---
 
-## 3. `Trainer` - `training.py`
+### 2.4 Training data — `preprocess.py` and `loader.py`
+
+#### Conversion: `convert_trk_to_zarr(filename, out_dir=None, track_length=8, mpps=None)`
+
+Turns a `<split>.trks` archive into three files, all written into `out_dir` (which must
+already exist) or beside the `.trks` file when `out_dir` is `None`:
+
+- `<split>.zarr` — `X`, `y` and `mpp` at native resolution
+- `<split>_proc.zarr` — the arrays the dataloader reads (below)
+- `<split>.json` — the corrected lineage of every movie
+
+Both zarrs are written together or not at all: each is staged as `<name>.partial` inside the
+output directory and renamed into place once both are complete.
+
+#### Per-movie resolution
+
+Each movie's declared resolution (µm/px) comes from one of two places:
+
+- **`mpps=`** — a sequence with exactly one value per movie. When given, nothing else is read.
+- **`data-source.npz`** — otherwise, a file of exactly that name **beside the `.trks`
+  file** (not in `out_dir`). It is keyed by split name (`train`, `val`, `test`); each value
+  is a per-movie metadata array whose **third column (index 2)** is that movie's resolution.
+
+If neither is available, or the number of resolutions differs from the number of movies,
+conversion fails naming what is missing. No default resolution is ever assumed. The values
+are stored in both zarrs, so nothing after conversion needs `data-source.npz`.
+
+#### The processed zarr
+
+Exactly four arrays, plus the lineage:
+
+| Key | Shape | Content |
+| --- | --- | --- |
+| `appearances` | `(B, T, N, 32, 32, 1)` | per-cell crops |
+| `morphologies` | `(B, T, N, 3)` | area, perimeter, eccentricity |
+| `centroids` | `(B, T, N, 2)` | centroid coordinates |
+| `mpp` | `(B,)` | declared resolution, µm/px |
+
+`N` is the largest cell count of any movie; unused slots are all zero. The corrected
+lineage of every movie is stored in the zarr's attributes under `lineages`. A processed zarr
+without it is rejected by the dataloader with an error naming it; no sibling `.json` is read
+in its place. Neither the training targets nor the spatial graph is stored.
+
+#### Training targets are built per window
+
+The dataloader builds each sample's `labels` from the lineage when the sample is drawn,
+for just the frames in that window: `(track_length - 1, N, N)`, one matrix per step from a
+frame to the next.
+
+Rows are the cells of one frame (the tracks) and columns are the cells of the next frame
+(the candidates). An entry is graded only when both of its slots carry a cell: the row's
+cell in the first frame and the column's cell in the next.
+
+| Value | Meaning |
+| --- | --- |
+| `1` | same cell: the cell is in both frames |
+| `2` | daughter: from a dividing parent to each daughter, at the parent's final frame |
+| `0` | different cell: both slots carry a cell and they are not the same cell |
+| `-1` | padding, ignored by the loss: the row has no cell in the first frame, or the column has none in the next |
+
+A slot with no cell, whether unused capacity, a cell not yet born, or a cell that has ended,
+holds all-zero features, so all of them are padding. Two consequences are deliberate: a
+newborn cell's column is graded in the step into its first frame (it is not any existing
+track), and a cell that ends has its row graded in its last frame (it matches no candidate).
+The `2` entries are written after padding so it can never erase one.
+
+The test dataloader is unshuffled and unaugmented, like validation. Only the training
+loader shuffles and augments.
+
+---
+
+## 3. Training - `training.py`
 
 ### 3.1 Module overview
 
-- Encapsulates the full supervised training loop: forward pass, loss computation, gradient update, validation, learning rate scheduling, early stopping, TensorBoard logging, and checkpoint management
-- Wraps a `GNNTrackingModel` and is configured entirely through constructor arguments — no global config file is required at runtime
+- Holds the whole supervised training loop (forward pass, loss, gradient update, validation, learning-rate scheduling, early stopping, TensorBoard logging, checkpointing), the `TrainingConfig` that describes a run, and the command-line entry point that launches one.
+- Three ways in, from highest to lowest level: the command `torch-tracking-train` (also `python -m torch_tracking.training`); `run_training(config)`, which builds the model and dataloaders a configuration describes; and `Trainer(model, train_loader, val_loader, config)` for a caller who assembles the pieces.
+- Everything that varies between runs is one `TrainingConfig`. There is no other configuration channel, and no file is read at run time.
+- The README's Training section is the user-facing recipe. This section is the contract behind it.
 
 ---
 
-### 3.2 `Trainer` class
+### 3.2 `TrainingConfig`
 
-#### Constructor — `__init__`
+A dataclass with one field per setting. Three properties are guaranteed and tested:
 
-- **Parameters** — document each:
-  - `model`: `GNNTrackingModel` instance — moved to `device` in the constructor
-  - `train_loader`, `val_loader`: PyTorch `DataLoader` objects producing batches with keys `appearances`, `morphologies`, `centroids`, `adj_matrices`, `labels`
-  - `optimizer`: pre-built optimizer (use `create_optimizer` from `utils.py`)
-  - `scheduler`: optional LR scheduler (use `create_scheduler` from `utils.py`); `ReduceLROnPlateau` is handled separately from step-based schedulers
-  - `device`: device string passed to `torch.amp.autocast` — must match the device the model is on
-  - `checkpoint_dir`, `log_dir`: base directories; a timestamp suffix is appended automatically to avoid overwriting runs
-  - `max_epochs`: hard ceiling on training duration
-  - `gradient_clip`: maximum gradient norm; set to 0 to disable clipping
-  - `early_stopping_patience`: number of validation epochs without improvement before stopping (only active if `enable_early_stopping=True`)
-  - `enable_early_stopping`: flag to turn early stopping on or off without changing patience
-  - `log_and_save`: when `False`, TensorBoard writer is not created and no checkpoints are written — useful for quick debugging runs
-  - `config`: arbitrary dict saved as `config.json` alongside checkpoints for reproducibility
-  - `loss`: one of `'wcce'`, `'focal'`, `'focal_wcce'` — passed to `TrackingLoss`
-  - `class_weights`: optional list of per-class weights passed to `TrackingLoss`; when `None`, weights are computed dynamically from each batch, but leads to unstable training. The default is 1:10:100 for different:same:mitosis.
-  - `stopping_metric`: key from the metrics dict used to determine best model — typically `'loss'`
-  - `gamma`: focal loss focusing parameter (only used when `loss` contains `'focal'`)
-  - `data_precision`: `'float32'`, `'float16'`, or `'bfloat16'` — controls `torch.amp.autocast` dtype and whether `GradScaler` is active
-- **Side effects**: creates checkpoint and log directories, writes `config.json`, instantiates `SummaryWriter`, `TrackingLoss`, `MetricsTracker`, and `EarlyStopping`
+- **It is recorded completely.** `to_dict()` is built from the dataclass fields, so every setting appears in the run's `config.json`, including `class_weights`. A field cannot be added without being recorded.
+- **Every field is read.** A setting no code path reads is removed, not left to be set in the belief that it acts.
+- **Every field is a flag.** The parser is generated from the fields (`--max-epochs` for `max_epochs`), so a new field is settable from the command line with no further edit.
+
+Choices are checked when the `Trainer` is built (`validate_config`): `optimizer` (`radam`, `adamw`), `scheduler` (`reduce_on_plateau`, `cosine`, `step`, `exp`, `none`), `loss` (`wcce`, `focal`, `focal_wcce`), `data_precision` (`bfloat16`, `float16`, `float32`) and `stopping_metric` (any key of the validation metrics). A bad value raises `ValueError` naming the value and the accepted set, rather than failing later as a missing attribute.
+
+Two settings that look alike are separate: `gamma` is the focal-loss focusing parameter, and `step_gamma` is the learning-rate multiplier of the `step` scheduler. The `exp` scheduler uses `decay`. `weight_decay` is passed to both optimizers.
 
 ---
+
+### 3.3 `Trainer` class
+
+#### Constructor
+
+`Trainer(model, train_loader, val_loader, config)`. The constructor:
+
+- validates the configuration (above);
+- builds the optimizer and scheduler from it with `create_optimizer` and `create_scheduler`;
+- builds `TrackingLoss`, passing `class_weights` only to the loss modes that apply them (`wcce`, `focal_wcce`); for `focal` it prints a note that the recorded weights have no effect;
+- moves the model and loss to `config.device`;
+- draws a seed if the configuration has none, records it as `config.seed`, and seeds the framework, NumPy and Python's random streams from it (`run_training` does the same before building the model, so the initial weights are covered too);
+- sets up mixed precision for that device's type. `bfloat16` and `float16` autocast with a `GradScaler`; `float32` disables autocasting and the scaler entirely;
+- resolves the direction of improvement once from `stopping_metric` (`loss` minimizes, every other metric maximizes) and gives it to best-epoch selection, `EarlyStopping` and the plateau scheduler;
+- when `log_and_save` is on, creates `<checkpoint_dir>/<timestamp>/` and `<log_dir>/<timestamp>/`, writes `config.json` and opens a `SummaryWriter`. When it is off none of that happens.
 
 #### `train_epoch()`
 
-- **Purpose**: Runs one full pass over the training set
-- **Workflow**:
-  1. Sets model to `train()` mode
-  2. For each batch: moves tensors to device, calls `model.training_forward()` under `autocast`, computes loss, scales and calls `backward()`, checks for NaN/Inf, unscales gradients, clips norm, steps scaler and optimizer
-  3. Updates `MetricsTracker` and refreshes the tqdm progress bar with per-class F1 and loss
-- **Returns**: metrics dict from `MetricsTracker.get_metrics()` — resets the tracker before returning
-- **Note on precision**: when `data_precision='float32'`, `GradScaler` is instantiated with `enabled=False`, making it a no-op — so the scaler calls are safe regardless of precision mode
+- Sets the model to `train()` and walks the training loader.
+- Per batch: forward under autocast (the model returns **probabilities**, which `TrackingLoss` requires), loss, then a finite-loss check. A batch whose loss is NaN or infinite is skipped with a message naming the batch, **before** any gradient scaling, so the scaler is never left half-updated.
+- For a finite loss: scaled `backward()`, unscale, gradient clipping (`clipnorm`, 0 disables), scaler and optimizer step, scaler update, metrics update. The gradient norm is measured before clipping on every batch, whether or not clipping is on.
+- Returns the metrics dict from `MetricsTracker.get_metrics()` and resets the tracker. Three further keys describe the gradients of that epoch: `grad_norm` (mean pre-clip norm over the batches that took a step), `grad_norm_max` (the largest) and `clip_engaged` (`True` if any batch's norm exceeded `clipnorm`). A batch whose norm is not finite is left out of the two figures.
 
 #### `validate()`
 
-- **Purpose**: Runs one full pass over the validation set without gradient computation
-- Decorated with `@torch.no_grad()` — no need to call `torch.no_grad()` manually inside
-- Identical structure to `train_epoch()` except no backward pass, no scaler, and NaN batches are silently skipped
-- **Returns**: metrics dict; resets tracker before returning
+- `@torch.no_grad()`, model in `eval()`. Same shape as `train_epoch()` without a backward pass.
+- **Runs under the same autocasting as `train_epoch()`**, so an epoch's training and validation losses are computed at the same precision (`bfloat16` by default; `float32` turns both off).
+- A batch with a NaN loss is skipped.
 
-#### `save_checkpoint(is_best)`
+#### `save_checkpoint(is_best=False)`
 
-- **Purpose**: Persists model and optimizer state to disk
-- Saves the full checkpoint dict (epoch, model state, optimizer state, best val loss, history) to `checkpoint_epoch_N.pt` for regular saves, or `best_model.pt` when `is_best=True`
-- Only the best checkpoint overwrites; regular checkpoints are pruned to keep only the last 3
+- Writes `checkpoint_epoch_NNNN.pt` (zero-padded to four digits) for the epoch just completed. When `is_best`, the same file is also copied to `best_model.pt`. Returns the path.
+- Does nothing, and returns `None`, when `log_and_save` is off.
+- Applies `max_checkpoints`: only the most recent N per-epoch files are kept, ordered by epoch number. `best_model.pt` is never pruned. The default keeps every epoch.
 
 #### `load_checkpoint(checkpoint_path)`
 
-- **Purpose**: Restores a training run from a saved checkpoint
-- Restores model weights, optimizer state, epoch counter, best val loss, and full history
-- Allows resuming training by calling `train()` after loading
+- Restores model, optimizer, learning-rate schedule, gradient scaler, early-stopping counter, best value, best epoch and both histories.
+- Sets `current_epoch` to the checkpoint's epoch **plus one**: a checkpoint records a finished epoch, so `train()` continues with the next. A checkpoint from before this was added holds no schedule or scaler state; the trainer says so and restarts the schedule from the optimizer's current rate.
 
 #### `train()`
 
-- **Purpose**: Main training loop — calls `train_epoch()` and `validate()` for each epoch, steps the scheduler, saves checkpoints, and triggers early stopping
-- **Scheduler step logic**: `ReduceLROnPlateau` is stepped with the current stopping metric; all other schedulers are stepped without arguments — document that list schedulers (the `'caliban'` case) are not handled
-- **Best model logic**: `is_best` is determined by comparing `val_metrics[stopping_metric]` against `self.best_val_loss`; note that `save_checkpoint(is_best=True)` is always called at the end of training, saving whatever state the model is in at the final epoch (not necessarily the best)
-- **TensorBoard**: all keys in `train_metrics` and `val_metrics` are logged under `train/` and `val/` namespaces
-- **History**: `train_history` and `val_history` are written to `training_history.json` at the end
+- Loops `range(current_epoch, max_epochs)`: train, validate, step the scheduler, decide whether the epoch is the best, decide early stopping, save the checkpoint, log to TensorBoard, print a summary.
+- **Scheduler**: `ReduceLROnPlateau` is stepped with the validation value of `stopping_metric`, in the direction that metric improves; every other scheduler is stepped with no argument.
+- **Best epoch**: an epoch is best if `val_metrics[stopping_metric]` improves on the best so far, in the metric's direction. The default is minimized validation loss.
+- **Early stopping**: only when `enable_early_stopping` is on. It is decided before the epoch's checkpoint is written, so the checkpoint holds the counter as it stood after that epoch.
+- **Every epoch writes a checkpoint**, best or not.
+- **History**: when `log_and_save` is on, `training_history.json` is written at the end with `train`, `val`, `stopping_metric`, `best_epoch` and `best_value`.
+- With `log_and_save` off the run writes nothing and still completes.
 
 ---
 
-### 3.3 `__main__` example script
+### 3.4 Command line
 
-- Shows a minimal end-to-end training run using `create_trk_dataloaders`, `create_optimizer`, and `create_scheduler` from `utils.py`
-- Document the config keys used and their meaning: `optimizer`, `learning_rate`, `weight_decay`, `decay`, `scheduler`, `max_epochs`, `batch_size`, `n_layers`, `num_workers`, `clipnorm`, `step_size`, `crop_mode`, `patience`, `log_and_save`, `enable_early_stopping`, `crop_size`, `truncate_dataset`, `loss`, `dropout`, `device`, `label_smoothing`, `stopping_metric`, `data_precision`, `gamma`
+`torch-tracking-train --data-dir <dir> [--<setting> value ...]`, or `python -m torch_tracking.training`. `--data-dir` is required and has no default; it must hold `train_proc.zarr` and `val_proc.zarr`, and it is recorded in `config.json`.
+
+`main(argv)` returns an exit status; `config_from_args(argv)` parses to a `TrainingConfig` without running anything; `build_parser()` returns the parser. `run_training(config)` builds the model (`build_model`, whose architecture is fixed to what `CellTracker` loads) and dataloaders, trains, and returns the `Trainer`.
+
+The device is whatever `--device` names (default `cuda`). No card index is written in source: on a shared machine, choose a card with `CUDA_VISIBLE_DEVICES` and leave the device as `cuda` or `cuda:0`.
 
 ---
 
-### 3.4 Checkpoints
+### 3.5 Checkpoints
 
-Document the schema of a saved checkpoint file:
+Each `checkpoint_epoch_NNNN.pt`, and `best_model.pt`, is a dictionary:
 
 | Key | Description |
 | --- | --- |
-| `epoch` | Last completed epoch index |
-| `model_state_dict` | `model.state_dict()` — load with `model.load_state_dict()` |
-| `optimizer_state_dict` | Optimizer state — load with `optimizer.load_state_dict()` |
-| `best_val_loss` | Best observed validation metric across all epochs |
-| `train_history` | List of per-epoch train metric dicts |
-| `val_history` | List of per-epoch val metric dicts |
+| `epoch` | Index of the last **completed** epoch (0-based). A resumed run continues at `epoch + 1` |
+| `model_state_dict` | `model.state_dict()`; load with `model.load_state_dict()` |
+| `optimizer_state_dict` | Optimizer state |
+| `scheduler_state_dict` | Learning-rate schedule state, or `None` for `scheduler='none'` |
+| `scaler_state_dict` | Gradient-scaler state; empty when the scaler is disabled (`float32`) |
+| `early_stopping_state` | `best_value`, `counter` and `should_stop` of the early-stopping tracker |
+| `stopping_metric` | Name of the metric that selected the best epoch |
+| `best_metric` | Best value of that metric so far, at the end of this epoch. (Older checkpoints call this `best_val_loss`; `load_checkpoint` reads either.) |
+| `best_epoch` | Epoch index of that best value, or `None` before any epoch has improved |
+| `train_history`, `val_history` | Lists of per-epoch metric dicts up to and including this epoch |
+
+The metrics in each dict are `loss`, `accuracy`, and `precision_class_{0,1,2}`, `recall_class_{0,1,2}`, `f1_class_{0,1,2}`, for class order `[different, same, mitosis]`. `loss` is each batch's loss as `TrackingLoss` returns it, pooled across batches with each weighted by how many entries it graded (padding is not graded). The batch loss itself is the weighted cross-entropy per graded entry; see section 3.6 for how it compares with earlier runs. The training metrics dict also carries `grad_norm`, `grad_norm_max` and `clip_engaged` (section 3.3).
+
+---
+
+### 3.6 Known limits
+
+- **Selection by validation loss is not where the accuracy is.** Validation loss ranks epochs only weakly against validation daughter-class F1 (rank correlation about -0.40 over 297 epochs in seven runs), but that F1 is a per-edge classification, not the metric this project is judged on. Traced over the 444 ground-truth divisions of the `val` split at the baseline checkpoint, a *perfect* daughter-class head would raise pooled division F1 by about **+0.006**, against a sampling standard error of about **0.012** on that split: half a standard error. The gap between validation loss and validation daughter-class F1 is therefore not evidence of recoverable accuracy. The default rule (minimize validation loss) is therefore kept, and every epoch is retained so the finding can be retested.
+- **Division detection is reachable only through a birth.** About 30.6% of true daughter edges on the `val` split are never offered to it, although the model had already given those edges a median daughter probability of about 0.99. This is the larger lever (a ceiling of about +0.018 on `val`, an upper bound and not a forecast) and lies in the tracker's assignment step, not in training; see section 1.
+- **Reproducibility.** A run is seeded from `--seed` (or a seed it draws and records in `config.json`). The same seed and configuration give the same recorded metrics on CPU; GPU kernels may still differ in the last bits. Runs recorded by earlier versions of this package carry no seed and cannot be reproduced.
+- **Comparing losses with earlier runs.** Every loss recorded by earlier versions of this package is one third of the per-entry cross-entropy (it was also averaged over the three classes). To compare an earlier loss with a later one, multiply it by 3. Earlier validation losses were also computed at full precision while training ran in reduced precision, so they are not directly comparable even after rescaling. The epoch an earlier run selected is unaffected by the rescale.
+- **Recorded validation losses are pooled by graded entries**, not by batch size, so they differ slightly from those recorded before that was changed.
+- **CPU training is not a supported mode.** The device type follows `--device`, so a CPU run works in tests, but only CPU *inference* is a project guarantee.
