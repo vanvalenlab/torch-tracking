@@ -12,7 +12,68 @@ from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import torchvision.transforms.v2.functional as F
 from scipy.spatial.distance import cdist
+
+from torch_tracking.utils import require_mpp, require_lineages, count_nonempty_frames, spatial_adjacency, DISTANCE_THRESHOLD
 warnings.filterwarnings("ignore") 
+
+#: The processed-zarr arrays the dataloader reads, by name. Anything else a zarr holds is
+#: never loaded, so an array no stage uses costs no memory.
+REQUIRED_ARRAYS = ('appearances', 'morphologies', 'centroids', 'mpp')
+
+
+def get_temporal_adjacency(lineage, start_frame, end_frame, max_cells):
+    """Training targets for the frames ``[start_frame, end_frame)`` of one movie.
+
+    Returns an int8 array ``(end_frame - start_frame - 1, max_cells, max_cells)``: entry
+    ``[t]`` compares the cells of frame ``start_frame + t`` (rows, the tracks) with the
+    cells of the next frame (columns, the candidates). A cell's slot is its label minus
+    one.
+
+    An entry is graded only when both of its slots carry a cell: the row's cell in the
+    first frame and the column's cell in the next. Otherwise it is ``-1`` (padding) and
+    the loss ignores it. That covers unused capacity, and equally a cell not yet born,
+    already ended, or missing from one of the two frames. Such a slot holds all-zero
+    features, identical to unused capacity, so the targets do not tell them apart.
+
+    * ``1`` on the diagonal: the cell is in both frames.
+    * ``2`` from a parent to each daughter, at the parent's final frame.
+    * ``0`` for every other graded pair: two cells that are not the same.
+
+    A newborn cell therefore has its column graded in the step into its first frame (it
+    is not any existing track), and a cell that ends has its row graded in its last frame
+    (it matches no candidate). The division entries are written after padding so that
+    they can never be erased.
+
+    Built from the lineage alone, for just the window requested, so there is no frame
+    beyond the movie's extent to pad.
+    """
+    n_frames = end_frame - start_frame
+    adjacency = np.zeros((n_frames - 1, max_cells, max_cells), dtype=np.int8)
+    present = np.zeros((n_frames, max_cells), dtype=bool)
+    divisions = []
+
+    for attr in lineage.values():
+        slot = int(attr['label']) - 1
+        frames = np.asarray(attr['frames'], dtype=int)
+        if frames.size == 0:
+            continue
+        in_window = frames[(frames >= start_frame) & (frames < end_frame)] - start_frame
+        present[in_window, slot] = True
+
+        final = int(frames[-1])
+        if attr['daughters'] and start_frame <= final < end_frame - 1:
+            divisions.append((final - start_frame, slot, [int(d) - 1 for d in attr['daughters']]))
+
+    tracks, candidates = present[:-1], present[1:]
+    np.putmask(adjacency, ~tracks[:, :, None] | ~candidates[:, None, :], -1)
+
+    steps, slots = np.nonzero(tracks & candidates)
+    adjacency[steps, slots, slots] = 1
+
+    for step, slot, daughters in divisions:
+        adjacency[step, slot, daughters] = 2
+
+    return adjacency
 
 
 class TrkDataset(Dataset):
@@ -41,12 +102,11 @@ class TrkDataset(Dataset):
         track_length: int = 8,
         stride: int = 1,
         data_format: str = 'channels_first',
-        distance_threshold: float = 64,
+        distance_threshold: float = DISTANCE_THRESHOLD,
         augment: bool = True,
         rotation_range: int = 180,
         translation_range: float = 512,
         truncate_dataset=None,
-        t_direction='forward',
     ):
         
         super().__init__()
@@ -59,18 +119,26 @@ class TrkDataset(Dataset):
         self.rotation_range = rotation_range
         self.translation_range = translation_range
         self.truncate_dataset = truncate_dataset
-        self.t_direction = t_direction
 
         features = zarr.open(self.trk_path)
+        require_mpp(features, self.trk_path)
+        lineages = require_lineages(features, self.trk_path)
 
+        for k in REQUIRED_ARRAYS:
+            if k not in features:
+                raise ValueError(f"{self.trk_path} holds no '{k}' array.")
+
+        # Only the arrays named above are read; a retired array in an older zarr is not.
         self.features = {}
-        for k in tqdm.tqdm(features.keys()):
+        for k in tqdm.tqdm(REQUIRED_ARRAYS):
             
             if self.truncate_dataset is not None:
                 self.features[k] = features[k][:self.truncate_dataset]
 
             else:
                 self.features[k] = features[k][:]
+
+        self.lineages = list(lineages[:self.truncate_dataset])
 
         # Build sample indices
         self.samples = self._build_sample_indices()
@@ -88,14 +156,13 @@ class TrkDataset(Dataset):
         B, T, N, Y, X, C = self.features['appearances'].shape
         
         for batch_idx in range(B):
-            # Slide window across time dimension
-            max_frames = np.sum(np.sum(self.features['appearances'][batch_idx], axis=(1, 2, 3)) != 0).item() - 1
+            # Slide window across the movie's occupied frames. The extent is the shared
+            # rule evaluation uses, and a window is kept while it ends within it, so
+            # every non-empty frame is reachable and none reaches into padding.
+            extent = min(T, count_nonempty_frames(self.features['appearances'][batch_idx]))
 
-            for start_frame in range(0, T - self.track_length + 1, self.stride):
+            for start_frame in range(0, extent - self.track_length + 1, self.stride):
                 end_frame = start_frame + self.track_length
-
-                if end_frame == max_frames:
-                    break
 
                 samples.append({
                     'batch_idx': batch_idx,
@@ -110,8 +177,8 @@ class TrkDataset(Dataset):
 
     def _apply_augmentation(self, appearances, centroids):
         
-        self.rotation_angle = (torch.rand(1) - 0.5) * 2 * self.rotation_range
-        angle_rad = torch.deg2rad(torch.tensor(self.rotation_angle))
+        rotation_angle = (torch.rand(1) - 0.5) * 2 * self.rotation_range
+        angle_rad = torch.deg2rad(torch.tensor(rotation_angle))
 
         rotation_mat =  torch.tensor([
             [torch.cos(angle_rad), -torch.sin(angle_rad)],
@@ -120,7 +187,7 @@ class TrkDataset(Dataset):
 
         # Apply rotation
         appearances = appearances.permute(0, 1, 4, 2, 3)
-        appearances = F.rotate(appearances, self.rotation_angle,
+        appearances = F.rotate(appearances, rotation_angle,
                             interpolation=F.InterpolationMode.BILINEAR)
         appearances = appearances.permute(0, 1, 3, 4, 2)
 
@@ -128,20 +195,21 @@ class TrkDataset(Dataset):
             
         # Apply translation
         random_translate = (torch.rand(2) - 0.5) * 2 * self.translation_range
-        self.random_translate = random_translate.unsqueeze(0).unsqueeze(0)
-        centroids = centroids + self.random_translate
+        random_translate = random_translate.unsqueeze(0).unsqueeze(0)
+        centroids = centroids + random_translate
 
         return appearances, centroids
     
-    def _get_adj_matrix(self, centroids):
+    def _get_adj_matrix(self, centroids, morphologies):
+        """Spatial graph for each frame of a window, by the rule inference also uses."""
 
         T, N, _ = centroids.shape
-        adj_matrix = np.zeros((T, N, N))
+        adj_matrix = np.zeros((T, N, N), dtype=bool)
 
         for time in range(T):
-            adj_matrix[time] = cdist(centroids[time], centroids[time], metric='euclidean')
-
-        adj_matrix = (adj_matrix > 0) & (adj_matrix < self.distance_threshold)
+            adj_matrix[time] = spatial_adjacency(
+                centroids[time], morphologies[time], self.distance_threshold
+            )
 
         return adj_matrix
     
@@ -179,15 +247,6 @@ class TrkDataset(Dataset):
 
             tensors['appearances'] = torch.from_numpy(data['appearances']).float()
             tensors['centroids'] = torch.from_numpy(data['centroids']).float()
-
-
-        if self.t_direction == 'backward':
-
-            tensors['morphologies'] = tensors['morphologies'].flip(0)
-            tensors['adj_matrices'] = tensors['adj_matrices'].flip(0)
-            tensors['centroids'] = torch.from_numpy(data['centroids']).flip(0)
-            tensors['appearances'] = torch.from_numpy(data['appearances']).flip(0)
-            tensors['labels'] = torch.transpose(tensors['labels'].flip(0), 1, 2)
         
         return tensors
 
@@ -200,7 +259,7 @@ class TrkDataset(Dataset):
             - morphologies: (track_length, max_cells, 3)
             - centroids: (track_length, max_cells, 2)
             - adj_matrices: (track_length, max_cells, max_cells)
-            - labels (optional): (track_length-1, max_cells, max_cells)
+            - labels: (track_length-1, max_cells, max_cells), built from the lineage
         """
 
         sample_info = self.samples[idx]
@@ -210,7 +269,6 @@ class TrkDataset(Dataset):
         end_frame = sample_info['end_frame']
 
         time_slice = slice(start_frame, end_frame)
-        time_slice_label = slice(start_frame, end_frame-1)
 
         items = {
             'appearances': self.features['appearances'][batch_idx, time_slice],
@@ -218,11 +276,14 @@ class TrkDataset(Dataset):
             'morphologies': self.features['morphologies'][batch_idx, time_slice]
         }
 
-        items['adj_matrices'] = self._get_adj_matrix(items['centroids'])
+        items['adj_matrices'] = self._get_adj_matrix(items['centroids'], items['morphologies'])
         
         # Generate labels if in training mode
 
-        items['labels'] = self.features['labels'][batch_idx, time_slice_label]
+        items['labels'] = get_temporal_adjacency(
+            self.lineages[batch_idx], start_frame, end_frame,
+            self.features['appearances'].shape[2],
+        )
 
         # Convert to tensors
         tensor_data = self._to_tensors(items)
@@ -310,13 +371,14 @@ def create_trk_dataloaders(
             trk_path=test_path,
             track_length=track_length,
             stride=stride,
+            augment=False,
             **dataset_kwargs
         )
         
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            shuffle=True,            
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
         )
@@ -326,50 +388,3 @@ def create_trk_dataloaders(
         loaders.append(None)
     
     return tuple(loaders)
-
-
-if __name__ == '__main__':
-
-    config = {
-        "optimizer": "radam",
-        "learning_rate": 1e-3,
-        "weight_decay": 0,
-        "decay": 0.99,
-        "scheduler": "reduce_on_plateau",
-        "max_epochs": 50,
-        "batch_size": 6,
-        "n_layers": 1,
-        "num_workers": 8,
-        "clipnorm": 0.001,
-        "step_size": 5,
-        "crop_mode": "resize",
-        "patience": 5,
-        "log_and_save": True,
-        "enable_early_stopping": False,
-        "crop_size": 32,
-        "attention": False,
-        "truncate_dataset": 4,
-        "loss": "wcce",
-        "t_direction": "forward",
-        "processed": True,
-        "dropout": 0,
-        "device": "cuda:0",
-        "label_smoothing": False,
-        "stopping_metric": 'loss'
-    }
-
-    train_loader, val_loader, _ = create_trk_dataloaders(
-        train_path='data/DynamicNuclearNet-tracking-v1_0/train_proc.zarr',
-        val_path='data/DynamicNuclearNet-tracking-v1_0/val_proc.zarr',
-        batch_size=config['batch_size'],
-        distance_threshold=64,
-        num_workers=config['num_workers'],
-        truncate_dataset = config['truncate_dataset'],
-        t_direction=config['t_direction'],
-    )
-
-    for sample in train_loader:
-        print(sample)
-
-    print()
-

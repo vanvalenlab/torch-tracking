@@ -1,107 +1,184 @@
-"""Inference and evaluation scripts for GNN cell tracking model"""
+"""Parameter sweep over postprocessing thresholds, using the shared evaluation rules.
+
+This is a different program from :mod:`torch_tracking.eval` - it produces one row per
+(movie, parameter combination) rather than one per movie - so it keeps its own entry
+point. What it does not keep is its own copy of the frame-extent rule: that is imported
+from :mod:`torch_tracking.eval` so both harnesses evaluate the same frames.
+
+Importing this module performs no sweep.
+
+It also shares the other evaluation rules: every non-empty frame is evaluated, and each
+movie is tracked at the resolution its zarr declares.
+"""
+
+from pathlib import Path
+import itertools
+import json
 
 import pandas as pd
-import numpy as np
-from torch_tracking.tracker import CellTracker
-import zarr
-import json
 import tqdm
-import itertools
-from pathlib import Path
+import zarr
 
+from torch_tracking.eval import build_indices, _resolve_split
 from torch_tracking.metrics import TrackingMetrics
+from torch_tracking.tracker import CellTracker
+from torch_tracking.utils import require_mpp, DISTANCE_THRESHOLD
 
-def build_indices(X):
+__all__ = ['sweep', 'build_indices']
 
-    samples = []
-
-    for batch in range(X.shape[0]):
-
-        end_frame = np.sum(np.sum(X[batch], axis=(1, 2, 3)) != 0) - 1
-        samples.append(end_frame.item())
-    
-    return samples
+DEFAULT_DIVISION_SWEEP = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+DEFAULT_BIRTH_SWEEP = (0.999,)
+DEFAULT_DEATH_SWEEP = (0.999,)
 
 
-if __name__ == "__main__":
+def sweep(
+    checkpoint_path,
+    split_dir,
+    split='test',
+    output_dir='metrics',
+    device='cpu',
+    division_sweep=DEFAULT_DIVISION_SWEEP,
+    birth_sweep=DEFAULT_BIRTH_SWEEP,
+    death_sweep=DEFAULT_DEATH_SWEEP,
+    track_length=8,
+    distance_threshold=DISTANCE_THRESHOLD,
+    threshold=0.8,
+    verbose=False,
+    progress=True,
+):
+    """Evaluate a checkpoint across a grid of postprocessing thresholds.
 
-    config = {
-            'batch_size': 6,
-            'n_layers': 2,
-            'crop_size': 32,
-            'crop_mode': 'fixed'
-        }
+    Args and behavior mirror :func:`torch_tracking.eval.evaluate`, except that the
+    results carry one row per (movie, parameter combination) and are written to
+    ``postprocess_sweep.csv``.
 
-    # Initialize model
+    Returns:
+        pandas.DataFrame: the per-combination results.
 
-    metrics_out = Path('metrics')
+    Raises:
+        FileNotFoundError: if the split's zarr or lineage JSON is absent.
+    """
+    zarr_path, lineage_path = _resolve_split(split_dir, split)
 
-    if not metrics_out.exists():
-        metrics_out.mkdir()
-
-    checkpoint_dir = Path.home() / '.deepcell/models/tracking/best_model.pt'
-
-    z = zarr.open(Path.home() / '.deepcell/tracking/test.zarr')
-
-    with open(Path.home() / '.deepcell/tracking/test.json') as file:
-        gt_lineage = json.load(file)
-
-    division_sweep = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    birth_sweep = [0.999]
-    death_sweep = [0.999]
-
-    metrics_out = []
+    z = zarr.open(str(zarr_path))
+    mpps = require_mpp(z, zarr_path)
+    with open(lineage_path) as handle:
+        gt_lineages = json.load(handle)
 
     X = z['X'][:]
     y = z['y'][:]
 
-    all_comb = [tup for tup in itertools.product(*[division_sweep, birth_sweep, death_sweep])]
+    # The shared rule, imported rather than redefined.
+    end_frames = build_indices(y)
 
-    for div_thresh, birth_thresh, death_thresh in tqdm.tqdm(all_comb):
-        for batch in tqdm.tqdm(range(X.shape[0]), leave=False):
+    rows = []
 
-            curr_gt_lineage= gt_lineage[batch]
+    combinations = list(itertools.product(division_sweep, birth_sweep, death_sweep))
+    if progress:
+        combinations = tqdm.tqdm(combinations)
 
-            samples = build_indices(y)
-            end_frame = samples[batch]
+    for div_thresh, birth_thresh, death_thresh in combinations:
+        batches = range(X.shape[0])
+        if progress:
+            batches = tqdm.tqdm(batches, leave=False)
+
+        for batch in batches:
+            end_frame = end_frames[batch]
 
             tracker = CellTracker(
-                checkpoint_dir=checkpoint_dir,
-                device='cuda:1',
+                checkpoint_path=checkpoint_path,
+                device=device,
+                mpp=float(mpps[batch]),
                 division=div_thresh,
                 birth=birth_thresh,
                 death=death_thresh,
-                track_length=8,
-                verbose=False
+                track_length=track_length,
+                distance_threshold=distance_threshold,
+                verbose=verbose,
             )
 
-            tracker.preprocess_movie(movie=X[batch, :end_frame],
-                                    annotation=y[batch, :end_frame])
+            tracker.preprocess_movie(
+                movie=X[batch, :end_frame],
+                annotation=y[batch, :end_frame],
+            )
 
             tracker.track_cells()
 
             y_tracked = tracker.y_tracked
-            lineage = tracker.get_lineage_dict()
+            lineage = tracker.get_lineage_dict()  # integer-keyed already
+            gt_lineage = {int(k): v for k, v in gt_lineages[batch].items()}
 
-            curr_gt_lineage  = {int(k): v for k, v in curr_gt_lineage.items()}
-            lineage = {int(k): v for k, v in lineage.items()}
+            stats = TrackingMetrics(
+                gt_lineage,
+                y[batch, :end_frame].squeeze(),
+                lineage,
+                y_tracked.squeeze(),
+                threshold=threshold,
+                verbose=verbose,
+            ).stats
 
-            metrics = TrackingMetrics(curr_gt_lineage, y[batch, :end_frame].squeeze(), lineage, y_tracked.squeeze(), threshold=0.8, verbose=False).stats
-            metrics['div'] = div_thresh
-            metrics['birth'] = birth_thresh
-            metrics['death'] = death_thresh
-            metrics['set_id'] = batch+1
+            stats['div'] = div_thresh
+            stats['birth'] = birth_thresh
+            stats['death'] = death_thresh
+            stats['set_id'] = batch + 1
 
-            metrics_out.append(metrics)
+            rows.append(stats)
 
-    df = pd.DataFrame(metrics_out)
+    df = pd.DataFrame(rows)
 
-    df['division_precision'] = (df['correct_division'])/(df['correct_division'] + df['false_positive_division'])
-    df['division_recall'] = df['correct_division']/(df['correct_division'] + df['false_negative_division'])
-    df['division_f1'] = (2 * df['division_recall'] * df['division_precision'])/(df['division_precision'] + df['division_recall'])
+    df['division_precision'] = df['correct_division'] / (
+        df['correct_division'] + df['false_positive_division'] + df['mismatch_division'])
+    df['division_recall'] = df['correct_division'] / (
+        df['correct_division'] + df['false_negative_division'] + df['mismatch_division'])
+    df['division_f1'] = (2 * df['division_recall'] * df['division_precision']) / (df['division_precision'] + df['division_recall'])
 
-    df['aa_accuracy'] = df['aa_tp']/df['aa_total']
-    df['te_accuracy'] = df['te_tp']/df['te_total']
-    
-    df.to_csv('metrics/postprocess_sweep.csv')
+    df['aa_accuracy'] = df['aa_tp'] / df['aa_total']
+    df['te_accuracy'] = df['te_tp'] / df['te_total']
 
+    if output_dir is not None:
+        # As in eval.evaluate: the directory created is the directory written into.
+        results_dir = Path(output_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        df.to_csv(results_dir / 'postprocess_sweep.csv')
+
+    return df
+
+
+def _cli(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--split-dir', required=True,
+                        help='Directory holding <split>.zarr and <split>.json')
+    parser.add_argument('--split', default='test')
+    parser.add_argument('--output-dir', default='metrics')
+    parser.add_argument('--device', default='cpu')
+    parser.add_argument('--division', type=float, nargs='+', default=list(DEFAULT_DIVISION_SWEEP))
+    parser.add_argument('--birth', type=float, nargs='+', default=list(DEFAULT_BIRTH_SWEEP))
+    parser.add_argument('--death', type=float, nargs='+', default=list(DEFAULT_DEATH_SWEEP))
+    parser.add_argument('--track-length', type=int, default=8)
+    parser.add_argument('--distance-threshold', type=int, default=DISTANCE_THRESHOLD,
+                        help='Distance in pixels within which cells count as connected in the '
+                        'graph (default: the retuned threshold, %(default)s)')
+    parser.add_argument('--threshold', type=float, default=0.8)
+
+    args = parser.parse_args(argv)
+
+    return sweep(
+        checkpoint_path=args.checkpoint,
+        split_dir=args.split_dir,
+        split=args.split,
+        output_dir=args.output_dir,
+        device=args.device,
+        division_sweep=tuple(args.division),
+        birth_sweep=tuple(args.birth),
+        death_sweep=tuple(args.death),
+        track_length=args.track_length,
+        distance_threshold=args.distance_threshold,
+        threshold=args.threshold,
+    )
+
+
+if __name__ == '__main__':
+    _cli()

@@ -7,10 +7,180 @@ import torch
 import cv2
 from skimage import transform
 import pandas as pd
-import networkx as nx
+from scipy.spatial.distance import cdist
 from tqdm import tqdm
 import torch.optim as optim
 from skimage.measure import regionprops
+
+# The resolution, in microns per pixel, that the model is trained at. Every movie is
+# rescaled to this resolution, in conversion and at inference alike.
+MODEL_MPP = 0.55
+
+
+# Pixel radius within which two cells are linked in the spatial graph, on the grid at
+# MODEL_MPP. 89 px keeps the physical reach the model was originally tuned at: 64 px at the
+# old effective 0.768 um/px (0.65**2 / 0.55) is 49.2 um, which is 89.4 px at 0.55 um/px.
+# Derived rather than swept, because a sweep needs a trained model. Used by training,
+# inference and evaluation alike so they cannot disagree.
+DISTANCE_THRESHOLD = 89
+
+
+def scale_factor(mpp, model_mpp=MODEL_MPP):
+    """Factor by which a movie declared at ``mpp`` is rescaled to the model resolution.
+
+    One output pixel must span ``model_mpp`` microns. A movie coarser than the model
+    (larger ``mpp``) has fewer pixels per micron, so it is enlarged: the factor is
+    ``mpp / model_mpp``. This is the single definition of the rule; conversion and
+    inference both call it so the two cannot disagree.
+    """
+    # float64 whatever the caller's type: a float32 scalar would round differently from
+    # the declared value and could size the same movie one pixel apart on the two sides.
+    return float(mpp) / float(model_mpp)
+
+
+def real_cell_mask(morphologies):
+    """Boolean mask, ``True`` where a cell slot holds a real cell.
+
+    ``morphologies`` is ``(..., 3)``, as an ``ndarray`` or a ``Tensor``; the result has
+    the shape of ``morphologies`` without its last axis. A padding slot carries an all-zero
+    morphology and a real cell has positive area, so a slot is real exactly when any of its
+    morphology values is non-zero.
+
+    This is the one definition of "padding" in the repository: the graph rule in
+    ``spatial_adjacency`` and every normalization layer in the model use it, so they cannot
+    drift apart. It is deliberately *not* read from the centroid. Padding sits at the
+    origin in stored data, but training augmentation translates every centroid - padding
+    rows included - by a random per-sample offset, so a padding slot's centroid can be
+    anywhere.
+    """
+    return (morphologies != 0).any(-1)
+
+
+def pair_masks(is_real):
+    """Real-pair masks for the two kinds of delta the training branch builds.
+
+    ``is_real`` is ``(B, T, N)``, from ``real_cell_mask``. Returns ``(within, across)``:
+
+    * ``across``, ``(B, T-1, N, N)``: entry ``[b, t, i, j]`` is real only when slot ``i`` of
+      frame ``t`` *and* slot ``j`` of frame ``t+1`` are both real. That is the pairing
+      ``compute_deltas_across_frames`` and ``Comparison`` use (tracks of the current frame
+      against candidates of the next), and the one the training targets use to decide
+      which entries are graded, so the three agree by construction.
+    * ``within``, ``(B, T, N)``: the delta of slot ``i`` from the previous frame to this
+      one. It is real when the slot is real in both frames; the first frame has no
+      predecessor, so there it is real when the slot itself is.
+    """
+    across = is_real[:, :-1, :, None] & is_real[:, 1:, None, :]
+    within = is_real.clone()
+    within[:, 1:] = is_real[:, 1:] & is_real[:, :-1]
+    return within, across
+
+
+def masked_apply(module, x, is_real, *, fallback_below=2):
+    """Apply a batch-statistic module to the real rows of ``x`` only.
+
+    ``x`` is ``(..., C)`` and ``is_real`` is the boolean mask of the leading axes. The
+    real rows are gathered into ``(R, C)``, passed through ``module`` - normally an
+    ``nn.BatchNorm1d`` - and scattered back into a zero tensor of ``x``'s shape, so padding
+    rows come out exactly zero. Because the stock module sees only real rows, its mean,
+    variance and running buffers are accumulated over real cells alone, with its momentum,
+    ``num_batches_tracked`` and train/eval switch behaving exactly as they always did.
+
+    Two degenerate cases, because ``nn.BatchNorm1d`` in train mode raises at exactly one
+    row and a fixture can easily hit it:
+
+    * **No real row.** The module is not called, so no running statistic moves, and the
+      result is all zeros.
+    * **Fewer than ``fallback_below`` real rows in train mode.** The module is applied to
+      every row unmasked instead. Real training carries tens of real cells per window and
+      never reaches this; it exists so a tiny batch gives a number rather than an error
+      whose cause is three layers from its symptom.
+
+    In eval mode the module uses its running buffers, which depend on no batch, so a single
+    real row is simply normalized.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    mask = is_real.reshape(-1)
+    n_real = int(mask.sum())
+
+    if n_real == 0:
+        return torch.zeros_like(x)
+    if module.training and n_real < fallback_below:
+        return module(flat).reshape(x.shape)
+
+    normalized = module(flat[mask])
+    out = normalized.new_zeros(flat.shape[0], normalized.shape[-1])
+    out[mask] = normalized
+    return out.reshape(*x.shape[:-1], normalized.shape[-1])
+
+
+def spatial_adjacency(centroids, morphologies, distance_threshold):
+    """Boolean ``(N, N)`` spatial graph over one frame's cell slots.
+
+    Two slots are linked when both are real cells (see ``real_cell_mask``) and their
+    centroid distance is strictly greater than zero and strictly less than
+    ``distance_threshold``.
+
+    The single definition of the graph rule: the tracker and the training dataloader
+    both call it, so training and inference build the same graph. Padding slots also sit
+    at centroid (0, 0), so without the exclusion every real cell near the origin would be
+    linked to every padding slot.
+    """
+    distance = cdist(centroids, centroids, metric='euclidean')
+    adjacency = (distance > 0) & (distance < distance_threshold)
+    is_real = real_cell_mask(np.asarray(morphologies))
+    return adjacency & is_real[:, None] & is_real[None, :]
+
+
+def count_nonempty_frames(movie):
+    """Number of frames of ``movie`` holding any non-zero value.
+
+    The single definition of a movie's extent, shared by evaluation and the training
+    sampler so the two cannot disagree about which frames exist. The leading axis is
+    time; every other axis, however many there are, is reduced - so the count does not
+    depend on the channel axis being singleton. Trailing frames are assumed empty
+    padding, so the count is also the exclusive end of the occupied frames.
+    """
+    movie = np.asarray(movie)
+    return int(movie.reshape(movie.shape[0], -1).any(axis=1).sum())
+
+
+def require_mpp(store, path):
+    """Return a converted split's per-movie resolutions, failing if it holds none.
+
+    A zarr written before per-movie resolution was persisted has no ``mpp`` array. It
+    was converted under the superseded scale convention, so it must be regenerated;
+    silently assuming ``MODEL_MPP`` would hide that and reproduce the mismatch.
+    """
+    if 'mpp' not in store:
+        raise ValueError(
+            f"{path} holds no 'mpp' array. It was converted before per-movie resolution "
+            "was persisted, under the superseded scale convention, and must be "
+            "regenerated with convert_trk_to_zarr. No default resolution is assumed."
+        )
+    return np.asarray(store['mpp'][:], dtype='float64')
+
+
+#: Where a processed zarr keeps each movie's corrected lineage (a list, one per movie).
+LINEAGES_KEY = 'lineages'
+
+
+def require_lineages(store, path):
+    """Return a processed zarr's per-movie lineages, failing if it carries none.
+
+    The dataloader builds each sample's training targets from the lineage, so a zarr
+    converted before the lineage travelled with it cannot drive training. It is rejected
+    rather than served from a sibling ``<split>.json``, which nothing guarantees agrees
+    with it.
+    """
+    if LINEAGES_KEY not in store.attrs:
+        raise ValueError(
+            f"{path} carries no '{LINEAGES_KEY}'. It was converted before the corrected "
+            "lineage was stored in the processed zarr, and must be regenerated with "
+            "convert_trk_to_zarr. No sibling .json is read in its place."
+        )
+    return store.attrs[LINEAGES_KEY]
+
 
 def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_format = 'channels_last'):
     """Pre-process images using Contrast Limited Adaptive
@@ -55,141 +225,33 @@ def histogram_normalization(image: np.typing.ArrayLike, kernel_size=None, data_f
 
     return image
 
-def weighted_categorical_crossentropy(y_true, y_pred,
-                                      n_classes=3, axis=None,
-                                      from_logits=False):
-    """Categorical crossentropy between an output tensor and a target tensor.
-    Automatically computes the class weights from the target image and uses
-    them to weight the cross entropy
+
+def add_self_loops_dense(adj: torch.Tensor, is_real: torch.Tensor) -> torch.Tensor:
+    """Give every *real* cell of a dense adjacency matrix a self-loop.
 
     Args:
-        y_true: A tensor of the same shape as ``y_pred``.
-        y_pred: A tensor resulting from a softmax
-            (unless ``from_logits`` is ``True``, in which
-            case ``y_pred`` is expected to be the logits).
-        from_logits: Boolean, whether ``y_pred`` is the
-            result of a softmax, or is a tensor of logits.
+        adj: Adjacency matrices of shape (B*T, N, N).
+        is_real: Boolean mask of shape (B*T, N), ``True`` for a real cell and ``False``
+            for a padding slot (see ``real_cell_mask``).
 
     Returns:
-        tensor: Output tensor.
-    """
-    
-    if from_logits:
-        raise Exception('weighted_categorical_crossentropy cannot take logits')
-    
-    if axis is None:
-        axis = -1 # if K.image_data_format() == 'channels_first' else K.ndim(y_pred) - 1
+        The same matrices with a non-zero diagonal entry at every real cell and none at a
+        padding slot, shape (B*T, N, N).
 
-    reduce_axis = [x for x in list(range(torch.Tensor.dim(y_pred))) if x != axis]
+    No edge weighting (such as symmetric `D^-1/2 A D^-1/2` normalization) is computed:
+    `NeighborhoodEncoder` converts the result to an edge list with `.nonzero()`, which
+    keeps the sparsity pattern and throws away every weight.
 
-    # scale preds so that the class probas of each sample sum to 1
-    y_pred = y_pred / torch.sum(y_pred, dim=axis, keepdims=True)
-
-    # manual computation of crossentropy
-    eps=1e-10
-    _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
-
-    y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
-
-    total_sum = torch.sum(y_true)
-    class_sum = torch.sum(y_true, dim=reduce_axis, keepdims=True)
-    class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.)
-
-    return - (y_true * torch.log(y_pred) * class_weights)
-
-
-def weighted_categorical_crossentropy_v2(
-        y_true, 
-        y_pred, 
-        n_classes=3, 
-    ):
-
-    """
-    Weighted categorical cross-entropy with masking for padded values.
-    
-    Args:
-        y_pred: Tensor of shape (N, C) - predictions for each sample and class
-        y_true: Tensor of shape (N, C) - one-hot encoded targets
-        mask: Tensor of shape (N, C) - 1 where included, 0 where excluded (padded)
-        n_classes: Number of classes
-        from_logits: Whether y_pred contains logits (True) or probabilities (False)
-    
-    Returns:
-        Scalar loss value
-    """
-    eps = 1e-10
-    _epsilon = torch.tensor(eps).type(y_pred.dtype).to(y_pred.device)
-    
-    y_pred = y_pred / torch.sum(y_pred, dim=-1, keepdims=True)
-    
-    # Clamp predictions to avoid log(0)
-    y_pred = torch.clamp(y_pred, min=_epsilon, max=(1. - _epsilon))
-        
-    # Total number of valid (non-masked) samples across all classes
-    total_sum = torch.sum(y_true)
-    
-    # Sum per class across all samples (N dimension)
-    class_sum = torch.sum(y_true, dim=0, keepdims=True)
-    
-    # Compute weights: inverse frequency normalized by n_classes
-    class_weights = 1.0 / n_classes * torch.divide(total_sum, class_sum + 1.).to(y_pred.device)
-        
-    return - (y_true * torch.log(y_pred) * class_weights)
-
-def normalize_adjacency_symmetric(
-    adj: torch.Tensor,
-    add_self_loops: bool = True,
-    eps: float = 1e-12
-) -> torch.Tensor:
-    """Symmetric normalization: D^(-1/2) @ A @ D^(-1/2)
-    
-    This is the most common normalization for GCNs (Kipf & Welling, 2017).
-    Results in normalized adjacency where each edge is weighted by the inverse
-    square root of the product of node degrees.
-    
-    Formula: Ã = D^(-1/2) @ A @ D^(-1/2)
-    where D is the degree matrix and A is the adjacency matrix.
-    
-    Args:
-        adj: Adjacency matrices of shape (B, T, N, N)
-        add_self_loops: If True, adds self-connections before normalization
-        eps: Small constant to avoid division by zero
-    
-    Returns:
-        Normalized adjacency matrices of shape (B, T, N, N)
-    
-    Example:
-        >>> adj = torch.rand(2, 8, 39, 39) > 0.5
-        >>> adj = adj.float()
-        >>> adj_norm = normalize_adjacency_symmetric(adj)
+    The graph layers are configured with `add_self_loops=False`, so these are the only
+    self-loops in the model, and dropping them would isolate every node. They are added
+    to real cells only. A padding slot is given no edge at all, so it cannot exchange
+    anything with a real cell and does not contribute an embedding the normalization
+    layers downstream would otherwise pool. A node with no edges is safe: `GATConv`
+    returns exactly zero for it.
     """
     with torch.no_grad():
-
-        if adj.ndim == 3:
-            T, N, _ = adj.shape
-        if adj.ndim == 4:
-            # batched
-            B, T, N, _ = adj.shape
-        
-        # Add self-loops: A + I
-        if add_self_loops:
-            identity = torch.eye(N, device=adj.device, dtype=adj.dtype)
-            identity = identity.view(1, N, N).expand(T, N, N)
-            adj = adj + identity
-        
-        # Compute degree matrix: D[i,i] = sum_j A[i,j]
-        degree = adj.sum(dim=-1)  # (B, T, N)
-        
-        # D^(-1/2)
-        degree_inv_sqrt = degree.pow(-0.5)
-        degree_inv_sqrt[degree_inv_sqrt == float('inf')] = 0.0
-        degree_inv_sqrt = torch.clamp(degree_inv_sqrt, min=0.0, max=1e10)
-        
-        # Create diagonal matrix from degree^(-1/2)
-        # D^(-1/2) @ A @ D^(-1/2)
-        adj_norm = degree_inv_sqrt.unsqueeze(-1) * adj * degree_inv_sqrt.unsqueeze(-2)
-        
-        return adj_norm
+        loops = torch.diag_embed(is_real.to(adj.dtype))
+        return adj + loops
 
 def is_valid_lineage(y, lineage):
     """Check if a cell lineage of a single movie is valid.
@@ -208,9 +270,13 @@ def is_valid_lineage(y, lineage):
 
     is_valid = True
 
+    # Integer keys are the in-memory convention; a lineage decoded from JSON arrives with
+    # string keys. Normalize once here so every lookup below, including parent and
+    # daughter references, resolves against the same key type.
+    lineage = {int(k): v for k, v in lineage.items()}
+
     # every lineage should have valid fields
     for cell_label, cell_lineage in lineage.items():
-        cell_label = int(cell_label)
         # Get last frame of parent
         if cell_label not in all_cells:
             warnings.warn('Cell {} not found in the label image.'.format(
@@ -233,7 +299,7 @@ def is_valid_lineage(y, lineage):
         last_parent_frame = cell_lineage['frames'][-1]
 
         for daughter in cell_lineage['daughters']:
-            daughter=str(daughter)
+            daughter = int(daughter)
             if daughter not in lineage:
                 warnings.warn('Lineage {} has daughter {} not in lineage'.format(
                     cell_label, daughter))
@@ -259,7 +325,7 @@ def is_valid_lineage(y, lineage):
         # TODO: test parent in lineage
         parent = cell_lineage.get('parent')
         if parent:
-            parent = str(parent)
+            parent = int(parent)
             try:
                 parent_lineage = lineage[parent]
             except KeyError:
@@ -305,6 +371,11 @@ def relabel_sequential_lineage(y, lineage):
     
     y_relabel, fw, _ = relabel_sequential(y)
 
+    # Accept either key spelling: a lineage decoded from JSON is keyed by strings, one
+    # produced by this package by integers. The output is always integer-keyed, so the
+    # function can be applied to its own result.
+    lineage = {int(k): v for k, v in lineage.items()}
+
     new_lineage = {}
 
     cell_ids = np.unique(y)
@@ -320,7 +391,6 @@ def relabel_sequential_lineage(y, lineage):
         # Fix label
         # TODO: label == track ID?
         new_lineage[new_cell_id]['label'] = new_cell_id
-        cell_id = str(cell_id)
         # Fix parent
         parent = lineage[cell_id]['parent']
         new_parent = int(fw[parent]) if parent is not None else parent
@@ -338,7 +408,7 @@ def relabel_sequential_lineage(y, lineage):
                 new_lineage[new_cell_id]['daughters'].append(new_daughter)
                 
         # Fix frames
-        y_true = np.any(y == np.int64(cell_id), axis=(1, 2))
+        y_true = np.any(y == cell_id, axis=(1, 2))
         y_index = np.nonzero(y_true)[0]
 
         new_lineage[new_cell_id]['frames'] = y_index.tolist()
@@ -364,107 +434,84 @@ def get_max_cells(y):
             max_cells = n_cells
     return max_cells
 
-def get_image_features(X, y, appearance_dim=32, crop_mode='fixed', norm=True):
+def get_image_features(X, y, appearance_dim=32):
     """Return features for every object in the array.
+
+    Appearance is what a cell looks like - its texture, shape and contrast - and
+    deliberately not how big it is. Size is carried by the morphology vector, which is
+    measured after the frame has been rescaled to the model resolution. Each cell's
+    bounding box is therefore masked to that cell's own label (so neighbours do not leak
+    in), normalized by the mean and standard deviation of its own non-zero pixels,
+    padded to a square about the cell (so its proportions are kept), and resized to
+    ``appearance_dim`` x ``appearance_dim``. Nothing is clipped and nothing is stretched.
+
+    Normalizing before the resize means the statistics come from the cell's real pixels
+    rather than from interpolated ones. A cell with no non-zero pixels is left as zeros.
+    Centroids are in image coordinates, with no offset.
 
     Args:
         X (np.array): a 3D numpy array of raw data of shape (x, y, c).
         y (np.array): a 3D numpy array of integer labels of shape (x, y, 1).
-        appearance_dim (int): The resized shape of the appearance feature.
-        crop_mode (str): Whether to do a fixed crop or to crop and resize
-            to create the appearance features
-        norm (bool): Whether to remove non cell features and normalize the
-            foreground pixels by zero-meaning and dividing by the standard
-            deviation. Applies to fixed crop mode only.
+        appearance_dim (int): The side length of the square appearance feature.
 
     Returns:
         dict: A dictionary of feature names to np.arrays of shape
             (n, c) or (n, x, y, c) where n is the number of objects.
     """
-    # X must be float32 for the resize norm option to work correctly
     X = X.astype('float32')
     y = y.astype('int32')
-
-    if crop_mode not in ['resize', 'fixed']:
-        raise ValueError('crop_mode must be either resize or fixed')
 
     appearance_dim = int(appearance_dim)
 
     # each feature will be ordered based on the label.
     # labels are also stored and can be fetched by index.
-    num_labels = len(np.unique(y)) - 1
+    #
+    # Count distinct non-zero labels directly. len(np.unique(y)) - 1 assumes every
+    # frame contains background, which a fully tiled mask - a confluent monolayer
+    # filling the field of view - does not.
+    num_labels = len(np.unique(y[y != 0]))
     labels = np.zeros((num_labels,), dtype='int32')
     centroids = np.zeros((num_labels, 2), dtype='float32')
     morphologies = np.zeros((num_labels, 3), dtype='float32')
     appearances = np.zeros((num_labels, appearance_dim,
                             appearance_dim, X.shape[-1]), dtype='float32')
 
-    if crop_mode == 'fixed':
-        # Zero-pad the X array for fixed crop mode
-        pad_width = ((appearance_dim, appearance_dim),
-                     (appearance_dim, appearance_dim),
-                     (0, 0))
-        X_padded = np.pad(X, pad_width=pad_width)
-        y_padded = np.pad(y, pad_width=pad_width)
+    for i, prop in enumerate(regionprops(y[..., 0], cache=False)):
 
-        props = regionprops(y_padded[..., 0], cache=False)
-
-    # iterate over all objects in y
-    if crop_mode == 'resize':
-        props = regionprops(y[..., 0], cache=False)
-
-    for i, prop in enumerate(props):
-
-        # Get label
         labels[i] = prop.label
-
-        # Get centroid
-        centroid = np.array(prop.centroid)
-        centroids[i] = centroid
-
-        # Get morphology
-        morphology = np.array([
+        centroids[i] = np.array(prop.centroid)
+        morphologies[i] = np.array([
             prop.area,
             prop.perimeter,
             prop.eccentricity
         ])
-        morphologies[i] = morphology
 
-        if crop_mode == 'resize':
-            # Get appearance
-            minr, minc, maxr, maxc = prop.bbox
-            appearance = np.copy(X[minr:maxr, minc:maxc, :])
-            resize_shape = (appearance_dim, appearance_dim)
+        # Crop to the bounding box and keep only this cell's own pixels.
+        minr, minc, maxr, maxc = prop.bbox
+        app = X[minr:maxr, minc:maxc, :] * (y[minr:maxr, minc:maxc, :] == prop.label)
 
-            label = np.copy(y[minr:maxr, minc:maxc])
+        # Zero-mean, unit-spread over the cell's own non-zero pixels. The guard tests
+        # the size of the index, not the arity of the index tuple: an all-zero cell has
+        # nothing to normalize and stays zero, without a warning.
+        idx = np.nonzero(app)
+        if idx[0].size > 0:
+            masked_app = app[idx]
+            app[idx] = (masked_app - np.mean(masked_app)) / (np.std(masked_app) + 1e-4)
 
-            appearance = appearance * (label == prop.label)
-            appearances[i] = resize(appearance, resize_shape)
+        # Pad the shorter side with background so the box is square about the cell.
+        # Resizing a non-square box to a square would stretch the cell.
+        height, width = app.shape[:2]
+        side = max(height, width)
+        pad_r, pad_c = side - height, side - width
+        app = np.pad(app, ((pad_r // 2, pad_r - pad_r // 2),
+                           (pad_c // 2, pad_c - pad_c // 2),
+                           (0, 0)))
 
-        if crop_mode == 'fixed':
-            cent = np.array(prop.centroid)
-            delta = appearance_dim // 2
-            minr = int(cent[0]) - delta
-            maxr = int(cent[0]) + delta
-            minc = int(cent[1]) - delta
-            maxc = int(cent[1]) + delta
-
-            app = np.copy(X_padded[minr:maxr, minc:maxc, :])
-            label = np.copy(y_padded[minr:maxr, minc:maxc])
-
-            if norm:
-                # Use label as a mask to zero out non-label information
-                app = app * (label == prop.label)
-                idx = np.nonzero(app)
-
-                # Check data and normalize
-                if len(idx) > 0:
-                    masked_app = app[idx]
-                    mean = np.mean(masked_app)
-                    std = np.std(masked_app)
-                    app[idx] = (masked_app - mean) / (std + 1e-4)
-
-            appearances[i] = app
+        if side == 1:
+            # A single-pixel cell: the resize helper squeezes it to a scalar.
+            appearances[i] = np.broadcast_to(app, appearances[i].shape)
+        else:
+            appearances[i] = resize(app, (appearance_dim, appearance_dim))
 
     return {
         'appearances': appearances,
@@ -592,78 +639,44 @@ def clean_up_annotations(y, uid=None, data_format='channels_last'):
             y[frame] = y_frame_new
     return y
 
-def trk_to_graph(lineage, node_key=None):
-    """Converts a lineage dictionary into a graph representation of the lineages
+#: Which way is "better" for every metric `MetricsTracker.get_metrics` reports. This is the
+#: single place the direction of improvement is decided: best-checkpoint selection, early
+#: stopping and the metric-driven learning-rate schedule all read it through
+#: `metric_direction`, so none of them can disagree about it.
+METRIC_DIRECTIONS = {
+    'loss': 'min',
+    'accuracy': 'max',
+    **{f'{kind}_class_{c}': 'max' for kind in ('precision', 'recall', 'f1') for c in range(3)},
+}
 
-    Args:
-        lineage (dict): Dictionary of lineage data
-        node_key (dict): Map between gt nodes and result nodes
 
-    Returns:
-        networkx.Graph: Graph representation of the lineage data.
+def check_choice(setting, value, accepted):
+    """Return `value` if it is one of `accepted`, else raise naming both.
+
+    Used wherever a configuration setting selects among named options, so that a bad value
+    fails where it is given instead of surfacing later as a missing attribute.
     """
-    edges = []
+    if value not in accepted:
+        raise ValueError(
+            f"Unknown {setting} {value!r}; accepted values: {', '.join(map(str, accepted))}"
+        )
+    return value
 
-    all_ids = set()
-    single_nodes = set()
-    attributes = {}
 
-    for i, lin in lineage.items():
-        # Update cell id if node_key is available
-        if node_key and (i in node_key):
-            idx = node_key[i]
-        else:
-            idx = i
+def metric_direction(metric_name):
+    """'min' if a lower value of `metric_name` is better, 'max' if a higher one is."""
+    check_choice('stopping_metric', metric_name, list(METRIC_DIRECTIONS))
+    return METRIC_DIRECTIONS[metric_name]
 
-        cellids = ['{}_{}'.format(idx, t) for t in lin['frames']]
-
-        if len(cellids) == 1:
-            single_nodes.add(cellids[0])
-
-        all_ids.update(cellids)
-        edges.append(pd.DataFrame({
-            'source': cellids[0:-1],
-            'target': cellids[1:]
-        }))
-
-        # Add connections to any daughters
-        source = '{}_{}'.format(idx, max(lin['frames']))
-        for d in lin['daughters']:
-            # Update cell id if node_key is available
-            if node_key and (i in node_key):
-                d_idx = node_key[d]
-            else:
-                d_idx = d
-
-            # Assume daughter appears in next frame
-            target = '{}_{}'.format(d_idx, max(lin['frames']) + 1)
-            edges.append(pd.DataFrame({
-                'source': [source],
-                'target': [target]
-            }))
-
-            attributes[source] = {'division': True}
-
-    # Create graph
-    edges = pd.concat(edges)
-    G = nx.from_pandas_edgelist(edges, source='source', target='target', create_using=nx.DiGraph)
-    nx.set_node_attributes(G, attributes)
-
-    # Add all isolates to graph
-    for cell_id in single_nodes:
-        G.add_node(cell_id)
-
-    return G
 
 class MetricsTracker:
     
     def __init__(self):
         self.reset()
-        self.pad_value = -1
     
     def reset(self):
         self.total_loss = 0.0
-        self.total_samples = 0
+        self.total_graded = 0
         self.correct = 0
         self.total_predictions = 0
         
@@ -672,25 +685,24 @@ class MetricsTracker:
         self.class_total = {0: 0, 1: 0, 2: 0}
         self.class_predicted = {0: 0, 1: 0, 2: 0}
 
-        self.cm = np.zeros((3,3))
-
-    
     def update(self, loss, predictions, targets):
         """
         Args:
-            loss: scalar loss value
-            predictions: (B, T, N, M, 3) logits
-            targets: (B, T, N, M, 3) one hot encoding of labels
+            loss: scalar loss for the batch, averaged over its graded entries
+            predictions: (B, T, N, M, 3) class probabilities
+            targets: (B, T, N, M) integer class labels, -1 marking an ungraded entry
         """
-
-        batch_size = predictions.shape[0]
-        self.total_loss += loss.item() * batch_size
-        self.total_samples += batch_size
 
         # Get predicted classes
         pred_classes = predictions.argmax(dim=-1).view(-1)  # (B*T*N*M)
         target_classes = targets.view(-1)
         valid_mask = target_classes.view(-1) >= 0
+
+        # The batch loss is already a mean over graded entries, so weight it by how many
+        # there were. Weighting by batch size would over-count a batch that graded little.
+        n_graded = valid_mask.sum().item()
+        self.total_loss += loss.item() * n_graded
+        self.total_graded += n_graded
 
         # Overall accuracy
         correct = (pred_classes == target_classes) & valid_mask
@@ -709,7 +721,7 @@ class MetricsTracker:
     
     def get_metrics(self):
         """Compute and return current metrics."""
-        avg_loss = self.total_loss / max(self.total_samples, 1)
+        avg_loss = self.total_loss / max(self.total_graded, 1)
         accuracy = self.correct / max(self.total_predictions, 1)
         
         metrics = {
@@ -717,8 +729,6 @@ class MetricsTracker:
             'accuracy': accuracy
         }
 
-        running_f1 = 0
-        
         # Add per-class metrics
         for class_idx in range(3):
             # Recall: of all true class_idx, how many did we predict correctly?
@@ -735,8 +745,7 @@ class MetricsTracker:
             metrics[f'recall_class_{class_idx}'] = recall
             metrics[f'precision_class_{class_idx}'] = precision
             metrics[f'f1_class_{class_idx}'] = f1
-            running_f1 *= f1
-                
+
         return metrics
     
 class EarlyStopping:
@@ -749,6 +758,7 @@ class EarlyStopping:
             min_delta: Minimum change to qualify as improvement
             mode: 'min' for loss, 'max' for accuracy
         """
+        check_choice('early-stopping mode', mode, ('min', 'max'))
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -777,10 +787,14 @@ class EarlyStopping:
         return self.should_stop
     
 
+OPTIMIZERS = ('radam', 'adamw')
+SCHEDULERS = ('reduce_on_plateau', 'cosine', 'step', 'exp', 'none')
+
+
 def create_optimizer(model, config):
     """Create optimizer based on config."""
 
-    optimizer_name = config.optimizer
+    optimizer_name = check_choice('optimizer', config.optimizer, OPTIMIZERS)
     
     if optimizer_name == 'radam':
         optimizer = optim.RAdam(
@@ -794,24 +808,21 @@ def create_optimizer(model, config):
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
+            weight_decay=config.weight_decay,
         )
 
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer_name}")
-    
     return optimizer
 
 
 def create_scheduler(optimizer, config):
     """Create learning rate scheduler."""
 
-    scheduler_name = config.scheduler
+    scheduler_name = check_choice('scheduler', config.scheduler, SCHEDULERS)
 
-    
     if scheduler_name == 'reduce_on_plateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode=metric_direction(config.stopping_metric),
             factor=0.2,
             patience=config.patience
             )
@@ -824,11 +835,10 @@ def create_scheduler(optimizer, config):
         )
 
     elif scheduler_name == 'step':
-        step_size = config.get('step_size', 30)
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=step_size,
-            gamma=config.gamma
+            step_size=config.step_size,
+            gamma=config.step_gamma
         )
 
     elif scheduler_name == 'exp':
@@ -837,8 +847,7 @@ def create_scheduler(optimizer, config):
             gamma=config.decay
         )
 
-    elif scheduler_name == 'none':
+    else:  # 'none'
         scheduler = None
 
-        
     return scheduler

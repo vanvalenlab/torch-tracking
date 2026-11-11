@@ -10,5 +10,16 @@ notebooks/
 *.ipynb
 *.csv
 
+# Baseline evidence: tracked deliberately, exempt from the *.csv rule above.
+# benchmarks.csv holds the TF Caliban tracking reference numbers and can never be
+# regenerated (deepcell-tf is unmaintained). See metrics/PROVENANCE.md.
+!metrics/benchmarks.csv
+!metrics/eval_results.csv
+
 # Docs cruft
 doc/_build
+
+# Claude Code local config and instructions
+.claude/
+CLAUDE.md
+AGENTS.md

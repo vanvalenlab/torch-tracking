@@ -6,6 +6,7 @@ import torch.nn as nn
 # Assuming these are imported from your other modules
 from torch_tracking.layers import Comparison, DeltaReshape, Unmerge, TemporalMerge
 from torch_tracking.layers import compute_deltas, compute_deltas_across_frames
+from torch_tracking.utils import pair_masks, real_cell_mask
 
 from torch_tracking.encoders import NeighborhoodEncoder, AppearanceEncoder, MorphologyEncoder, CentroidEncoder, DeltaEncoder
 
@@ -66,6 +67,10 @@ class TrainingBranch(nn.Module):
         Returns:
             embedding_comparisons: (batch, time-1, max_cells, max_cells, 2*embedding_dim)
             deltas: (batch, time-1, max_cells, max_cells, 2*encoder_dim)
+            pair_mask: (batch, time-1, max_cells, max_cells) boolean, ``True`` where both
+                the track and the candidate of that entry are real cells. Derived here once
+                from the morphologies and handed to the decoder, so the delta encoders and
+                the decoder normalize over the same pairs.
         """
 
         batch_size, time_steps, max_cells, H, W, C = appearances.shape
@@ -103,6 +108,11 @@ class TrainingBranch(nn.Module):
         # Process centroids to get deltas
         # 1. Compute deltas within each frame (across tracks)
 
+        # Which slots, and which pairs of slots, are real. Padding must not set the
+        # statistics a real pair is normalized by.
+        is_real = real_cell_mask(morphologies)  # (B, T, N)
+        within_real, pair_mask = pair_masks(is_real)
+
         deltas_within = compute_deltas(centroids_out)  # (B, T, N, 2)
         deltas_within = torch.abs(deltas_within)
         
@@ -111,8 +121,8 @@ class TrainingBranch(nn.Module):
         deltas_across = torch.abs(deltas_across)
         
         # Encode deltas
-        deltas_within_enc = self.delta_encoder(deltas_within)  # (B, T, N, encoder_dim)
-        deltas_across_enc = self.delta_across_frames_encoder(deltas_across)  # (B, T-1, N, N, encoder_dim)
+        deltas_within_enc = self.delta_encoder(deltas_within, within_real)  # (B, T, N, encoder_dim)
+        deltas_across_enc = self.delta_across_frames_encoder(deltas_across, pair_mask)  # (B, T-1, N, N, encoder_dim)
         
         # Apply temporal merge to within-frame deltas
         deltas_within_current = deltas_within_enc[:, :-1]  # (B, T-1, N, encoder_dim)
@@ -127,7 +137,7 @@ class TrainingBranch(nn.Module):
         # Concatenate within and across deltas
         deltas = torch.cat([deltas_within_current, deltas_across_enc], dim=-1)
         
-        return embedding_comparisons, deltas
+        return embedding_comparisons, deltas, pair_mask
 
 
 class InferenceBranch(nn.Module):
@@ -213,107 +223,3 @@ class InferenceBranch(nn.Module):
         deltas = torch.cat([deltas_within_current, deltas_across_enc], dim=-1)
         
         return embedding_comparisons, deltas
-
-
-# Example usage and tests
-if __name__ == "__main__":
-    print("Testing Training and Inference Branches...\n")
-    
-    batch_size = 2
-    embedding_dim = 64
-    encoder_dim = 64
-    track_length = 8
-    max_cells = 39
-    
-    # Create temporal merge modules
-    embedding_temporal_merge = TemporalMerge(embedding_dim)
-    delta_temporal_merge = TemporalMerge(encoder_dim)
-    
-    delta_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
-    delta_across_frames_encoder = DeltaEncoder(input_dim=2, encoder_dim=64)
-
-    app_encoder = AppearanceEncoder(appearance_shape=(32, 32, 1), data_format='channels_last')
-    mo_encoder = MorphologyEncoder(input_dim=3)
-    cen_encoder = CentroidEncoder(input_dim=2)
-    
-    # Mock neighborhood encoder
-    neighborhood_encoder = NeighborhoodEncoder(appearance_encoder=app_encoder,
-                                               morphology_encoder=mo_encoder,
-                                               centroid_encoder=cen_encoder)
-    
-    print("1. Testing TrainingBranch")
-    training_branch = TrainingBranch(
-        neighborhood_encoder=neighborhood_encoder,
-        embedding_temporal_merge=embedding_temporal_merge,
-        delta_temporal_merge=delta_temporal_merge,
-        delta_encoder=delta_encoder,
-        delta_across_frames_encoder=delta_across_frames_encoder,
-        track_length=track_length,
-        max_cells=max_cells,
-        embedding_dim=embedding_dim,
-        encoder_dim=encoder_dim
-    )
-    
-    # Create sample inputs
-    appearances = torch.randn(batch_size, track_length, max_cells,  32, 32, 1)
-    morphologies = torch.randn(batch_size, track_length, max_cells, 3)
-    centroids = torch.randn(batch_size, track_length, max_cells, 2)
-    adj_matrices = torch.randn(batch_size, track_length, max_cells, max_cells)
-    
-    print(f"   Input shapes:")
-    print(f"   - Appearances: {appearances.shape}")
-    print(f"   - Morphologies: {morphologies.shape}")
-    print(f"   - Centroids: {centroids.shape}")
-    print(f"   - Adjacency: {adj_matrices.shape}")
-    
-    # Note: This will fail with mock encoder, but shows the structure
-    # try:
-    emb_comp, deltas = training_branch(appearances, morphologies, centroids, adj_matrices)
-    print(f"   Output shapes:")
-    print(f"   - Embedding comparisons: {emb_comp.shape}")
-    print(f"   - Deltas: {deltas.shape}")
-    print(f"   Expected embedding comparisons: ({batch_size}, {track_length-1}, {max_cells}, {max_cells}, {2*embedding_dim})")
-    print(f"   Expected deltas: ({batch_size}, {track_length-1}, {max_cells}, {max_cells}, {2*encoder_dim})")
-    # except Exception as e:
-    #     print(f"   (Expected error with mock encoder: {type(e).__name__})")
-    # print()
-    
-    print("2. Testing InferenceBranch")
-    inference_branch = InferenceBranch(
-        embedding_temporal_merge=embedding_temporal_merge,
-        delta_temporal_merge=delta_temporal_merge,
-        delta_encoder=delta_encoder,
-        delta_across_frames_encoder=delta_across_frames_encoder,
-        embedding_dim=embedding_dim,
-        encoder_dim=encoder_dim
-    )
-    
-    # Create inference inputs
-    num_tracks = 10
-    num_detections = 15
-    time_history = 5
-    
-    current_embeddings = torch.randn(batch_size, time_history, num_tracks, embedding_dim)
-    current_centroids = torch.randn(batch_size, time_history, num_tracks, 2)
-    future_embeddings = torch.randn(batch_size, 1, num_detections, embedding_dim)
-    future_centroids = torch.randn(batch_size, 1, num_detections, 2)
-    
-    print(f"   Input shapes:")
-    print(f"   - Current embeddings: {current_embeddings.shape}")
-    print(f"   - Current centroids: {current_centroids.shape}")
-    print(f"   - Future embeddings: {future_embeddings.shape}")
-    print(f"   - Future centroids: {future_centroids.shape}")
-    
-    emb_comp, deltas = inference_branch(
-        current_embeddings, current_centroids,
-        future_embeddings, future_centroids
-    )
-    
-    print(f"   Output shapes:")
-    print(f"   - Embedding comparisons: {emb_comp.shape}")
-    print(f"   - Deltas: {deltas.shape}")
-    print(f"   Expected: ({batch_size}, 1, {num_tracks}, {num_detections}, {2*embedding_dim})")
-    print(f"   Expected: ({batch_size}, 1, {num_tracks}, {num_detections}, {2*encoder_dim})")
-    print()
-    
-    print("✅ Branch structure tests passed!")

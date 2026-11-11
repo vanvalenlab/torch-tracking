@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 # Import all components (assumes they're in separate modules)
-from torch_tracking.layers import Unmerge, TemporalMerge
+from torch_tracking.layers import TemporalMerge
 from torch_tracking.encoders import (
     AppearanceEncoder, MorphologyEncoder, CentroidEncoder,
     DeltaEncoder, NeighborhoodEncoder
@@ -19,34 +19,48 @@ class GNNTrackingModel(nn.Module):
     This model uses Graph Neural Networks to track cells across video frames
     by learning appearance, morphology, and spatial relationships.
     
+    The number of cells per frame is not a constructor argument: it is read from the input
+    at runtime, so it must agree within a batch but not across batches.
+
     Args:
-        max_cells (int): Maximum number of tracks per frame
-        track_length (int): Length of track sequences
+        track_length (int): Number of frames in each track sequence
         n_filters (int): Number of convolutional/GNN filters
-        encoder_dim (int): Dimension of feature encoders
-        embedding_dim (int): Dimension of final embeddings
+        encoder_dim (int): Dimension of the feature encoders, and of the embeddings they
+            produce. The decoder and the graph layers size themselves from it
         n_layers (int): Number of GNN layers
         graph_layer (str): Type of graph layer ('gcn', 'gat', 'gcs')
-        appearance_shape (tuple): Shape of appearance crops (time, H, W, C)
-        norm_layer (str): Normalization type ('batch' or 'layer')
+        norm_layer (str): Normalization type. Only 'batch' is supported
         appearance_norm (bool): Whether to normalize input images
-        n_classes (int): Number of tracking classes (default: 3)
-        data_format (str): 'channels_first' or 'channels_last'
-    
+        n_classes (int): Number of tracking classes (default: 3) - different cell,
+            same cell, daughter cell, in that order
+        crop_size (int): Side length of the square appearance crops. Must be a power of
+            two; `appearance_shape` is derived from it as `(crop_size, crop_size, 1)`
+        data_format (str): Must be 'channels_last'. The training branch unpacks a
+            channels-last appearance tensor, so channels-first cannot reach a forward pass
+        dropout (float): Dropout probability used by the encoders and the decoder
+
     Example:
-        >>> model = GNNTrackingModel(
-        ...     max_cells=39,
-        ...     track_length=8,
-        ...     appearance_shape=(1, 32, 32, 1)
-        ... )
-        >>> 
-        >>> # Training
-        >>> logits = model.training_forward(appearances, morphologies, 
-        ...                                  centroids, adj_matrices)
-        >>> 
-        >>> # Inference
-        >>> probs = model.inference_forward(current_emb, current_cent,
-        ...                                  future_emb, future_cent)
+        >>> import torch
+        >>> model = GNNTrackingModel(track_length=3, n_layers=2, crop_size=32).eval()
+        >>> appearances = torch.zeros(1, 3, 4, 32, 32, 1)
+        >>> morphologies = torch.zeros(1, 3, 4, 3)
+        >>> centroids = torch.zeros(1, 3, 4, 2)
+        >>> adj_matrices = torch.zeros(1, 3, 4, 4)
+        >>> # Training (returns probabilities, which TrackingLoss requires)
+        >>> with torch.no_grad():
+        ...     probs = model.training_forward(
+        ...         appearances, morphologies, centroids, adj_matrices
+        ...     )
+        >>> tuple(probs.shape)
+        (1, 2, 4, 4, 3)
+        >>> # Inference: three tracks with four frames of history, two new detections
+        >>> with torch.no_grad():
+        ...     probs = model.inference_forward(
+        ...         torch.zeros(1, 4, 3, 64), torch.zeros(1, 4, 3, 2),
+        ...         torch.zeros(1, 1, 2, 64), torch.zeros(1, 1, 2, 2),
+        ...     )
+        >>> tuple(probs.shape)
+        (1, 1, 3, 2, 3)
     """
     def __init__(
         self,
@@ -59,7 +73,7 @@ class GNNTrackingModel(nn.Module):
         appearance_norm=True,
         n_classes=3,
         crop_size=16,
-        data_format='channels_first',
+        data_format='channels_last',
         dropout = 0.1
     ):
         super().__init__()
@@ -87,32 +101,50 @@ class GNNTrackingModel(nn.Module):
         self._build_decoder()
     
     def _validate_config(self):
-        """Validate configuration parameters."""
+        """Validate configuration parameters.
 
-        spatial_dim = self.appearance_shape[1]
-
-        if self.data_format == 'channels_last':
-            spatial_compare = self.appearance_shape[1] == self.appearance_shape[0]
-        if self.data_format == 'channels_first':
-            spatial_compare = self.appearance_shape[1] == self.appearance_shape[2]
+        Checks run in dependency order: every value is validated before anything indexes
+        or branches on it. The previous ordering read `appearance_shape[1]` and
+        `appearance_shape[2]` before checking the shape's length, and left the squareness
+        comparison unbound for any `data_format` outside the two it tested.
+        """
+        if self.data_format != 'channels_last':
+            raise ValueError(
+                f"data_format must be 'channels_last', got {self.data_format!r}. "
+                'The training branch unpacks a channels-last six-dimensional appearance '
+                'tensor, so channels-first cannot reach a forward pass.'
+            )
 
         if len(self.appearance_shape) != 3:
-            raise ValueError(f'appearance_shape should be length 4, got {len(self.appearance_shape)}')
-        
-        # Check if spatial dims are square and power of 2
-        if not spatial_compare:
-            raise ValueError('Appearance shape should have square spatial dimensions')
-        
-        log2 = math.log2(spatial_dim)
+            raise ValueError(
+                'appearance_shape should be length 3, got '
+                f'{len(self.appearance_shape)}'
+            )
+
+        height, width, _channels = self.appearance_shape
+        if height != width:
+            raise ValueError(
+                'Appearance shape should have square spatial dimensions, got '
+                f'{height}x{width}'
+            )
+
+        log2 = math.log2(height)
         if int(log2) != log2:
-            raise ValueError('Spatial dimensions should be power of 2')
-        
+            raise ValueError(
+                f'Spatial dimensions should be power of 2, got {height}'
+            )
+
         graph_layer_name = self.graph_layer.split('-')[0].lower()
         if graph_layer_name not in {'gcn', 'gat', 'gcs'}:
             raise ValueError(f'Invalid graph_layer: {graph_layer_name}')
-        
-        if self.norm_layer not in {'batch', 'layer'}:
-            raise ValueError(f'norm_layer must be "batch" or "layer", got {self.norm_layer}')
+
+        if self.norm_layer != 'batch':
+            raise ValueError(
+                f"norm_layer must be 'batch', got {self.norm_layer!r}. The appearance, "
+                'morphology, centroid and delta encoders have no LayerNorm form, so '
+                "'layer' would build a mostly-BatchNorm model that fails on the first "
+                'forward pass.'
+            )
     
     def _build_encoders(self):
         """Build all feature encoders."""
@@ -121,7 +153,6 @@ class GNNTrackingModel(nn.Module):
             appearance_shape=self.appearance_shape,
             n_filters=self.n_filters,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer,
             appearance_norm=self.appearance_norm,
             data_format=self.data_format,
         )
@@ -130,30 +161,23 @@ class GNNTrackingModel(nn.Module):
         self.morphology_encoder = MorphologyEncoder(
             input_dim=3,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer,
-
         )
         
         # Centroid encoder
         self.centroid_encoder = CentroidEncoder(
             input_dim=2,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer,
-
         )
         
         # Delta encoders (shared weights for both types)
         self.delta_encoder = DeltaEncoder(
             input_dim=2,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer,
-
         )
         
         self.delta_across_frames_encoder = DeltaEncoder(
             input_dim=2,
             encoder_dim=self.encoder_dim,
-            norm_layer=self.norm_layer
         )
         
         # Neighborhood encoder (combines everything with GNN)
@@ -178,11 +202,7 @@ class GNNTrackingModel(nn.Module):
         self.delta_temporal_merge = TemporalMerge(
             encoder_dim=self.encoder_dim
         )
-        
-        # Unmerge layers
-        self.unmerge_embeddings = Unmerge()
-        
-        self.unmerge_centroids = Unmerge()
+        # No Unmerge layers here: `TrainingBranch` builds and uses its own.
     
     def _build_branches(self):
         """Build training and inference branches."""
@@ -206,6 +226,7 @@ class GNNTrackingModel(nn.Module):
 
         self.tracking_decoder = TrackingDecoder(
             embedding_dim=self.encoder_dim,
+            encoder_dim=self.encoder_dim,
             n_filters=self.n_filters,
             n_classes=self.n_classes,
             norm_layer=self.norm_layer,
@@ -213,7 +234,7 @@ class GNNTrackingModel(nn.Module):
         )
         
     def training_forward(self, appearances, morphologies, centroids, adj_matrices,
-                        return_logits=True):
+                        return_logits=False):
         """Forward pass for training.
         
         Args:
@@ -221,21 +242,25 @@ class GNNTrackingModel(nn.Module):
             morphologies: (batch, track_length, max_cells, 3)
             centroids: (batch, track_length, max_cells, 2)
             adj_matrices: (batch, track_length, max_cells, max_cells)
-            return_logits: If True, return logits; if False, return probabilities
+            return_logits: If True, return logits; if False (the default), return
+                probabilities. The default is probabilities because `TrackingLoss` takes
+                the logarithm of its input and so requires them; passing logits to it
+                yields NaN.
         
         Returns:
             Tensor of shape (batch, track_length-1, max_cells, max_cells, n_classes)
         """
 
         # Get features from training branch
-        embedding_comparisons, deltas = self.training_branch(
+        embedding_comparisons, deltas, pair_mask = self.training_branch(
             appearances, morphologies, centroids, adj_matrices
         )
         
         # Decode to predictions
         output = self.tracking_decoder(
             embedding_comparisons, deltas,
-            apply_softmax=not return_logits
+            apply_softmax=not return_logits,
+            is_real=pair_mask
         )
         
         return output
@@ -328,13 +353,3 @@ class GNNTrackingModel(nn.Module):
     def count_parameters(self):
         """Count total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    print("="*70)
-    print("Complete GNN Tracking Model - PyTorch Implementation")
-    print("="*70)
-    print()
-    
-    
