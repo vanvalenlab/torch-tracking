@@ -58,6 +58,11 @@ class CellTracker:
             Default is 8, the window the training data is built for; change the two
             together.
 
+        embedding_frames (int, optional): How many frames are sent to the device at a
+            time when computing cell embeddings. Smaller values use less device memory
+            (peak memory is roughly proportional to it) and give identical results; the
+            only cost is a little speed. Default is 8.
+
         mpp (float, optional): The microns per pixel of the movie, 
             used to resize the input image to
             match the input resolution of the model.
@@ -77,6 +82,7 @@ class CellTracker:
         mpp = 0.55,
         verbose=True,
         checkpoint_dir = None,
+        embedding_frames: int = 8,
     ):
         # `checkpoint_dir` is the old name for `checkpoint_path`. It always took a file,
         # despite its name, and is kept as a deprecated alias so existing code still runs.
@@ -120,6 +126,9 @@ class CellTracker:
         self.division = division
         self.dtype = 'float32'
         self.track_length = track_length
+        if embedding_frames < 1:
+            raise ValueError(f'`embedding_frames` must be at least 1. Got {embedding_frames}.')
+        self.embedding_frames = embedding_frames
         self.tracks = {}
         self.model_mpp = MODEL_MPP
         self.scale_factor = scale_factor(mpp, self.model_mpp)
@@ -163,7 +172,6 @@ class CellTracker:
         self.y = None
         self.y_tracked = None
         self.features = None
-        self.tensors = None
         self.relabel_map: Dict[int, Dict[int, int]] = {}
 
         # ID mappings (accounting for 0-indexing vs 1-based labels)
@@ -246,7 +254,6 @@ class CellTracker:
         self.y = None
         self.y_tracked = None
         self.features = None
-        self.tensors = None
         self.id_to_idx = {}
         self.idx_to_id = {}
         self.relabel_map: Dict[int, Dict[int, int]] = {}
@@ -321,24 +328,6 @@ class CellTracker:
                 )
         return adj_matrices, appearances, morphologies, centroids
 
-    def _to_tensors(
-            self,
-            appearances,
-            morphologies,
-            centroids,
-            adj_matrices
-    ) -> Dict[str, torch.Tensor]:
-        """Convert numpy arrays to PyTorch tensors."""
-        tensors = {}
-        
-        # Appearances: (T, N, H, W, C)
-        tensors['appearances'] = torch.from_numpy(appearances).float().to(self.device)
-        tensors['morphologies'] = torch.from_numpy(morphologies).float().to(self.device)
-        tensors['centroids'] = torch.from_numpy(centroids).float().to(self.device)
-        tensors['adj_matrix'] = torch.from_numpy(adj_matrices).float().to(self.device)
-
-        self.tensors = tensors
-
     @torch.no_grad()
     def _compute_embeddings(
         self,
@@ -348,31 +337,36 @@ class CellTracker:
         adj_matrices: np.ndarray
     ) -> np.ndarray:
         """Compute embeddings using the GNN neighborhood encoder.
-        
+
+        The movie is encoded `embedding_frames` frames at a time: only that slice is
+        copied to the device, and its result is brought back to host memory before the
+        next slice starts. Each frame's embedding depends on that frame alone (the model
+        is in eval mode), so the slicing changes memory use but not the values.
+
         Args:
-            appearances: (T, N, H, W, C) appearance features
-            morphologies: (T, N, 3) morphology features
-            centroids: (T, N, 2) centroid positions
-            adj_matrices: (T, N, N) adjacency matrices
-        
+            appearances: (B, T, N, H, W, C) appearance features
+            morphologies: (B, T, N, 3) morphology features
+            centroids: (B, T, N, 2) centroid positions
+            adj_matrices: (B, T, N, N) adjacency matrices
+
         Returns:
             embeddings: (T, N, embedding_dim) cell embeddings
         """
-        # Convert to tensors and add batch dimension
-        self._to_tensors(appearances, morphologies, centroids, adj_matrices)
-    
-        # Get embeddings from model
-        embeddings_t, _ = self.tracking_model.get_embeddings(
-            appearances=self.tensors['appearances'],
-            morphologies=self.tensors['morphologies'],
-            centroids=self.tensors['centroids'],
-            adj_matrices=self.tensors['adj_matrix']
-        )
-        
-        # Remove batch dimension and convert back to numpy
-        embeddings = embeddings_t.squeeze(0).cpu().numpy()
-        return embeddings
-    
+        n_frames = appearances.shape[1]
+        chunks = []
+        for start in range(0, n_frames, self.embedding_frames):
+            sl = slice(start, start + self.embedding_frames)
+            embeddings_t, _ = self.tracking_model.get_embeddings(
+                appearances=torch.from_numpy(appearances[:, sl]).float().to(self.device),
+                morphologies=torch.from_numpy(morphologies[:, sl]).float().to(self.device),
+                centroids=torch.from_numpy(centroids[:, sl]).float().to(self.device),
+                adj_matrices=torch.from_numpy(adj_matrices[:, sl]).float().to(self.device),
+            )
+            chunks.append(embeddings_t.cpu().numpy())
+
+        # Join along time, then remove the batch dimension
+        return np.concatenate(chunks, axis=1).squeeze(0)
+
     def _validate_feature_name(self, feature_name: str):
         """Validate that feature name exists."""
         if feature_name not in self.features:
