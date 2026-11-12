@@ -839,3 +839,37 @@ def test_division_is_judged_by_the_daughter_probability(
     assert tracker.division == 0.5
     assert parent_given(different=0.05, same=0.9, daughter=0.05) is None
     assert parent_given(different=0.05, same=0.05, daughter=0.9) == 0
+
+
+@pytest.mark.parametrize("embedding_frames", [1, 3, 1000])
+def test_embeddings_do_not_depend_on_chunk_size(
+    untrained_checkpoint, synthetic_movie, device, embedding_frames
+):
+    """Encoding the movie a few frames at a time gives the same embeddings as all at once.
+
+    Chunking exists to bound device memory during inference (the encoder's working memory
+    grows with frames x cells). It must therefore change memory only, never results. On a
+    CPU the match is exact; on a GPU it is exact up to float rounding, so a small
+    tolerance is allowed there.
+    """
+    from torch_tracking.tracker import CellTracker
+
+    def embeddings(frames):
+        tracker = CellTracker(
+            checkpoint_path=str(untrained_checkpoint), device=device, verbose=False,
+            embedding_frames=frames, **BASELINE_INFERENCE_PARAMS,
+        )
+        tracker.preprocess_movie(movie=synthetic_movie.X.copy(), annotation=synthetic_movie.y.copy())
+        return tracker.features['embedding']
+
+    # 1000 exceeds the movie length, so it is the single-pass reference.
+    reference = embeddings(1000)
+    chunked = embeddings(embedding_frames)
+    np.testing.assert_allclose(chunked, reference, rtol=1e-4, atol=1e-4)
+
+
+def test_embedding_frames_must_be_positive(untrained_checkpoint):
+    from torch_tracking.tracker import CellTracker
+
+    with pytest.raises(ValueError, match="embedding_frames"):
+        CellTracker(checkpoint_path=str(untrained_checkpoint), verbose=False, embedding_frames=0)
