@@ -41,7 +41,7 @@ pip install .
 pip install -r requirements.txt
 ```
 
-Default model weights are downloaded from [Hugging Face](https://huggingface.co/vanvalenlab). Access is gated: you must join the `vanvalenlab` organization, accept the license terms, and create a Read token exposed as `HF_TOKEN` in your environment.
+Default model weights are downloaded from [Hugging Face](https://huggingface.co/vanvalenlab). Access is gated, but approved automatically. Create a Hugging Face account, then create a Read token exposed as `HF_TOKEN` in your environment.
 
 ```bash
 export HF_TOKEN="<your-token-here>"
